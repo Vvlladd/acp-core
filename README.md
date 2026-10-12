@@ -86,31 +86,31 @@ sequenceDiagram
     actor Human
     participant Lead as Host and skill / MCP
     participant Entry as CLI or MCP boundary
-    participant Actor as Core actor and policy
+    participant CoreActor as Core actor and policy
     participant Supervisor as Checked process supervisor
     participant Git as Isolated worktree
     participant History as Durable events and frozen evidence
     Human->>Lead: Task, reuse saved team or confirm exact setup
     Lead->>Entry: Submit bounded work
-    Entry->>Actor: Validate role, caller scope and execution settings
-    Actor->>History: Record run and selected checks
-    Actor->>Git: Prepare isolated builder worktree
-    Actor->>Supervisor: Launch builder with checked argv
+    Entry->>CoreActor: Validate role, caller scope and execution settings
+    CoreActor->>History: Record run and selected checks
+    CoreActor->>Git: Prepare isolated builder worktree
+    CoreActor->>Supervisor: Launch builder with checked argv
     Supervisor->>Git: Builder edits, workers never commit
-    Supervisor-->>Actor: Schema-validated result
-    Actor->>Supervisor: Run selected checks on this attempt
+    Supervisor-->>CoreActor: Schema-validated result
+    CoreActor->>Supervisor: Run selected checks on this attempt
     alt Repair required and allowed
-        Actor->>Supervisor: Repair and repeat selected checks
+        CoreActor->>Supervisor: Repair and repeat selected checks
     else Ready for human decision
-        Actor->>History: Freeze exact diff, attempt and check evidence
-        Actor-->>Lead: Pending gate
+        CoreActor->>History: Freeze exact diff, attempt and check evidence
+        CoreActor-->>Lead: Pending gate
         Lead-->>Human: Present evidence and wait
         Human->>Entry: Approve using human CLI / socket client
-        Entry->>Actor: Socket-only gate approval
-        Actor->>Git: Recheck approved bytes under worktree lock, commit
-        Actor->>History: Record resulting commit
+        Entry->>CoreActor: Socket-only gate approval
+        CoreActor->>Git: Recheck approved bytes under worktree lock, commit
+        CoreActor->>History: Record resulting commit
     end
-    Note over Lead,Actor: MCP cannot approve integration. Same-user shell access is not a physical-human boundary.
+    Note over Lead,CoreActor: MCP cannot approve integration. Same-user shell access is not a physical-human boundary.
 ```
 
 ### Source map

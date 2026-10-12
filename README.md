@@ -146,3 +146,12 @@ part of this fresh public history; public behavior is described here and in [the
 ACP code in this repository is [MIT](LICENSE), including the original Swift analyzer. Dependencies
 retain their own licenses: see [third-party guidance](THIRD-PARTY-NOTICES.md). Binary distributions
 include dependency notices. The license does not cover the separately maintained private Mac app.
+
+## Verification — 2026-10-12
+
+The independent core passed **658 Rust tests, with nine live probes ignored**, warnings-denied
+Clippy and **five Swift analyzer tests**. The source installer built both executables. The packaged
+preview passed disposable Swift Review acceptance and sandbox denial checks. The public
+[plugin compatibility record](https://github.com/Vvlladd/acp-plugin/blob/main/docs/COMPATIBILITY.md)
+records the anonymous download and isolated skill-installation check. No provider calls were made.
+Clean-machine, complete fresh-host/provider workflows and notarization remain separate acceptance.

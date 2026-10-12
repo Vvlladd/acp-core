@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a02001-0003-7003-8003-000000000003"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`[features].web_search_request` is deprecated because web search is enabled by default."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'cargo build && cargo test'","aggregated_output":"test result: ok. 12 passed; 0 failed.","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"status\":\"pass\",\"summary\":\"cargo build and cargo test both succeeded: 12 passed.\",\"commands\":[\"cargo build\",\"cargo test\"],\"failures\":[],\"diffHash\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":7000,"cached_input_tokens":3000,"output_tokens":90,"reasoning_output_tokens":30}}

@@ -1,0 +1,42 @@
+{
+  "$defs": {
+    "BuildStatus": {
+      "description": "How the attempt ended.",
+      "enum": [
+        "succeeded",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The report a builder's final message must be: what changed, and how it went.",
+  "properties": {
+    "filesChanged": {
+      "description": "Repo-relative paths this attempt changed.",
+      "items": {
+        "maxLength": 400,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 100,
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/BuildStatus"
+    },
+    "summary": {
+      "description": "What changed and why, for the human reviewing it.",
+      "maxLength": 4000,
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "filesChanged",
+    "status",
+    "summary"
+  ],
+  "title": "BuildResult",
+  "type": "object"
+}

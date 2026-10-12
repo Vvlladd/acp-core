@@ -1,0 +1,5 @@
+/target/
+/.acp/
+/tools/acp-swift-checks/.build/
+/tools/acp-swift-checks/.swiftpm/
+.DS_Store

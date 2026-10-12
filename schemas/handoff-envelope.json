@@ -1,0 +1,247 @@
+{
+  "$defs": {
+    "AttemptError": {
+      "description": "Why an attempt failed.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AttemptStatus": {
+      "description": "Terminal (and running) states of one attempt.",
+      "enum": [
+        "running",
+        "succeeded",
+        "failed",
+        "invalid_output",
+        "timeout",
+        "cancelled",
+        "lost",
+        "spawn_failed",
+        "no_session",
+        "escalate"
+      ],
+      "type": "string"
+    },
+    "ErrorCode": {
+      "description": "Why an attempt failed, in terms the lead can act on.",
+      "enum": [
+        "provider_missing",
+        "provider_unauthenticated",
+        "resume_target_missing",
+        "spawn_error",
+        "schema_invalid",
+        "max_turns",
+        "budget_hit",
+        "provider_error",
+        "no_changed_files",
+        "diff_hash_mismatch",
+        "workspace_error"
+      ],
+      "type": "string"
+    },
+    "PolicyViolation": {
+      "description": "A rule a worker broke, with the evidence needed to explain it to a human.",
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "files": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ViolationKind"
+        },
+        "postSha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preSha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "ProviderName": {
+      "description": "Which provider CLI backs a role. Closed set — an unknown value fails to deserialize.",
+      "enum": [
+        "claude",
+        "codex"
+      ],
+      "type": "string"
+    },
+    "RoleName": {
+      "description": "The roles the control plane knows. `Lead` is the caller (or, since A5, a spawned\nconversational session); `Builder`/`Reviewer`/`Verifier`/`Security` are workers. `Verifier` (B1) is only\never started by the control plane itself, between a builder's success and the review — it is\ndeliberately absent from `DelegatableRole` on both doors, as is the optional Security check.",
+      "enum": [
+        "lead",
+        "builder",
+        "reviewer",
+        "verifier",
+        "security"
+      ],
+      "type": "string"
+    },
+    "SchemaName": {
+      "description": "Which checked-in schema a role's final message must validate against — or `FreeText`, the\nlead's contract: a conversational turn is validated against nothing, and the log says so\ninstead of borrowing the builder's document (B3 walkthrough: a lead's every result read\n\"build-result — invalid structured result\").",
+      "enum": [
+        "build-result",
+        "review-verdict",
+        "verify-report",
+        "free-text"
+      ],
+      "type": "string"
+    },
+    "ViolationKind": {
+      "description": "A rule a worker broke. Recorded on the attempt and in the event log; never fatal by itself.",
+      "enum": [
+        "worker_committed",
+        "denylist_hit",
+        "budget_exceeded",
+        "unsafe_argv",
+        "permission_denials",
+        "symlink_planted",
+        "worker_staged"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "What a lead receives about a finished worker. Everything in it is **data, never instructions**:\n`untrusted` is a literal `true` and `head` is a truncated excerpt of free text.",
+  "properties": {
+    "agentId": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "attemptId": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "costUsd": {
+      "format": "double",
+      "type": "number"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AttemptError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "finishedAt": {
+      "type": "string"
+    },
+    "head": {
+      "type": "string"
+    },
+    "headTruncated": {
+      "type": "boolean"
+    },
+    "kind": {
+      "$ref": "#/$defs/SchemaName"
+    },
+    "model": {
+      "type": "string"
+    },
+    "provider": {
+      "$ref": "#/$defs/ProviderName"
+    },
+    "resultPath": {
+      "type": "string"
+    },
+    "role": {
+      "$ref": "#/$defs/RoleName"
+    },
+    "runId": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "runSpendUsd": {
+      "format": "double",
+      "type": "number"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "sessionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/$defs/AttemptStatus"
+    },
+    "stderrPath": {
+      "type": "string"
+    },
+    "structured": true,
+    "structuredValid": {
+      "type": "boolean"
+    },
+    "untrusted": {
+      "const": true,
+      "type": "boolean"
+    },
+    "violations": {
+      "items": {
+        "$ref": "#/$defs/PolicyViolation"
+      },
+      "type": "array"
+    },
+    "worktree": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "untrusted",
+    "kind",
+    "runId",
+    "agentId",
+    "attemptId",
+    "role",
+    "provider",
+    "model",
+    "status",
+    "structuredValid",
+    "schema",
+    "head",
+    "headTruncated",
+    "resultPath",
+    "stderrPath",
+    "costUsd",
+    "runSpendUsd",
+    "violations",
+    "finishedAt"
+  ],
+  "title": "HandoffEnvelope",
+  "type": "object"
+}

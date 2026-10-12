@@ -1,0 +1,263 @@
+{
+  "version": 1,
+  "ratesUpdated": "2026-09-11",
+  "gates": {
+    "allowAgentApprove": false
+  },
+  "limits": {
+    "maxConcurrentAttempts": 2
+  },
+  "defaults": {
+    "baseRef": "HEAD",
+    "maxDepth": 2,
+    "runBudgetUsd": 15,
+    "spawnBudgetUsd": 2,
+    "attemptTimeoutSec": 1800,
+    "awaitResultMaxSec": 300,
+    "strikesBeforeReplacement": 2,
+    "maxLineages": 2,
+    "denylistGlobs": [
+      "**/*.entitlements",
+      "**/*.xcconfig",
+      "**/Migrations/**",
+      ".github/workflows/**",
+      "fastlane/**",
+      "**/*.mobileprovision",
+      "**/*.p12",
+      "**/project.pbxproj"
+    ]
+  },
+  "providers": {
+    "claude": {
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "efforts": []
+    },
+    "codex": {
+      "models": [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "modelEfforts": {
+        "gpt-5.5": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "gpt-5.3-codex-spark": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    }
+  },
+  "rates": {
+    "gpt-5.5": {
+      "inputPerMTokUsd": 5.0,
+      "cachedInputPerMTokUsd": 0.5,
+      "outputPerMTokUsd": 30.0
+    },
+    "gpt-6-astra": {
+      "inputPerMTokUsd": 10.0,
+      "cachedInputPerMTokUsd": 1.0,
+      "outputPerMTokUsd": 50.0
+    },
+    "gpt-5.6-sol": {
+      "inputPerMTokUsd": 4.0,
+      "cachedInputPerMTokUsd": 0.4,
+      "outputPerMTokUsd": 20.0
+    },
+    "gpt-5.6-terra": {
+      "inputPerMTokUsd": 2.0,
+      "cachedInputPerMTokUsd": 0.2,
+      "outputPerMTokUsd": 12.0
+    },
+    "gpt-5.6-luna": {
+      "inputPerMTokUsd": 0.2,
+      "cachedInputPerMTokUsd": 0.02,
+      "outputPerMTokUsd": 1.2
+    }
+  },
+  "roles": {
+    "lead": {
+      "role": "lead",
+      "provider": "claude",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "haiku",
+      "writes": false,
+      "description": "Coordinates work through closed ACP tools; never writes or approves integration.",
+      "promptFile": "prompts/lead.md",
+      "promptSha256": "a6e3a5b4ecf9e58b3fc3a80f634d0a12445bdb1661ce83fddc9b6dc24ba3477f",
+      "tools": [
+        "mcp__acp__delegate",
+        "mcp__acp__submit_plan",
+        "mcp__acp__audit_existing",
+        "mcp__acp__send_message",
+        "mcp__acp__await_result",
+        "mcp__acp__get_status",
+        "mcp__acp__cancel",
+        "mcp__acp__request_human_gate",
+        "mcp__acp__resolve_gate"
+      ],
+      "maxTurns": 100,
+      "spawnBudgetUsd": 2,
+      "resultSchema": "free-text",
+      "allowedDelegations": [
+        "builder",
+        "reviewer",
+        "verifier",
+        "security"
+      ]
+    },
+    "builder": {
+      "role": "builder",
+      "provider": "claude",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "sonnet",
+      "writes": true,
+      "description": "Implements one task in an isolated worktree; never commits.",
+      "promptFile": "prompts/builder-worker.md",
+      "promptSha256": "f6e421735d3e83e4dac45b8049ecfee6586351ef8ae493519b7c1e70c413ab6a",
+      "tools": [
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep"
+      ],
+      "maxTurns": 40,
+      "spawnBudgetUsd": 2,
+      "resultSchema": "build-result",
+      "allowedDelegations": []
+    },
+    "reviewer": {
+      "role": "reviewer",
+      "provider": "codex",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "gpt-5.5",
+      "writes": false,
+      "description": "Reviews the builder's frozen diff read-only and returns a verdict.",
+      "sandboxMode": "read-only",
+      "promptFile": "prompts/reviewer-worker.md",
+      "promptSha256": "cad8e82500dd38d54c0fe2c0a9573dd8dc8b1e84abca495e804bb1c30b985038",
+      "maxTurns": 12,
+      "spawnBudgetUsd": 2,
+      "resultSchema": "review-verdict",
+      "allowedDelegations": []
+    },
+    "verifier": {
+      "role": "verifier",
+      "provider": "claude",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "haiku",
+      "writes": false,
+      "description": "Builds and runs the repo's tests in the builder's worktree between build and review; never modifies tracked files.",
+      "promptFile": "prompts/verifier-worker.md",
+      "promptSha256": "7312026288a65273df4c12b7712dc2936acc21163cb62172a94504fe2ff00b60",
+      "tools": [
+        "Bash",
+        "Read",
+        "Glob",
+        "Grep"
+      ],
+      "maxTurns": 24,
+      "spawnBudgetUsd": 2,
+      "resultSchema": "verify-report",
+      "allowedDelegations": []
+    },
+    "security": {
+      "role": "security",
+      "provider": "codex",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "gpt-5.5",
+      "writes": false,
+      "description": "Inspects the frozen diff for concrete security defects, read-only, and returns a diff-bound verdict.",
+      "sandboxMode": "read-only",
+      "promptFile": "prompts/security-worker.md",
+      "promptSha256": "48c2c6b6e6240c064d49bb6c22d107821e41b05c5a6c962df9eb3038d06974e8",
+      "maxTurns": 12,
+      "spawnBudgetUsd": 2,
+      "resultSchema": "review-verdict",
+      "allowedDelegations": [],
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep"
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a02001-0002-7002-8002-000000000002"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`[features].web_search_request` is deprecated because web search is enabled by default."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"apply_patch <<'EOF' ... EOF","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"apply_patch <<'EOF' ... EOF","aggregated_output":"Success. Updated the following files:\nA src/adder.ts","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"status\":\"succeeded\",\"filesChanged\":[\"src/adder.ts\"],\"summary\":\"Added src/adder.ts exporting add(a, b) under the codex workspace-write seatbelt.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":9001,"cached_input_tokens":4096,"output_tokens":120,"reasoning_output_tokens":48}}

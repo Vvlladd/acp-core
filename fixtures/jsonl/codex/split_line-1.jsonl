@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a02005-0005-7005-8005-000000000005"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"verdict\":\"PASS\",\"findings\":[],\"diffHash\":\"5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":17920,"cached_input_tokens":16128,"output_tokens":96,"reasoning_output_tokens":32}}

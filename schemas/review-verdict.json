@@ -1,0 +1,89 @@
+{
+  "$defs": {
+    "ReviewFinding": {
+      "additionalProperties": false,
+      "description": "One finding from a reviewer worker.",
+      "properties": {
+        "file": {
+          "maxLength": 400,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fix": {
+          "maxLength": 4000,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "problem": {
+          "maxLength": 4000,
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "required": [
+        "file",
+        "fix",
+        "line",
+        "problem",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Severity of one reviewer finding. `Blocking` findings drive the repair loop.",
+      "enum": [
+        "blocking",
+        "suggestion"
+      ],
+      "type": "string"
+    },
+    "Verdict": {
+      "description": "A reviewer's verdict. The casing matches the provider fixtures (`{\"verdict\":\"PASS\"}`).",
+      "enum": [
+        "PASS",
+        "FAIL"
+      ],
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The report a reviewer's final message must be: one verdict, plus every finding behind it.",
+  "properties": {
+    "diffHash": {
+      "description": "Copy the `diffHash` from your task prompt verbatim. A verdict that does not echo it is\ndiscarded: it cannot be shown to have reviewed the diff you were given.",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/ReviewFinding"
+      },
+      "maxItems": 100,
+      "type": "array"
+    },
+    "verdict": {
+      "$ref": "#/$defs/Verdict"
+    }
+  },
+  "required": [
+    "diffHash",
+    "findings",
+    "verdict"
+  ],
+  "title": "ReviewVerdict",
+  "type": "object"
+}

@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"dddddddd-4444-4d44-8d44-dddddddddddd"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"First lead answer."},{"type":"tool_use","id":"toolu_01LeadRead","name":"Read","input":{"file_path":"src/lib.rs"}},{"type":"text","text":"Second lead answer."}]}}
+{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","session_id":"dddddddd-4444-4d44-8d44-dddddddddddd","total_cost_usd":0.01,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10},"result":"done","structured_output":{"status":"succeeded","filesChanged":["src/adder.ts"],"summary":"Added src/adder.ts."}}

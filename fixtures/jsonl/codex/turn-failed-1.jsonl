@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a02004-0004-7004-8004-000000000004"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`[features].web_search_request` is deprecated because web search is enabled by default. (Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it.)"}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":500,\"error\":{\"type\":\"server_error\",\"message\":\"The model produced an invalid response. Please try again.\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":500,\"error\":{\"type\":\"server_error\",\"message\":\"The model produced an invalid response. Please try again.\"}}"}}

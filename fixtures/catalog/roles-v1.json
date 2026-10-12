@@ -1,0 +1,124 @@
+{
+  "roles": [
+    {
+      "provider": "claude",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "sonnet",
+      "writes": true,
+      "description": "Implements one task in an isolated worktree; never commits.",
+      "name": "builder"
+    },
+    {
+      "provider": "codex",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "gpt-5.5",
+      "writes": false,
+      "description": "Reviews the builder's frozen diff read-only and returns a verdict.",
+      "name": "reviewer"
+    },
+    {
+      "provider": "codex",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "gpt-5.5",
+      "writes": false,
+      "description": "Inspects the frozen diff for concrete security defects, read-only, and returns a diff-bound verdict.",
+      "name": "security"
+    },
+    {
+      "provider": "claude",
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "defaultModel": "haiku",
+      "writes": false,
+      "description": "Builds and runs the repo's tests in the builder's worktree between build and review; never modifies tracked files.",
+      "name": "verifier"
+    }
+  ],
+  "providers": {
+    "claude": {
+      "models": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "efforts": [],
+      "available": true
+    },
+    "codex": {
+      "models": [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark"
+      ],
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "modelEfforts": {
+        "gpt-5.5": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "gpt-5.3-codex-spark": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "available": true
+    }
+  }
+}

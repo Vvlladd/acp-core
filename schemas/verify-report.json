@@ -1,0 +1,59 @@
+{
+  "$defs": {
+    "VerifyStatus": {
+      "description": "What one verify attempt found (B1). `nothing-to-run` is a first-class answer: a repo with no\ndiscoverable build/test command must never fail verification for it, and a verifier must never\ninvent a command to have something to report.",
+      "enum": [
+        "pass",
+        "fail",
+        "nothing-to-run"
+      ],
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The verifier's schema-bound report (B1, `schemas/verify-report.json`). Every string is\nworker-authored and untrusted; the bounds here are the wire contract, enforced by the same\n`jsonschema` validation as the other worker results.",
+  "properties": {
+    "commands": {
+      "description": "The build/test commands actually run, for the human and the reviewer — never re-executed.",
+      "items": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 20,
+      "type": "array"
+    },
+    "diffHash": {
+      "description": "Copy the `diffHash` from your task prompt verbatim. A report that does not echo it is\ndiscarded: it cannot be shown to be about the state you were asked to verify.",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "failures": {
+      "description": "Failing test names / the top build error. Empty unless `status` is `fail`.",
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "type": "array"
+    },
+    "status": {
+      "$ref": "#/$defs/VerifyStatus"
+    },
+    "summary": {
+      "maxLength": 4000,
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "commands",
+    "diffHash",
+    "failures",
+    "status",
+    "summary"
+  ],
+  "title": "VerifyReport",
+  "type": "object"
+}

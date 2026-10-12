@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"eeeeeeee-5555-4e55-8e55-eeeeeeeeeeee"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I am ready to coordinate this work."}]}}
+{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","session_id":"eeeeeeee-5555-4e55-8e55-eeeeeeeeeeee","total_cost_usd":0.01,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10},"result":"Ready."}

@@ -25,6 +25,7 @@ use agent_control_plane::providers::{
     base_env, NormalizedEvent, ProviderAdapter, RawResult, ResultCtx, SandboxSpec, SpawnPlan,
     SpawnRequest,
 };
+use agent_control_plane::roles::loader::{estimate_cost_usd, load_roles};
 use serde_json::{json, Value};
 
 const MODEL: &str = "gpt-5.5";
@@ -381,19 +382,19 @@ fn thread_started_yields_the_one_session_event() {
 }
 
 #[test]
-fn turn_completed_usage_carries_all_four_token_counts() {
+fn turn_completed_usage_normalizes_all_four_token_counts() {
     let usage: Vec<NormalizedEvent> = events("review-pass-1.jsonl")
         .into_iter()
         .filter(|event| matches!(event, NormalizedEvent::Usage { .. }))
         .collect();
 
-    // The four counts on `review-pass-1.jsonl`'s last line, verbatim. Codex reports no dollar
-    // figure, so cost stays `None` and is computed later from the rate table.
+    // Codex's 18,432 total input includes 16,128 cached tokens. The adapter makes those categories
+    // disjoint before the rate estimator sees them. Cost stays `None` and is computed later.
     assert_eq!(
         usage,
         vec![NormalizedEvent::Usage {
             tokens: TokenUsage {
-                input: 18432,
+                input: 2304,
                 cached_input: 16128,
                 output: 142,
                 reasoning: Some(64),
@@ -401,6 +402,87 @@ fn turn_completed_usage_carries_all_four_token_counts() {
             cost_usd: None,
         }]
     );
+}
+
+#[test]
+fn codex_usage_normalization_flows_into_the_existing_rate_estimator() {
+    let cfg = load_roles(None).expect("embedded roles config");
+    let cases = [
+        (
+            "uncached",
+            json!({"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 10_000}),
+            TokenUsage {
+                input: 1_000_000,
+                cached_input: 0,
+                output: 10_000,
+                reasoning: None,
+            },
+            4.2,
+        ),
+        (
+            "partly cached",
+            json!({"input_tokens": 1_000_000, "cached_input_tokens": 900_000, "output_tokens": 10_000}),
+            TokenUsage {
+                input: 100_000,
+                cached_input: 900_000,
+                output: 10_000,
+                reasoning: None,
+            },
+            0.96,
+        ),
+        (
+            "fully cached",
+            json!({"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000, "output_tokens": 10_000}),
+            TokenUsage {
+                input: 0,
+                cached_input: 1_000_000,
+                output: 10_000,
+                reasoning: None,
+            },
+            0.6,
+        ),
+        (
+            "cached count absent",
+            json!({"input_tokens": 1_000_000, "output_tokens": 10_000}),
+            TokenUsage {
+                input: 1_000_000,
+                cached_input: 0,
+                output: 10_000,
+                reasoning: None,
+            },
+            4.2,
+        ),
+        (
+            "cached greater than total",
+            json!({"input_tokens": 1_000_000, "cached_input_tokens": 1_100_000, "output_tokens": 10_000}),
+            TokenUsage {
+                input: 0,
+                cached_input: 1_100_000,
+                output: 10_000,
+                reasoning: None,
+            },
+            0.64,
+        ),
+    ];
+
+    for (label, usage, expected_tokens, expected_cost) in cases {
+        let line = json!({"type": "turn.completed", "usage": usage}).to_string();
+        let parsed = CodexAdapter.parse_line(&line);
+        let tokens = match parsed.as_slice() {
+            [NormalizedEvent::Usage {
+                tokens,
+                cost_usd: None,
+            }, NormalizedEvent::Completed] => *tokens,
+            other => panic!("{label}: unexpected events: {other:?}"),
+        };
+
+        assert_eq!(tokens, expected_tokens, "{label}");
+        let cost = estimate_cost_usd(&cfg, "gpt-5.6-sol", &tokens);
+        assert!(
+            (cost - expected_cost).abs() < 1e-9,
+            "{label}: estimate was {cost}, expected {expected_cost}"
+        );
+    }
 }
 
 #[test]

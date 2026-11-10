@@ -65,3 +65,16 @@ worktrees merely because supervision stopped. See CLI help for human commands.
 The optional private app is another socket client. `acp app` task links do not install that app
 or transfer a host's entire conversation. Standalone `acp review` works through the public CLI
 and helper; automatic builder checks and direct lead/MCP review are still future work.
+
+## Usage accounting
+
+Persisted `TokenUsage` records use disjoint categories: `input` is fresh, uncached input and
+`cachedInput` is cache-read input. Rate-table estimates charge each category once at its own rate.
+Provider adapters normalize native counters at the boundary; in particular, Codex reports cached
+input as a subset of total input, so ACP subtracts that subset for newly processed attempts.
+If a Codex event reports cached input greater than total input, fresh input safely saturates at zero
+and the reported cached count is retained rather than hidden.
+
+This normalization is prospective. Raw provider stdout remains verbatim, and ACP does not rewrite
+persisted token or spend records. Historical attempts, including blocked runs, therefore retain the
+accounting recorded by the version that executed them.

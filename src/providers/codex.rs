@@ -403,8 +403,13 @@ fn item_phase(value: &Value) -> Option<NormalizedEvent> {
     })
 }
 
-/// `turn.completed` → the four token counts, verbatim. Codex reports no dollar figure, so cost is
-/// computed later from `roles.json`'s rate table (`CostSource::RateTable`), never guessed here.
+/// `turn.completed` → provider-neutral token counts. Codex's `input_tokens` includes the
+/// `cached_input_tokens` subset, while [`TokenUsage`] and the rate estimators require disjoint
+/// fresh-input and cached-input categories. Subtract that subset here at the provider boundary.
+/// If Codex ever reports cached input greater than total input, saturating subtraction records no
+/// fresh input while retaining the reported cached count; this avoids underflow without silently
+/// discarding usage. Codex reports no dollar figure, so cost is computed later from `roles.json`'s
+/// rate table (`CostSource::RateTable`), never guessed here.
 fn usage_event(value: &Value) -> NormalizedEvent {
     let usage = value.get("usage");
     let count = |key: &str| {
@@ -412,10 +417,12 @@ fn usage_event(value: &Value) -> NormalizedEvent {
             .and_then(|usage| usage.get(key))
             .and_then(Value::as_u64)
     };
+    let total_input = count("input_tokens").unwrap_or(0);
+    let cached_input = count("cached_input_tokens").unwrap_or(0);
     NormalizedEvent::Usage {
         tokens: TokenUsage {
-            input: count("input_tokens").unwrap_or(0),
-            cached_input: count("cached_input_tokens").unwrap_or(0),
+            input: total_input.saturating_sub(cached_input),
+            cached_input,
             output: count("output_tokens").unwrap_or(0),
             reasoning: count("reasoning_output_tokens"),
         },

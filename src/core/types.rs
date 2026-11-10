@@ -747,7 +747,10 @@ pub struct Attempt {
     pub diff_path: Option<PathBuf>,
 }
 
-/// Token counts for one attempt, as reported by the provider.
+/// Provider-neutral token counts for one attempt. In newly produced records, `input` is fresh
+/// (uncached) input and `cached_input` is cache-read input, so the two categories are disjoint for
+/// rate estimation. Provider adapters normalize their native counters into these semantics before
+/// persistence; existing durable records are not migrated.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {

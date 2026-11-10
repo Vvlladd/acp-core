@@ -266,21 +266,18 @@ impl ProviderAdapter for CodexAdapter {
             // Usage and explicit terminal evidence are separate: the supervisor needs the latter
             // after reattachment, while the final result is still read from the output file.
             "turn.completed" => vec![usage_event(&value), NormalizedEvent::Completed],
-            "turn.failed" => vec![NormalizedEvent::Final {
-                ok: false,
-                text: Some(
-                    value
-                        .get("error")
-                        .and_then(|error| str_field(error, "message"))
-                        .unwrap_or("codex reported turn.failed with no error message")
-                        .to_string(),
-                ),
-                structured: None,
-                stop_reason: Some(kind.to_string()),
-                cost_usd: None,
-                tokens: None,
-                error_code: Some(ErrorCode::ProviderError),
-            }],
+            "turn.failed" => {
+                let (message, error_code) = codex_failure(&value);
+                vec![NormalizedEvent::Final {
+                    ok: false,
+                    text: Some(message),
+                    structured: None,
+                    stop_reason: Some(kind.to_string()),
+                    cost_usd: None,
+                    tokens: None,
+                    error_code: Some(error_code),
+                }]
+            }
             // A top-level `error` line: the API call behind the turn failed. Not fatal by itself —
             // Codex may retry, and when it does not the `turn.failed` line above is what ends the
             // attempt. Killing the child here would pre-empt the CLI's own recovery.
@@ -385,6 +382,47 @@ fn path_arg(path: &Path) -> String {
 
 fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+/// A terminal Codex error envelope mapped at the provider boundary. The core deliberately knows
+/// neither Codex error codes nor model names. Only closed, structured admission codes are special;
+/// unknown failures (including ordinary transient server and rate-limit failures) retain the
+/// existing finite retry behavior as `provider_error`.
+fn codex_failure(value: &Value) -> (String, ErrorCode) {
+    const MAX_MESSAGE_CHARS: usize = 1_000;
+    let raw = value
+        .get("error")
+        .and_then(|error| str_field(error, "message"))
+        .unwrap_or("codex reported turn.failed with no error message");
+    let envelope = serde_json::from_str::<Value>(raw).ok();
+    let detail = envelope
+        .as_ref()
+        .and_then(|outer| outer.get("error"))
+        .filter(|error| error.is_object())
+        .or(envelope.as_ref());
+    let code = detail
+        .and_then(|error| str_field(error, "code"))
+        .unwrap_or_default();
+    let category = match code {
+        "model_not_found" | "model_not_supported" | "unsupported_model" => {
+            ErrorCode::ProviderModelUnavailable
+        }
+        "usage_limit_reached" | "insufficient_quota" | "quota_exhausted" => {
+            ErrorCode::ProviderUsageLimit
+        }
+        _ => ErrorCode::ProviderError,
+    };
+    let message = if category == ErrorCode::ProviderError {
+        raw.to_string()
+    } else {
+        detail
+            .and_then(|error| str_field(error, "message"))
+            .unwrap_or(raw)
+            .chars()
+            .take(MAX_MESSAGE_CHARS)
+            .collect()
+    };
+    (message, category)
 }
 
 /// `item.started` / `item.completed` → the phase named by `item.type`, annotated with the item's

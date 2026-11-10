@@ -1477,8 +1477,9 @@ impl Core {
 
 /// What a lead should do next with one agent (Rev 25), in priority order.
 ///
-/// The environment check comes first because it is the one branch that is never the model's fault
-/// and never resolves on its own (17a: no strike, the run is blocked until a human fixes the CLI).
+/// The environment/admission check comes first because it is never the model's fault and an
+/// equivalent automatic attempt cannot resolve it (17a: no strike, the run is blocked until the
+/// CLI environment or recorded account/model access changes).
 fn recommended_next(
     run: &Run,
     agent: &AgentHandle,
@@ -1490,7 +1491,10 @@ fn recommended_next(
     if let Some(error) = error {
         if matches!(
             error.code,
-            ErrorCode::ProviderMissing | ErrorCode::ProviderUnauthenticated
+            ErrorCode::ProviderMissing
+                | ErrorCode::ProviderUnauthenticated
+                | ErrorCode::ProviderUsageLimit
+                | ErrorCode::ProviderModelUnavailable
         ) {
             return RecommendedNext::FixEnvironment;
         }

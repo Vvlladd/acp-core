@@ -557,6 +557,63 @@ fn turn_failed_yields_a_failed_final() {
 }
 
 #[test]
+fn structured_model_admission_refusal_is_provider_neutral_and_bounded() {
+    let message = serde_json::json!({
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "message": "The selected model is unavailable for this account.",
+            "code": "model_not_found"
+        }
+    })
+    .to_string();
+    let line = serde_json::json!({
+        "type": "turn.failed",
+        "error": { "message": message }
+    })
+    .to_string();
+
+    assert_eq!(
+        CodexAdapter.parse_line(&line),
+        vec![NormalizedEvent::Final {
+            ok: false,
+            text: Some("The selected model is unavailable for this account.".to_string()),
+            structured: None,
+            stop_reason: Some("turn.failed".to_string()),
+            cost_usd: None,
+            tokens: None,
+            error_code: Some(ErrorCode::ProviderModelUnavailable),
+        }]
+    );
+}
+
+#[test]
+fn transient_and_unknown_codex_failures_stay_retryable_provider_errors() {
+    for (status, code) in [(429, "rate_limit_exceeded"), (503, "server_error")] {
+        let message = serde_json::json!({
+            "type": "error",
+            "status": status,
+            "error": { "message": "try again later", "code": code }
+        })
+        .to_string();
+        let line = serde_json::json!({
+            "type": "turn.failed",
+            "error": { "message": message }
+        })
+        .to_string();
+        let parsed = CodexAdapter.parse_line(&line);
+        assert!(matches!(
+            parsed.as_slice(),
+            [NormalizedEvent::Final {
+                error_code: Some(ErrorCode::ProviderError),
+                ..
+            }]
+        ));
+    }
+}
+
+#[test]
 fn every_transcript_starts_with_a_session_and_emits_bounded_normalized_events() {
     for name in TRANSCRIPTS {
         let transcript = fixture(name);

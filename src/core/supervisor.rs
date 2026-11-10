@@ -2959,6 +2959,21 @@ fn classify(
             }),
         );
     }
+    if matches!(
+        raw.error_code,
+        Some(ErrorCode::ProviderUsageLimit | ErrorCode::ProviderModelUnavailable)
+    ) {
+        let code = raw.error_code.expect("matched a provider admission code");
+        return (
+            AttemptStatus::SpawnFailed,
+            Some(AttemptError {
+                code,
+                message: raw.text.clone().unwrap_or_else(|| {
+                    "the provider refused this account/model before worker work began".to_string()
+                }),
+            }),
+        );
+    }
     // "Died before `system/init`" is a claim only a supervisor that watched the first line may
     // make; a resumed tail starts past it, and the session it recorded before the restart is what
     // `ctx.session_id` carries back in.

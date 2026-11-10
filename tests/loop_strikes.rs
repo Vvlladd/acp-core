@@ -25,15 +25,18 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_control_plane::core::handoff::ADVISORY_OPEN;
+use agent_control_plane::core::recovery::Request as RecoveryRequest;
 use agent_control_plane::core::types::{
-    AgentId, AgentStatus, AttemptId, AttemptKind, AttemptStatus, ErrorCode, Event, EventPayload,
-    GateKind, LineageId, LoopBranch, RoleName, RunId, RunStatus, ViolationKind,
+    Actor, AgentId, AgentStatus, AttemptId, AttemptKind, AttemptStatus, ErrorCode, Event,
+    EventPayload, GateKind, GateStatus, LineageId, LoopBranch, RoleName, RunId, RunStatus,
+    ViolationKind,
 };
-use agent_control_plane::core::StatusQuery;
+use agent_control_plane::core::{RecommendedNext, StatusQuery};
 use agent_control_plane::providers::find_on_path;
 
 use common::{
@@ -588,6 +591,208 @@ fn auth_fail_blocks_the_run_without_a_strike_via_17a() {
             "{:?}",
             blocked_reasons(&events)
         );
+    });
+}
+
+/// A provider can admit the CLI process and still refuse the selected model before any reviewer
+/// work. The adapter maps the structured native envelope to a closed generic category; the loop
+/// blocks on the first refusal, preserves the builder draft, and does not claim a review happened.
+#[test]
+fn unavailable_reviewer_model_blocks_once_without_consuming_builder_lineage() {
+    common::with_exclusive_env(|| async {
+        common::install_fake_clis();
+        let world = LoopWorld::new("pass", &[]);
+        let override_dir = tempfile::tempdir().expect("provider override dir");
+        let codex = override_dir.path().join("codex");
+        let available = override_dir.path().join("provider-available");
+        let fallback_codex = find_on_path("codex").expect("installed fake codex wrapper");
+        let script = format!(
+            r##"#!/bin/sh
+if [ -e '{available}' ]; then
+  exec '{fallback}' "$@"
+fi
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'codex-cli 0.132.0'
+  exit 0
+fi
+printf '%s\n' \
+  '{{"type":"thread.started","thread_id":"11111111-2222-4333-8444-555555555555"}}' \
+  '{{"type":"turn.started"}}' \
+  '{{"type":"turn.failed","error":{{"message":"{{\"type\":\"error\",\"status\":400,\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"The selected model is unavailable for this account.\",\"code\":\"model_not_found\"}}}}"}}}}'
+exit 1
+"##,
+            available = available.display(),
+            fallback = fallback_codex.display(),
+        );
+        std::fs::write(&codex, script).expect("write fake codex admission refusal");
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake codex executable");
+        let mut provider_path = vec![override_dir.path().to_path_buf()];
+        provider_path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let narrowed = PathGuard::narrow(&provider_path);
+
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let handle = actor.handle.clone();
+        let out = handle
+            .delegate(delegate_builder(loop_task("T37-provider-model-admission")))
+            .await
+            .expect("builder delegation accepted");
+        let blocked_status = wait_for_status(
+            &handle,
+            StatusQuery {
+                run_id: Some(out.run_id),
+                ..StatusQuery::default()
+            },
+            "provider admission block",
+            |status| {
+                status
+                    .runs
+                    .first()
+                    .is_some_and(|run| run.status == RunStatus::Blocked)
+            },
+        )
+        .await;
+        let refused_reviewer = blocked_status
+            .agents
+            .iter()
+            .find(|agent| agent.role == RoleName::Reviewer)
+            .expect("the refused reviewer is projected in status");
+        assert_eq!(
+            refused_reviewer.recommended_next,
+            RecommendedNext::FixEnvironment,
+            "status directs the lead to restore access, not repeat an equivalent delegation"
+        );
+        quiesce(&handle).await;
+        actor.stop().await;
+
+        let events = world.events(&out.run_id);
+        assert_eq!(
+            finished(&events),
+            vec![
+                (AttemptStatus::Succeeded, None),
+                (AttemptStatus::Succeeded, None),
+                (
+                    AttemptStatus::SpawnFailed,
+                    Some(ErrorCode::ProviderModelUnavailable),
+                ),
+            ],
+            "one builder, its selected verifier, and exactly one refused reviewer"
+        );
+        assert_eq!(
+            reviewers(&events).len(),
+            1,
+            "no equivalent replacement reviewer"
+        );
+        assert!(
+            strikes(&events).is_empty(),
+            "provider admission consumes no builder strike"
+        );
+        assert!(gate_summaries(&events, GateKind::Integrate).is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(&event.payload, EventPayload::DiffFrozen { .. })),
+            "the builder draft remains frozen for deliberate continuation"
+        );
+        let reasons = blocked_reasons(&events);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("provider_model_unavailable")
+                    && reason.contains("selected model is unavailable")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains("failed review")),
+            "{reasons:?}"
+        );
+
+        // Prefix replay of a blocked run must not manufacture another provider attempt.
+        let replay = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let replay_handle = replay.handle.clone();
+        quiesce(&replay_handle).await;
+        assert_eq!(attempts_started(&world.events(&out.run_id)).len(), 3);
+
+        // Once access returns, deliberate recovery reuses the draft and still runs every selected
+        // check before presenting the unchanged human integration gate.
+        std::fs::write(&available, "available\n").expect("restore fake provider access");
+        let preview = replay_handle
+            .recovery_preview(out.run_id)
+            .await
+            .expect("recovery preview");
+        assert!(
+            preview.unavailable_reason.is_none(),
+            "{:?}",
+            preview.unavailable_reason
+        );
+        let source = preview
+            .candidates
+            .first()
+            .expect("preserved builder candidate");
+        let recovered = replay_handle
+            .recover_run(
+                RecoveryRequest {
+                    run_id: out.run_id,
+                    source_agent_id: source.agent_id,
+                    expected_seq: preview.seq,
+                    request_id: uuid::Uuid::new_v4(),
+                    builder: source.builder.clone(),
+                    feedback: "Provider access is restored; continue the preserved draft".into(),
+                },
+                Actor::Socket {
+                    client_name: "provider-admission-test".into(),
+                },
+            )
+            .await
+            .expect("human-confirmed recovery");
+        let status = wait_for_status(
+            &replay_handle,
+            StatusQuery {
+                run_id: Some(out.run_id),
+                ..StatusQuery::default()
+            },
+            "recovered integration gate",
+            |status| {
+                status.gates.iter().any(|gate| {
+                    gate.run_id == out.run_id
+                        && gate.kind == GateKind::Integrate
+                        && gate.status == GateStatus::Pending
+                })
+            },
+        )
+        .await;
+        assert!(status.gates.iter().any(|gate| gate.run_id == out.run_id
+            && gate.kind == GateKind::Integrate
+            && gate.status == GateStatus::Pending));
+        let recovered_events = world.events(&out.run_id);
+        let recovery_seq = recovered_events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::RunRecovered { recovery }
+                    if recovery.agent_id == recovered.agent_id =>
+                {
+                    Some(event.base.seq)
+                }
+                _ => None,
+            })
+            .expect("recovery is durable");
+        assert!(recovered_events
+            .iter()
+            .any(|event| event.base.seq > recovery_seq
+                && matches!(&event.payload, EventPayload::VerifyReport { .. })));
+        assert!(recovered_events
+            .iter()
+            .any(|event| event.base.seq > recovery_seq
+                && matches!(&event.payload, EventPayload::ReviewVerdict { .. })));
+        assert!(!recovered_events
+            .iter()
+            .any(|event| matches!(&event.payload, EventPayload::IntegrateCommitted { .. })));
+        replay.stop().await;
+        drop(narrowed);
     });
 }
 

@@ -306,6 +306,14 @@ pub enum AttemptStatus {
 pub enum ErrorCode {
     ProviderMissing,
     ProviderUnauthenticated,
+    // The provider accepted the CLI invocation but refused admission because the account's
+    // deliberate usage allowance is unavailable. This is distinct from a transient provider
+    // error: repeating the same request automatically cannot restore that allowance.
+    ProviderUsageLimit,
+    // The provider rejected the recorded model for this account or endpoint before worker work
+    // began. The catalog remains the local allowlist; this reports the narrower remote admission
+    // decision without teaching the core provider-specific model names or error strings.
+    ProviderModelUnavailable,
     ResumeTargetMissing,
     SpawnError,
     SchemaInvalid,
@@ -461,7 +469,8 @@ pub enum LoopBranch {
     /// A conversational lead turn ended; it becomes idle and awaits a human follow-up.
     #[serde(rename = "lead")]
     Lead,
-    /// 17a — an environment failure. No strike; the run is blocked until a human fixes the CLI.
+    /// 17a — an environment or provider-admission failure. No strike; the run is blocked until
+    /// the CLI environment or recorded account/model access changes.
     #[serde(rename = "17a")]
     Environment,
     /// 17b — a resumable failure: strike, then repair the same session.

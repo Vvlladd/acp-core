@@ -459,6 +459,7 @@ fn parse_result(value: &Value) -> Vec<NormalizedEvent> {
     let tokens = token_usage(value.get("usage"));
     let cost_usd = value.get("total_cost_usd").and_then(Value::as_f64);
     let subtype = str_at(value, "subtype");
+    let failure = claude_failure(value);
     vec![
         NormalizedEvent::Usage { tokens, cost_usd },
         NormalizedEvent::Final {
@@ -467,7 +468,10 @@ fn parse_result(value: &Value) -> Vec<NormalizedEvent> {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            text: str_at(value, "result").map(str::to_string),
+            text: failure
+                .as_ref()
+                .map(|(message, _)| message.clone())
+                .or_else(|| str_at(value, "result").map(str::to_string)),
             structured: value
                 .get("structured_output")
                 .filter(|structured| !structured.is_null())
@@ -489,9 +493,57 @@ fn parse_result(value: &Value) -> Vec<NormalizedEvent> {
             tokens: Some(tokens),
             // The one failure Claude names precisely enough to act on; every other `is_error` is
             // classified by the caller from the exit code and the terminal-state table.
-            error_code: (subtype == Some("error_max_turns")).then_some(ErrorCode::MaxTurns),
+            error_code: failure
+                .map(|(_, code)| code)
+                .or_else(|| (subtype == Some("error_max_turns")).then_some(ErrorCode::MaxTurns)),
         },
     ]
+}
+
+/// Claude's terminal admission refusals, normalized before they reach provider-neutral core code.
+/// Structured error codes win. Older CLI releases expose account usage exhaustion only as a
+/// terminal `result`/`errors` message, so the adapter also recognizes a deliberately narrow set of
+/// provider-owned phrases. Generic 429/rate-limit and unknown failures are intentionally omitted:
+/// those remain transient/unknown and keep the existing finite retry controls.
+fn claude_failure(value: &Value) -> Option<(String, ErrorCode)> {
+    if !value
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    const MAX_MESSAGE_CHARS: usize = 1_000;
+    let object = value.get("error").filter(|error| error.is_object());
+    let structured_code =
+        object.and_then(|error| str_at(error, "code").or_else(|| str_at(error, "type")));
+    let raw = object
+        .and_then(|error| str_at(error, "message"))
+        .or_else(|| str_at(value, "result"))
+        .or_else(|| {
+            value
+                .get("errors")
+                .and_then(Value::as_array)
+                .and_then(|errors| errors.iter().find_map(Value::as_str))
+        })?;
+    let lower = raw.to_ascii_lowercase();
+    let code = match structured_code {
+        Some("model_not_found" | "model_not_supported" | "unsupported_model") => {
+            ErrorCode::ProviderModelUnavailable
+        }
+        Some("usage_limit_reached" | "insufficient_quota" | "quota_exhausted") => {
+            ErrorCode::ProviderUsageLimit
+        }
+        _ if lower.contains("you've hit your limit")
+            || lower.contains("you have hit your limit")
+            || lower.contains("usage limit reached")
+            || lower.contains("credit balance is too low") =>
+        {
+            ErrorCode::ProviderUsageLimit
+        }
+        _ => return None,
+    };
+    Some((raw.chars().take(MAX_MESSAGE_CHARS).collect(), code))
 }
 
 /// The final text as JSON, tolerating one surrounding markdown fence — and, failing that, prose

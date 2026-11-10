@@ -37,6 +37,8 @@
       "enum": [
         "provider_missing",
         "provider_unauthenticated",
+        "provider_usage_limit",
+        "provider_model_unavailable",
         "resume_target_missing",
         "spawn_error",
         "schema_invalid",

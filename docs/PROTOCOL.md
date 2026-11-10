@@ -78,3 +78,16 @@ and the reported cached count is retained rather than hidden.
 This normalization is prospective. Raw provider stdout remains verbatim, and ACP does not rewrite
 persisted token or spend records. Historical attempts, including blocked runs, therefore retain the
 accounting recorded by the version that executed them.
+
+## Provider admission failures
+
+Provider adapters may classify a validated native refusal as `provider_usage_limit` or
+`provider_model_unavailable`. These mean the provider declined the recorded account/model before
+worker work began; they are not review findings. ACP records the attempt and its bounded provider
+message, blocks the run without a lineage strike, and does not start an equivalent replacement.
+Unknown and transient provider failures remain under the normal finite retry and checker limits.
+
+After access changes, a human may deliberately recover the preserved draft. Recovery retains the
+recorded execution profile, usage, historical strikes, selected verify/review/security steps and
+human integration gate; it does not probe accounts, switch providers/models, or treat an unavailable
+check as passing.

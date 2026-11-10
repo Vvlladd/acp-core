@@ -186,7 +186,8 @@ impl PendingSpawn {
 /// error code and its role, and from nothing else, so the table is directly testable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Branch {
-    /// 17a — the CLI is missing or unauthenticated. No strike; a human has to fix the machine.
+    /// 17a — the CLI or provider admission is unavailable. No strike; an equivalent automatic
+    /// retry cannot fix the environment or account/model access.
     Environment,
     /// A denylist hit or an unverifiable workspace: an `escalate` gate, no strike, no reviewer.
     Escalate,
@@ -213,7 +214,12 @@ enum Branch {
 fn branch_of(role: RoleName, status: AttemptStatus, error: Option<&AttemptError>) -> Branch {
     if matches!(
         error.map(|e| e.code),
-        Some(ErrorCode::ProviderMissing | ErrorCode::ProviderUnauthenticated)
+        Some(
+            ErrorCode::ProviderMissing
+                | ErrorCode::ProviderUnauthenticated
+                | ErrorCode::ProviderUsageLimit
+                | ErrorCode::ProviderModelUnavailable
+        )
     ) {
         return Branch::Environment;
     }
@@ -1449,8 +1455,8 @@ impl Core {
         }
     }
 
-    /// 17a — an environment failure. **No strike**: the model did nothing wrong and a repair
-    /// attempt would fail identically until a human installs or logs into the CLI.
+    /// 17a — an environment or provider-admission failure. **No strike**: the model did nothing
+    /// wrong and an equivalent repair would fail identically until access changes.
     fn branch_environment(&mut self, f: &Finished) {
         let reason = f.error.as_ref().map_or_else(
             || "the provider CLI could not be started".to_string(),
@@ -4688,6 +4694,8 @@ fn error_key(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::ProviderMissing => "provider_missing",
         ErrorCode::ProviderUnauthenticated => "provider_unauthenticated",
+        ErrorCode::ProviderUsageLimit => "provider_usage_limit",
+        ErrorCode::ProviderModelUnavailable => "provider_model_unavailable",
         ErrorCode::ResumeTargetMissing => "resume_target_missing",
         ErrorCode::SpawnError => "spawn_error",
         ErrorCode::SchemaInvalid => "schema_invalid",
@@ -4740,6 +4748,21 @@ mod tests {
             ),
             Branch::Environment
         );
+        for code in [
+            ErrorCode::ProviderUsageLimit,
+            ErrorCode::ProviderModelUnavailable,
+        ] {
+            assert_eq!(
+                branch_of(b, S::SpawnFailed, Some(&err(code))),
+                Branch::Environment,
+                "a recognized admission refusal never consumes a builder strike"
+            );
+            assert_eq!(
+                branch_of(r, S::SpawnFailed, Some(&err(code))),
+                Branch::Environment,
+                "a recognized admission refusal never spawns a replacement reviewer"
+            );
+        }
         // A denylist hit and an unverifiable workspace both escalate without striking.
         assert_eq!(branch_of(b, S::Escalate, None), Branch::Escalate);
         assert_eq!(

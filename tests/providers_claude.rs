@@ -217,6 +217,59 @@ fn parse_fixture(name: &str) -> Vec<NormalizedEvent> {
         .collect()
 }
 
+#[test]
+fn terminal_usage_admission_refusal_is_classified_without_account_details() {
+    let line = serde_json::json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "session_id": SESSION_ID,
+        "result": "You've hit your limit. Try again after access is restored.",
+        "usage": {}
+    })
+    .to_string();
+    let events = ClaudeAdapter.parse_line(&line);
+    assert!(matches!(
+        events.as_slice(),
+        [
+            NormalizedEvent::Usage { .. },
+            NormalizedEvent::Final {
+                error_code: Some(ErrorCode::ProviderUsageLimit),
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn transient_rate_limits_and_unknown_claude_errors_remain_generic() {
+    for message in [
+        "rate limit exceeded; retry shortly",
+        "temporary upstream failure",
+    ] {
+        let line = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "session_id": SESSION_ID,
+            "result": message,
+            "usage": {}
+        })
+        .to_string();
+        let events = ClaudeAdapter.parse_line(&line);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                NormalizedEvent::Usage { .. },
+                NormalizedEvent::Final {
+                    error_code: None,
+                    ..
+                }
+            ]
+        ));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // argv helpers
 // ---------------------------------------------------------------------------

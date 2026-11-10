@@ -55,6 +55,11 @@ pub enum PolicyCode {
     WorktreeBusy,
     /// A socket-started lead already has a provider spawn or running attempt in this repository.
     LeadBusy,
+    /// The agent already owns an accepted attempt — a spawn being prepared, a running, cancelling
+    /// or finalizing attempt, or a finished one whose result the loop has not processed yet — so a
+    /// follow-up (`send_message` or a resume delegation) would overlap it on the same provider
+    /// session and worktree. Nothing is recorded; retry once the agent is idle.
+    AgentBusy,
     GatePending,
     InvalidTask,
     /// A submitted B3 plan whose shape failed `plan::validate_plan` — the reason carries the
@@ -100,6 +105,7 @@ impl PolicyCode {
             PolicyCode::BudgetSpawnExceeded => "budget_spawn_exceeded",
             PolicyCode::WorktreeBusy => "worktree_busy",
             PolicyCode::LeadBusy => "lead_busy",
+            PolicyCode::AgentBusy => "agent_busy",
             PolicyCode::GatePending => "gate_pending",
             PolicyCode::InvalidTask => "invalid_task",
             PolicyCode::InvalidPlan => "invalid_plan",
@@ -747,6 +753,7 @@ mod tests {
         PolicyCode::BudgetSpawnExceeded,
         PolicyCode::WorktreeBusy,
         PolicyCode::LeadBusy,
+        PolicyCode::AgentBusy,
         PolicyCode::GatePending,
         PolicyCode::InvalidTask,
         PolicyCode::InvalidBaseRef,
@@ -766,10 +773,10 @@ mod tests {
     ];
 
     /// Twenty in the design as first written, plus `team_invalid` and `model_provider_mismatch`
-    /// from Rev 26, `gate_pending` from the T35 final-review follow-up, and A5's `lead_busy`.
+    /// from Rev 26, `gate_pending` from the T35 final-review follow-up, A5's `lead_busy`, and issue #4's `agent_busy`.
     #[test]
-    fn the_code_set_is_the_twenty_four_the_design_fixes() {
-        assert_eq!(ALL.len(), 24);
+    fn the_code_set_is_the_twenty_five_the_design_fixes() {
+        assert_eq!(ALL.len(), 25);
     }
 
     #[test]

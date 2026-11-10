@@ -34,6 +34,24 @@ own default, so teams saved before efforts existed keep working unchanged.
   only while the agent still runs the recorded provider and model. Editing the saved team later
   does not change it.
 
+## Follow-ups and resumes
+
+`send_message` (`acp send`, the socket and MCP doors) and a delegation with a resume session do
+not deliver a message into a running process. Each launches a **new** provider attempt on the
+agent's recorded session and worktree, and is accepted only while that agent is idle. At most one
+accepted attempt owns an agent's session and writable worktree at a time, from the moment it is
+accepted until the loop has processed its result:
+
+- a spawn being prepared, an attempt that is running, being cancelled or being finalized, or a
+  finished attempt whose loop step has not been recorded yet all make the agent busy;
+- an overlapping follow-up is refused with the stable code `agent_busy` (detail: `agentId`,
+  `state` = `preparing` | `running` | `result_pending`, `attemptId`). The refusal records no
+  attempt, strike, spend or transcript turn; there is no queue, so retry once the agent is idle;
+- a lead's own live attempt still answers `lead_busy` first; gate, budget and cancelled-run
+  refusals are unchanged;
+- an idle session whose last attempt finished — including one a human cancelled — accepts one
+  follow-up, which makes it busy again until that attempt is processed.
+
 Events and state remain local. Output schemas are validated and free text is bounded/untrusted.
 Frozen evidence identifies the attempt and exact diff, with an assembled 8 MiB diff budget.
 Integration checks those bytes under the same worktree lock used for finalization. This is distinct

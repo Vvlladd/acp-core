@@ -2270,6 +2270,219 @@ mod tests {
         attempt
     }
 
+    /// Issue #4 fixture: a builder attempt the supervisor still owns (`running`), with the provider
+    /// session the builder would be resumed on.
+    fn start_resumable_attempt(core: &mut Core, run: &RunId, agent: AgentId) -> AttemptId {
+        let attempt = AttemptId::new_v4();
+        core.registry
+            .append(
+                run,
+                EventPayload::AttemptStarted {
+                    attempt_id: attempt,
+                    agent_id: agent,
+                    attempt_kind: crate::core::types::AttemptKind::Fresh,
+                    dir: core.state_dir.join("attempt"),
+                    argv: vec!["claude".to_string()],
+                    cwd: core.repo_root.clone(),
+                    pid: 4242,
+                    pgid: 4242,
+                    start_time: "Sat Aug 23 00:00:00 2026".to_string(),
+                    pre_sha: "0".repeat(40),
+                    timeout_sec: 900,
+                    spawn_budget_usd: 2.0,
+                },
+            )
+            .expect("attempt.started");
+        core.registry
+            .append(
+                run,
+                EventPayload::AgentSession {
+                    agent_id: agent,
+                    attempt_id: attempt,
+                    session_id: "session-1".to_string(),
+                    src_line: 1,
+                },
+            )
+            .expect("agent.session");
+        attempt
+    }
+
+    fn finish(core: &mut Core, run: &RunId, attempt: AttemptId, status: AttemptStatus) {
+        core.registry
+            .append(
+                run,
+                EventPayload::AttemptFinished {
+                    attempt_id: attempt,
+                    status,
+                    exit_code: Some(0),
+                    signal: None,
+                    post_sha: Some("0".repeat(40)),
+                    duration_ms: 10,
+                    error: None,
+                },
+            )
+            .expect("attempt.finished");
+    }
+
+    fn resume_request(run: RunId, agent: AgentId) -> DelegateRequest {
+        DelegateRequest {
+            run_id: Some(run),
+            role: RoleName::Builder,
+            task: task(),
+            model: None,
+            session: policy::SessionSpec::Resume(agent),
+            base_ref: None,
+            worktree: None,
+            steps: None,
+            caller_run_id: None,
+        }
+    }
+
+    /// `state` is one of the accepted spellings: a follow-up accepted in this test core is either
+    /// still being prepared, or — where the provider preflight cannot pass in the test
+    /// environment — already recorded as a `spawn_failed` attempt whose branch is owed.
+    fn assert_busy(out: &SendResult, states: &[&str]) {
+        match out {
+            SendResult::Rejected { code, reason } => {
+                assert_eq!(*code, PolicyCode::AgentBusy, "{reason}");
+                assert!(
+                    states.iter().any(|s| reason.contains(&format!("({s})"))),
+                    "{reason}"
+                );
+            }
+            SendResult::Ok { attempt } => {
+                panic!("an overlapping follow-up was accepted: {attempt}")
+            }
+        }
+    }
+
+    /// Everything a refused follow-up must leave untouched: attempts, strikes, transcript turns,
+    /// pending spawns, and the run's status and spend.
+    fn side_effect_fingerprint(
+        core: &Core,
+        run: &RunId,
+    ) -> (usize, usize, usize, RunStatus, String) {
+        let events = core.registry.events(run, None, usize::MAX);
+        let strikes = events
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::LineageStrike { .. }))
+            .count();
+        let run = core.registry.run(run).expect("run");
+        (
+            core.registry.state().attempts.len(),
+            strikes,
+            core.pending_spawn.len(),
+            run.status,
+            format!("{:?}", run.spend_usd),
+        )
+    }
+
+    /// Issue #4: repeated sends and a resume delegation against a running (or cancelling, or
+    /// finalizing — all still `running` until `attempt.finished` is durable) attempt are refused
+    /// with `agent_busy` and record nothing — not even the strike `strike: true` asks for.
+    #[tokio::test]
+    async fn follow_ups_to_a_running_attempt_are_agent_busy_without_side_effects() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut core, _rx) = core(&dir);
+        let (run, agent) = seed(&mut core);
+        start_resumable_attempt(&mut core, &run, agent);
+        let before = side_effect_fingerprint(&core, &run);
+
+        for strike in [false, true, false] {
+            let out = core.send_message(&agent, "carry on", strike).await;
+            assert_busy(&out, &["running"]);
+        }
+        let err = core
+            .delegate(resume_request(run, agent))
+            .expect_err("resume delegation overlaps");
+        assert!(
+            matches!(err, CoreError::Policy(ref e) if e.code == PolicyCode::AgentBusy),
+            "{err:?}"
+        );
+
+        assert_eq!(side_effect_fingerprint(&core, &run), before);
+        let events = core.registry.events(&run, None, usize::MAX);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.payload, EventPayload::AgentMessage { .. })));
+    }
+
+    /// Issue #4: a finished attempt whose loop branch is still owed (a branch that failed before
+    /// its marker, or a restart before the first sweep) still owns the session; once dispatched the
+    /// idle session accepts exactly one follow-up, and a competing second admission is refused
+    /// while the first is still being prepared.
+    #[tokio::test]
+    async fn an_idle_session_accepts_one_follow_up_and_refuses_a_competing_one() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut core, _rx) = core(&dir);
+        let (run, agent) = seed(&mut core);
+        let attempt = start_resumable_attempt(&mut core, &run, agent);
+        finish(&mut core, &run, attempt, AttemptStatus::Succeeded);
+        let before = side_effect_fingerprint(&core, &run);
+        assert_busy(
+            &core.send_message(&agent, "too early", false).await,
+            &["result_pending"],
+        );
+        assert_eq!(side_effect_fingerprint(&core, &run), before);
+
+        core.registry
+            .append(
+                &run,
+                EventPayload::LoopDispatched {
+                    attempt_id: attempt,
+                    branch: LoopBranch::Review,
+                },
+            )
+            .expect("loop.dispatched");
+        core.dispatched.insert(attempt);
+
+        let first = core.send_message(&agent, "one follow-up", false).await;
+        assert!(matches!(first, SendResult::Ok { .. }), "{first:?}");
+        let accepted =
+            |core: &Core| core.pending_spawn.len() + core.registry.state().attempts.len();
+        assert_eq!(
+            accepted(&core),
+            before.0 + 1,
+            "exactly one accepted attempt"
+        );
+        let after_first = side_effect_fingerprint(&core, &run);
+
+        let busy = core.send_message(&agent, "a competing one", false).await;
+        assert_busy(&busy, &["preparing", "result_pending"]);
+        let err = core
+            .delegate(resume_request(run, agent))
+            .expect_err("competing resume delegation");
+        assert!(
+            matches!(err, CoreError::Policy(ref e) if e.code == PolicyCode::AgentBusy),
+            "{err:?}"
+        );
+        assert_eq!(side_effect_fingerprint(&core, &run), after_first);
+    }
+
+    /// Issue #4: a cancelled attempt is never dispatched by the loop (a human owns what happens
+    /// next), so it must not leave the session permanently busy: the resume delegation is the one
+    /// follow-up it accepts.
+    #[tokio::test]
+    async fn a_cancelled_attempt_leaves_the_session_resumable_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut core, _rx) = core(&dir);
+        let (run, agent) = seed(&mut core);
+        let attempt = start_resumable_attempt(&mut core, &run, agent);
+        finish(&mut core, &run, attempt, AttemptStatus::Cancelled);
+
+        let out = core
+            .delegate(resume_request(run, agent))
+            .expect("idle resume delegation");
+        assert_eq!(out.agent_id, agent);
+        let busy = core.send_message(&agent, "and another", false).await;
+        assert_busy(&busy, &["preparing", "result_pending"]);
+        assert_eq!(
+            core.pending_spawn.len() + core.registry.state().attempts.len(),
+            2,
+            "the cancelled attempt plus exactly one accepted follow-up"
+        );
+    }
+
     /// A crash between `attempt.finished` and the branch's own events: the log shows a strike (17b
     /// got that far) but no `loop.dispatched`, so the repair attempt the branch owes was never
     /// started. The restarted actor must run the branch again.

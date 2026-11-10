@@ -486,6 +486,81 @@ impl Core {
             .min_by_key(|agent| *agent.as_uuid())
     }
 
+    /// Issue #4: the one-accepted-attempt-per-agent admission rule for every resume route
+    /// (`send_message` and a `SessionSpec::Resume` delegation both reach [`Self::resume_attempt`]).
+    /// A resume launches a **new** provider attempt on the agent's session and worktree; it never
+    /// delivers a message into a live process, so it is only admissible while the agent is idle.
+    ///
+    /// The agent is busy while it owns any of:
+    /// * a provider spawn being prepared (`pending_spawn`, including one a human cancelled before
+    ///   adoption) or a 17c retry waiting for its worktree status (`pending_retry`);
+    /// * an attempt still `running` — which covers cancelling and finalizing too, because
+    ///   `attempt.finished` is appended only once the supervisor's finalize report is durable;
+    /// * a terminal attempt whose loop branch is still owed (no `loop.dispatched` yet). An attempt
+    ///   in `in_flight` is exempt: its branch is the code running in this very mailbox turn, and
+    ///   the branch's own repair resume is the follow-up it is entitled to. A cancelled or lost
+    ///   attempt (`Branch::None`) is never dispatched and stays admissible: a human owns what
+    ///   happens next. Cancelled and audit runs refuse every resume on their own.
+    ///
+    /// The refusal is checked before any strike, transcript turn or attempt is recorded, so a busy
+    /// answer has no side effects.
+    fn agent_busy(&self, agent: &AgentId) -> Option<PolicyError> {
+        let busy = |state: &str, attempt: Option<AttemptId>| {
+            PolicyError::new(
+                PolicyCode::AgentBusy,
+                format!(
+                    "agent {agent} already has an accepted attempt ({state}); \
+                     wait for it to finish before sending a follow-up"
+                ),
+            )
+            .with_detail(serde_json::json!({
+                "agentId": agent.to_string(),
+                "state": state,
+                "attemptId": attempt.map(|a| a.to_string()),
+            }))
+        };
+        if let Some(attempt) = self
+            .pending_spawn
+            .iter()
+            .filter(|(_, pending)| pending.agent() == *agent)
+            .map(|(attempt, _)| *attempt)
+            .min_by_key(|attempt| *attempt.as_uuid())
+        {
+            return Some(busy("preparing", Some(attempt)));
+        }
+        if let Some(attempt) = self.pending_retry.get(agent) {
+            return Some(busy("preparing", Some(*attempt)));
+        }
+        let handle = self.registry.agent(agent)?;
+        if self
+            .registry
+            .run(&handle.run_id)
+            .is_some_and(|run| run.status == RunStatus::Cancelled || run.audit.is_some())
+        {
+            // Neither kind of run is ever resumed, and neither dispatches its attempts through
+            // the branch table, so only the live checks above apply to them.
+            return None;
+        }
+        for id in &handle.attempt_ids {
+            let Some(attempt) = self.registry.attempt(id) else {
+                continue;
+            };
+            if attempt.status == AttemptStatus::Running {
+                // Also a cancelling or exited-but-finalizing attempt: still `running` until durable.
+                return Some(busy("running", Some(*id)));
+            }
+            // `Branch::None` (cancelled, lost) is never dispatched by design: a human owns what
+            // happens next, and the follow-up this door offers is exactly that.
+            if !self.dispatched.contains(id)
+                && !self.in_flight.contains(id)
+                && branch_of(handle.role, attempt.status, attempt.error.as_ref()) != Branch::None
+            {
+                return Some(busy("result_pending", Some(*id)));
+            }
+        }
+        None
+    }
+
     /// T84's fail-closed attribution check: `claimed` is trustworthy only when it names the run of
     /// the daemon's own [`Core::live_lead_agent`] — the one fact the daemon itself wrote into an
     /// `acp mcp-proxy` child's `ACP_LEAD_RUN_ID`. Anything else (absent, stale, forged, or no lead
@@ -1000,6 +1075,19 @@ impl Core {
             }
         }
         let (run, lineage, role) = (handle.run_id, handle.lineage_id, handle.role);
+        // Issue #4: refuse an overlapping follow-up before the strike below can be recorded.
+        if let Some(err) = self.agent_busy(agent) {
+            self.registry.audit(AuditEntry::new(
+                "send_message",
+                err.code.as_str(),
+                &err.reason,
+                agent.to_string(),
+            ));
+            return SendResult::Rejected {
+                code: err.code,
+                reason: err.reason,
+            };
+        }
         if role == RoleName::Security {
             return SendResult::Rejected { code: PolicyCode::DelegationNotAllowed,
                 reason: "security checks are single-use inspections; change the input and start a new check through the workflow".into() };
@@ -2568,6 +2656,10 @@ impl Core {
         prompt: String,
         spawn_cap: f64,
     ) -> Result<(), PolicyError> {
+        // Issue #4: the delegate-resume route reaches here without passing `send_message`.
+        if let Some(err) = self.agent_busy(&agent) {
+            return Err(err);
+        }
         let cfg = Arc::clone(&self.roles);
         let checked = {
             let ctx = PolicyCtx {

@@ -291,6 +291,39 @@ async fn replay_keeps_assignment_and_effort_when_saved_team_is_unreadable() {
     assert_eq!(pending.effort, Some(Effort::High));
 }
 
+/// acp-core #8: a resume (lead or worker) reuses the recorded claude `opus`/`medium` effort even
+/// after the saved team changes, and drops it when the agent no longer runs the recorded model.
+#[tokio::test]
+async fn resume_keeps_the_recorded_claude_effort_after_a_team_change() {
+    let dir = TempDir::new().unwrap();
+    let (mut core, _rx) = core(&dir);
+    let selected: team::Team = serde_json::from_value(json!({
+        "version": 3, "mode": "build", "name": "selection",
+        "lead": {"provider":"claude","model":"opus","effort":"medium"},
+        "roles": {"builder": {"provider":"claude","model":"opus","effort":"medium"}}
+    }))
+    .unwrap();
+    let mut captured = execution(&core, &selected);
+    // As the lead-start path records it (`execution.assignments["lead"]`).
+    captured.assignments.insert("lead".into(), selected.lead.clone().unwrap());
+    let run = seed_run(&mut core, captured);
+    team::save_team(&core.state_dir, &builder_team("sonnet")).unwrap();
+    for role in [RoleName::Builder, RoleName::Lead] {
+        assert_eq!(
+            core.recorded_effort(&run, role, ProviderName::Claude, "opus"),
+            Some(Effort::Medium),
+            "{role:?}"
+        );
+    }
+    assert_eq!(core.recorded_effort(&run, RoleName::Builder, ProviderName::Claude, "sonnet"), None);
+    assert_eq!(core.recorded_effort(&run, RoleName::Builder, ProviderName::Codex, "opus"), None);
+    assert_eq!(core.recorded_effort(&run, RoleName::Reviewer, ProviderName::Claude, "opus"), None);
+    // A team that omits effort records none, so the resume argv stays exactly as before.
+    let captured = execution(&core, &builder_team("opus"));
+    let plain = seed_run(&mut core, captured);
+    assert_eq!(core.recorded_effort(&plain, RoleName::Builder, ProviderName::Claude, "opus"), None);
+}
+
 #[tokio::test]
 async fn delayed_build_caller_keeps_its_team_after_the_lead_exits() {
     let dir = TempDir::new().unwrap();

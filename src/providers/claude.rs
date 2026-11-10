@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::core::team::Effort;
 use crate::core::types::{
     strip_dollar_schema, AttemptError, ErrorCode, ProviderName, RoleName, RoleSpec, RunId,
     TokenUsage,
@@ -69,6 +70,20 @@ const DISALLOWED_TOOLS: [&str; 4] = [
     "Bash(git reset:*)",
     "Bash(git add:*)",
 ];
+
+/// The `--effort` value for `model`, or `None` when this adapter does not spell that pair.
+///
+/// Closed on purpose, and narrower than the CLI: Claude Code 2.1.322 `--help` lists
+/// `low, medium, high, xhigh, max`, but the only pair ACP has adopted is `opus` at `medium`
+/// (`roles/roles.json` narrows every other claude model to no effort). A value the catalog did not
+/// let through is never spelled here, and [`ClaudeAdapter::preflight`] refuses it rather than
+/// letting the session run silently at its default.
+fn effort_token(model: &str, effort: Effort) -> Option<&'static str> {
+    match (model, effort) {
+        ("opus", Effort::Medium) => Some("medium"),
+        _ => None,
+    }
+}
 
 /// The Claude Code CLI, reduced to argv construction and line parsing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -117,6 +132,19 @@ impl ProviderAdapter for ClaudeAdapter {
                     req.cwd.display()
                 ),
             });
+        }
+        // Fail closed on an effort this adapter does not spell (defence in depth: team validation
+        // already rejects it against the catalog).
+        if let Some(effort) = req.effort {
+            if effort_token(req.model, effort).is_none() {
+                return Some(AttemptError {
+                    code: ErrorCode::SpawnError,
+                    message: format!(
+                        "claude model `{}` does not accept reasoning effort `{effort}`",
+                        req.model.chars().take(80).collect::<String>()
+                    ),
+                });
+            }
         }
         None
     }
@@ -201,6 +229,13 @@ fn plan(req: &SpawnRequest<'_>, extra: &[String]) -> SpawnPlan {
     argv.extend([
         "--model".to_string(),
         req.model.to_string(),
+    ]);
+    // `--effort` applies to the current session only and does not persist, so a resume repeats
+    // it exactly like the rest of the fresh flag set (V1).
+    if let Some(level) = req.effort.and_then(|effort| effort_token(req.model, effort)) {
+        argv.extend(["--effort".to_string(), level.to_string()]);
+    }
+    argv.extend([
         // Project settings only: no user-level `~/.claude/settings.json` and no enterprise policy
         // file, so what the worker runs under is entirely what this argv says.
         "--setting-sources".to_string(),

@@ -13,6 +13,27 @@ cannot approve integration. Tasks retain their recorded team/execution settings 
 editing the saved team does not silently change an in-flight run. The daemon's closed catalog is
 in `roles/roles.json`; arbitrary CLI flag passthrough is not supported.
 
+## Reasoning effort
+
+A team assignment may carry an optional `effort`. It is checked against the closed catalog in
+`roles/roles.json` (`providers.<name>.efforts`, narrowed per model by `modelEfforts`) before any
+spawn; an effort for a model whose list is empty is `effort_unsupported`, and a value outside the
+model's list is `effort_not_allowed`. Omitting `effort` stays valid and leaves the provider on its
+own default, so teams saved before efforts existed keep working unchanged.
+
+- **Codex** spends it as `-c model_reasoning_effort=<level>` on a fresh spawn only; its resume
+  argv is unchanged and carries no effort.
+- **Claude** accepts exactly `medium`, and only for the `opus` alias; `fable`, `sonnet` and `haiku`
+  take none. The catalog is intentionally minimal. Claude Code 2.1.322 `--help` lists
+  `--effort <level>` (`low, medium, high, xhigh, max`), and the CLI reference says the flag applies
+  to the current session and does not persist. Because of that, ACP emits the checked pair
+  `--effort medium` directly after `--model opus` on fresh **and** resume argv. No environment
+  variable (such as `CLAUDE_CODE_EFFORT_LEVEL`) or other flag is passed through.
+- The effort a run was started with is recorded in its execution assignments. Replays, fresh
+  re-spawns, builder recovery, and lead **and** worker resumes reuse that recorded value, and
+  only while the agent still runs the recorded provider and model. Editing the saved team later
+  does not change it.
+
 Events and state remain local. Output schemas are validated and free text is bounded/untrusted.
 Frozen evidence identifies the attempt and exact diff, with an assembled 8 MiB diff budget.
 Integration checks those bytes under the same worktree lock used for finalization. This is distinct

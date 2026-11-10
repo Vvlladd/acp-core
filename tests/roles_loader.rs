@@ -16,6 +16,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use agent_control_plane::core::team::Effort;
 use agent_control_plane::core::types::{
     ProviderName, RoleName, SandboxMode, SchemaName, TokenUsage,
 };
@@ -163,10 +164,12 @@ fn the_embedded_config_loads_and_describes_every_role() {
         .get(&ProviderName::Claude)
         .expect("claude catalog");
     assert!(claude.models.contains(&"sonnet".to_string()));
-    assert!(
-        claude.efforts.is_empty(),
-        "claude takes no reasoning effort"
-    );
+    // Claude's effort catalog is closed and minimal: `medium`, for `opus` only.
+    assert_eq!(claude.efforts, [Effort::Medium]);
+    assert_eq!(claude.efforts_for("opus"), [Effort::Medium]);
+    for model in ["fable", "sonnet", "haiku"] {
+        assert!(claude.efforts_for(model).is_empty(), "{model} takes no effort");
+    }
     let codex = cfg
         .providers
         .get(&ProviderName::Codex)

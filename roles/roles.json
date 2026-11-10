@@ -35,7 +35,14 @@
         "sonnet",
         "haiku"
       ],
-      "efforts": []
+      "efforts": [
+        "medium"
+      ],
+      "modelEfforts": {
+        "fable": [],
+        "sonnet": [],
+        "haiku": []
+      }
     },
     "codex": {
       "models": [

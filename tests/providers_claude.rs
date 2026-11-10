@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use agent_control_plane::core::team::Effort;
 use agent_control_plane::core::types::{
     ErrorCode, ProviderName, RoleName, RoleSpec, RunId, SandboxMode, SchemaName,
 };
@@ -484,6 +485,91 @@ fn fresh_and_resume_differ_only_by_the_resume_pair() {
         ["--resume", SESSION_ID]
     );
     assert_eq!(resume, fresh, "resume must repeat the fresh flag set (V1)");
+}
+
+/// The `opus` catalog alias at `medium` is the one effort pair ACP spells: exactly
+/// `--effort medium` directly after `--model opus`, and otherwise the unchanged fresh argv.
+#[test]
+fn opus_medium_effort_adds_exactly_the_checked_effort_pair() {
+    let fixture = Fixture::builder();
+    let request = SpawnRequest {
+        model: "opus",
+        effort: Some(Effort::Medium),
+        ..fixture.request()
+    };
+    let mut argv = ClaudeAdapter.build_fresh(&request).argv;
+    assert_eq!(&argv[2..6], ["--model", "opus", "--effort", "medium"]);
+    assert_eq!(argv.iter().filter(|t| t.as_str() == "--effort").count(), 1);
+    assert!(ClaudeAdapter.preflight(&request).is_none_or(|e| e.code != ErrorCode::SpawnError));
+    argv.drain(4..6);
+    assert_eq!(argv, fixture.fresh("opus"), "the effort pair is the only difference");
+}
+
+/// `--effort` does not persist across `--resume`, so the recorded effort is repeated on resume
+/// and fresh and resume still differ only by the resume pair.
+#[test]
+fn opus_medium_effort_is_repeated_on_resume() {
+    let fixture = Fixture::builder();
+    let request = SpawnRequest {
+        model: "opus",
+        effort: Some(Effort::Medium),
+        ..fixture.request()
+    };
+    let fresh = ClaudeAdapter.build_fresh(&request).argv;
+    let mut resume = ClaudeAdapter
+        .build_resume(&SpawnRequest {
+            session_id: Some(SESSION_ID),
+            ..request
+        })
+        .argv;
+    assert_eq!(
+        resume.drain(2..4).collect::<Vec<_>>(),
+        ["--resume", SESSION_ID]
+    );
+    assert_eq!(resume, fresh);
+    assert_eq!(flag_value(&resume, "--effort"), "medium");
+}
+
+/// No effort, no flag: teams saved before efforts existed spawn exactly as before.
+#[test]
+fn no_effort_means_no_effort_flag() {
+    let fixture = Fixture::builder();
+    for argv in [fixture.fresh("opus"), fixture.resume("opus"), fixture.fresh(SONNET)] {
+        assert!(!argv.iter().any(|t| t.contains("--effort")), "{argv:?}");
+    }
+}
+
+/// Fail closed: a pair outside the adapter's closed set is never spelled into argv, and preflight
+/// refuses the spawn instead of letting it run at the CLI default.
+#[test]
+fn an_unsupported_effort_or_model_is_never_spelled_and_is_refused() {
+    let fixture = Fixture::builder();
+    for (model, effort) in [
+        ("opus", Effort::High),
+        ("opus", Effort::Max),
+        ("opus", Effort::Minimal),
+        ("sonnet", Effort::Medium),
+        ("haiku", Effort::Medium),
+        ("fable", Effort::Medium),
+        (OPUS, Effort::Medium),
+    ] {
+        let request = SpawnRequest {
+            model,
+            effort: Some(effort),
+            ..fixture.request()
+        };
+        let argv = ClaudeAdapter.build_fresh(&request).argv;
+        assert!(!argv.iter().any(|t| t == "--effort"), "{model} {effort}: {argv:?}");
+        // `preflight` checks PATH first; on a host without `claude` it answers ProviderMissing,
+        // which also refuses the spawn. With `claude` present it must name the effort.
+        let error = ClaudeAdapter
+            .preflight(&request)
+            .unwrap_or_else(|| panic!("{model} {effort} must be refused"));
+        assert!(
+            matches!(error.code, ErrorCode::SpawnError | ErrorCode::ProviderMissing),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]

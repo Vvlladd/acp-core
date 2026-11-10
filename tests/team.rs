@@ -534,11 +534,29 @@ fn roles_list_keeps_the_legacy_worker_catalog_and_adds_a_separate_lead() {
     );
     for (name, provider) in answer["providers"].as_object().expect("providers") {
         let same = &fallback["providers"][name];
+        if name == "claude" {
+            // The frozen v1 fixture predates claude efforts (#8) and is deliberately not
+            // regenerated: it still pins claude's legacy shape, and the new fields are checked
+            // exactly, on their own, rather than hidden by editing the fixture.
+            assert_eq!(same["efforts"], json!([]), "the legacy fixture is frozen");
+            assert!(same.get("modelEfforts").is_none(), "the legacy fixture is frozen");
+            let mut legacy = provider.clone();
+            legacy.as_object_mut().unwrap().remove("modelEfforts");
+            assert_eq!(keys(&legacy), keys(same), "the `{name}` catalog differs");
+            assert_eq!(provider["models"], same["models"], "`{name}` models");
+            assert_eq!(provider["efforts"], json!(["medium"]), "claude takes only `medium`");
+            assert_eq!(
+                provider["modelEfforts"],
+                json!({ "fable": [], "sonnet": [], "haiku": [] }),
+                "only opus takes claude's `medium`"
+            );
+            continue;
+        }
         assert_eq!(keys(provider), keys(same), "the `{name}` catalog differs");
         assert_eq!(provider["models"], same["models"], "`{name}` models");
         assert_eq!(provider["efforts"], same["efforts"], "`{name}` efforts");
-        // Revision 28: the per-model narrowing must agree too (absent on both sides for claude),
-        // or the two files could narrow different models and this drift guard would stay green.
+        // Revision 28: the per-model narrowing must agree too, or the two files could narrow
+        // different models and this drift guard would stay green.
         assert_eq!(
             provider["modelEfforts"], same["modelEfforts"],
             "`{name}` modelEfforts"
@@ -929,8 +947,8 @@ fn an_invalid_team_set_lists_every_issue_and_writes_nothing() {
                         "roles": {
                             // claude has no `gpt-5.5` …
                             "builder": { "provider": "claude", "model": "gpt-5.5" },
-                            // … and claude takes no reasoning effort.
-                            "reviewer": { "provider": "claude", "model": "opus", "effort": "high" }
+                            // … and claude sonnet takes no reasoning effort.
+                            "reviewer": { "provider": "claude", "model": "sonnet", "effort": "high" }
                         }
                     }
                 }),

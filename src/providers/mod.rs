@@ -76,9 +76,10 @@ pub struct SpawnRequest<'a> {
     /// Required by [`ProviderAdapter::build_resume`], ignored by `build_fresh`.
     pub session_id: Option<&'a str>,
     /// The reasoning effort the team assigned this role (Rev 26), or `None` to leave the adapter on
-    /// its own configured constant. Codex spends it as `-c model_reasoning_effort=`; claude has no
-    /// such knob and ignores it. A **resume** never carries one: a thread keeps the effort it was
-    /// started with.
+    /// its own configured constant. Codex spends it as `-c model_reasoning_effort=` on a fresh spawn
+    /// only (a codex thread keeps the effort it was started with, so its resume argv ignores this).
+    /// Claude spends it as the checked `--effort <level>` on fresh **and** resume, because the CLI
+    /// flag does not persist across `--resume`; the caller passes the recorded effort for both.
     pub effort: Option<Effort>,
 }
 

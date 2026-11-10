@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_control_plane::core::policy::{PolicyCode, DENIED_ARGV, MAX_ARGV_BYTES};
+use agent_control_plane::core::team::Effort;
 use agent_control_plane::core::supervisor::{assert_safe_argv, spawn_detached, ArgvCtx};
 use agent_control_plane::core::types::{ProviderName, RoleName, RoleSpec, SandboxMode, SchemaName};
 use agent_control_plane::providers::claude::ClaudeAdapter;
@@ -132,6 +133,11 @@ impl Fixture {
 
     /// The plan the real adapter builds for one combination.
     fn plan(&self, combo: Combo) -> SpawnPlan {
+        self.plan_with(combo, None, None)
+    }
+
+    /// [`Fixture::plan`] with the team's model and effort for the role, as the loop passes them.
+    fn plan_with(&self, combo: Combo, model: Option<&str>, effort: Option<Effort>) -> SpawnPlan {
         let builder = combo.writes();
         let role = if builder {
             &self.builder
@@ -150,7 +156,7 @@ impl Fixture {
         };
         let req = SpawnRequest {
             role,
-            model: if builder { CLAUDE_MODEL } else { CODEX_MODEL },
+            model: model.unwrap_or(if builder { CLAUDE_MODEL } else { CODEX_MODEL }),
             prompt: &self.prompt,
             role_prompt: &self.role_prompt,
             // The reviewer runs read-only in the builder's worktree — never `-C`, always the cwd.
@@ -165,7 +171,7 @@ impl Fixture {
                 worktree: self.repo.path(),
             }),
             session_id: session,
-            effort: None,
+            effort,
         };
         let mut plan = match (builder, session.is_some()) {
             (true, false) => ClaudeAdapter.build_fresh(&req),
@@ -322,6 +328,27 @@ fn every_role_and_session_combination_is_accepted_as_the_adapter_built_it() {
         let expected = fx.fake(if combo.writes() { "claude" } else { "codex" });
         assert_eq!(checked.plan().file, expected, "{combo:?}");
     }
+}
+
+/// acp-core #8: a claude builder at `opus`/`medium` passes the chokepoint unchanged, fresh and
+/// resumed, carrying exactly one `--effort medium` right after `--model opus` and still sandboxed.
+#[test]
+fn a_claude_opus_medium_effort_passes_the_chokepoint_fresh_and_resumed() {
+    let fx = Fixture::new();
+    for combo in [Combo::BuilderFresh, Combo::BuilderResume] {
+        let plan = fx.plan_with(combo, Some("opus"), Some(Effort::Medium));
+        let argv = plan.argv.clone();
+        let checked = assert_safe_argv(plan, &fx.ctx(true))
+            .unwrap_or_else(|err| panic!("{combo:?} must pass, got {err}"));
+        assert_eq!(checked.plan().argv, argv, "{combo:?}");
+        let at = index_of(&argv, "--model");
+        assert_eq!(&argv[at..at + 4], ["--model", "opus", "--effort", "medium"], "{combo:?}");
+        assert_eq!(argv.iter().filter(|t| t.as_str() == "--effort").count(), 1);
+        assert!(argv.iter().any(|t| t == "--settings"), "{combo:?} stays sandboxed");
+    }
+    // The codex reviewer's resume is untouched by an effort: its thread keeps the one it began with.
+    let resumed = fx.plan_with(Combo::ReviewerResume, None, Some(Effort::High));
+    assert_eq!(resumed.argv, fx.plan(Combo::ReviewerResume).argv);
 }
 
 #[test]

@@ -464,6 +464,16 @@ fn check_assignment(
                     provider_str(assignment.provider)
                 ),
             ));
+        } else if provider.efforts_for(&assignment.model).is_empty() {
+            // A model the catalog narrows to nothing takes no effort at all (claude `sonnet`),
+            // which is the same answer as a provider that takes none.
+            issues.push(issue(
+                TeamIssueCode::EffortUnsupported,
+                format!(
+                    "model `{}` takes no reasoning effort, but `{effort}` was set",
+                    echo(&assignment.model)
+                ),
+            ));
         } else if !provider.efforts.contains(&effort) {
             issues.push(issue(
                 TeamIssueCode::EffortNotAllowed,
@@ -1132,6 +1142,67 @@ mod tests {
         );
     }
 
+    /// acp-core #8: claude takes `medium`, for `opus` only — the closed catalog, not the CLI's
+    /// wider `--help` list. Omitting `effort` stays valid for every claude model.
+    #[test]
+    fn claude_effort_is_opus_medium_only() {
+        let cfg = cfg();
+        let opus_medium = json!({ "provider": "claude", "model": "opus", "effort": "medium" });
+        let team = validate_team(
+            &cfg,
+            &team_json(json!({
+                "version": 1, "name": "t",
+                "lead": opus_medium,
+                "roles": { "builder": opus_medium }
+            })),
+        )
+        .unwrap_or_else(|issues| panic!("{issues:?}"));
+        assert_eq!(team.assignment(RoleName::Builder).and_then(|a| a.effort), Some(Effort::Medium));
+        assert_eq!(team.lead().and_then(|a| a.effort), Some(Effort::Medium));
+        // The lead is checked too: a lead at an unsupported claude effort is refused.
+        assert!(validate_team(
+            &cfg,
+            &team_json(json!({
+                "version": 1, "name": "t",
+                "lead": { "provider": "claude", "model": "sonnet", "effort": "medium" },
+                "roles": {}
+            })),
+        )
+        .is_err());
+        for model in ["fable", "opus", "sonnet", "haiku"] {
+            let plain = json!({ "provider": "claude", "model": model });
+            assert!(validate_team(
+                &cfg,
+                &team_json(json!({
+                    "version": 1, "name": "t", "lead": plain, "roles": { "builder": plain }
+                })),
+            )
+            .is_ok(), "{model} without effort stays valid");
+        }
+        for effort in ["minimal", "low", "high", "xhigh", "max"] {
+            assert_eq!(
+                issue_codes(json!({
+                    "version": 1, "name": "t",
+                    "roles": { "builder": { "provider": "claude", "model": "opus", "effort": effort } }
+                })),
+                vec![TeamIssueCode::EffortNotAllowed],
+                "opus {effort}"
+            );
+        }
+        for model in ["sonnet", "haiku"] {
+            assert_eq!(
+                issue_codes(json!({
+                    "version": 1, "name": "t",
+                    "roles": { "builder": { "provider": "claude", "model": model, "effort": "medium" } }
+                })),
+                vec![TeamIssueCode::EffortUnsupported],
+                "{model} medium"
+            );
+        }
+        // A level the CLI knows but the closed enum does not (`ultracode`) cannot even decode.
+        assert!(serde_json::from_value::<Effort>(json!("ultracode")).is_err());
+    }
+
     /// The lead is checked against the provider catalog and nothing else — `roles.lead` carries no
     /// model list, so a lead model that no role may be spawned with is still fine.
     #[test]
@@ -1412,7 +1483,7 @@ mod tests {
 
         assert_eq!(roles[2]["name"], json!("security"));
         assert_eq!(roles[2]["writes"], json!(false));
-        assert_eq!(value["providers"]["claude"]["efforts"], json!([]));
+        assert_eq!(value["providers"]["claude"]["efforts"], json!(["medium"]));
         assert_eq!(value["providers"]["claude"]["available"], json!(true));
         assert_eq!(value["providers"]["codex"]["available"], json!(false));
         assert_eq!(
@@ -1501,7 +1572,12 @@ mod tests {
             json!(["low", "medium", "high", "xhigh"])
         );
         assert!(codex["modelEfforts"].get("gpt-6-astra").is_none());
-        assert!(value["providers"]["claude"].get("modelEfforts").is_none());
+        // acp-core #8: claude's one effort (`medium`) is narrowed away from every model but opus.
+        assert_eq!(
+            value["providers"]["claude"]["modelEfforts"],
+            json!({ "fable": [], "haiku": [], "sonnet": [] })
+        );
+        assert!(value["providers"]["claude"]["modelEfforts"].get("opus").is_none());
 
         // The answer decodes back into the type `acp start` reads, per-model lookup included.
         let decoded: RolesListResult = serde_json::from_value(value).expect("decodes");

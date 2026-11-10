@@ -2411,8 +2411,8 @@ impl Core {
                 worktree: &s.worktree,
             }),
             session_id: s.session_id.as_deref(),
-            // A resumed session keeps the effort it started with — codex's resume argv carries no
-            // `model_reasoning_effort` at all — so this only ever travels on a fresh spawn.
+            // The recorded effort, on fresh and resume alike: codex's resume argv carries no
+            // `model_reasoning_effort` at all, while claude repeats its non-persistent `--effort`.
             effort: s.effort,
         };
 
@@ -2540,6 +2540,24 @@ impl Core {
         })
     }
 
+    /// The effort recorded in `run`'s execution for `role`, while the agent still runs the recorded
+    /// provider and model. The saved team is never consulted: a team edit after the run was
+    /// created must not change what a resumed session runs at.
+    fn recorded_effort(
+        &self,
+        run: &RunId,
+        role: RoleName,
+        provider: ProviderName,
+        model: &str,
+    ) -> Option<Effort> {
+        self.registry
+            .run(run)
+            .and_then(|r| r.execution.as_ref())
+            .and_then(|e| e.assignments.get(role_key(role)))
+            .filter(|a| a.provider == provider && a.model == model)
+            .and_then(|a| a.effort)
+    }
+
     /// The resume half of [`Core::start_attempt`]: the same chain, with the agent's own session,
     /// cwd, provider and model — a resumed session never changes any of them, whatever the team
     /// says today.
@@ -2579,10 +2597,11 @@ impl Core {
             })
         };
         let mut spawn = checked?;
-        if spawn.role == RoleName::Lead {
-            spawn.effort = self.registry.run(&spawn.run).and_then(|r| r.execution.as_ref())
-                .and_then(|e| e.assignments.get("lead")).and_then(|a| a.effort);
-        }
+        // A resume reuses the effort recorded for the run — lead or worker — and only while the
+        // agent still runs the recorded provider and model; a later team edit never changes it.
+        // Codex's resume argv ignores it (the thread keeps its effort); claude must repeat its
+        // `--effort`, which does not persist across `--resume`.
+        spawn.effort = self.recorded_effort(&spawn.run, spawn.role, spawn.provider, &spawn.model);
         // The worktree's HEAD is the lineage's base commit: a worker that commits is soft-reset
         // back to it, so this is the sha the next attempt diffs against.
         spawn.pre_sha = self.agent_base_sha(&agent);

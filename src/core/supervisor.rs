@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use globset::GlobSet;
+use jsonschema::error::ValidationErrorKind;
 use nix::errno::Errno;
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
@@ -2778,11 +2779,8 @@ async fn finalize_prepare(
     // Free text (the lead's contract) is validated against nothing and carries no structured
     // artifact into the log: a fenced JSON block in a reply is prose, not a deliverable.
     let free_text = run.ctx.schema_name == SchemaName::FreeText;
-    let structured_valid = !free_text
-        && raw
-            .structured
-            .as_ref()
-            .is_some_and(|structured| validates(&run.ctx.schema, structured));
+    let validation_error = (!free_text).then(|| output_validation_error(&run.ctx.schema, &raw));
+    let structured_valid = validation_error.as_ref().is_some_and(Result::is_ok);
     // A spawned lead is a conversational session, not a worker returning a typed artifact. It has
     // no CLI `--json-schema`; its final free text is still written and logged below, but absence of
     // structured output is explicitly accepted for this one closed role only.
@@ -2804,14 +2802,28 @@ async fn finalize_prepare(
         });
     }
 
-    let (mut status, mut error) = classify(&run, &exit, &raw, output_accepted);
+    let validation_message = validation_error.and_then(Result::err);
+    let (mut status, mut error) = classify(
+        &run,
+        &exit,
+        &raw,
+        output_accepted,
+        validation_message.as_deref(),
+    );
 
-    // Rev 25: a builder that succeeded and changed nothing has produced nothing to review.
+    // A schema-valid task failure is distinct from claiming success with no changes. Freeze
+    // even its empty draft so workspace enforcement and exact evidence remain intact.
+    let builder_reported_failure = run.ctx.role == RoleName::Builder
+        && structured_valid
+        && raw.structured.as_ref().is_some_and(|value| {
+            value.get("status").and_then(|status| status.as_str()) == Some("failed")
+        });
+    // Rev 25: a builder that claimed task success and changed nothing has nothing to review.
     let mut frozen = None;
     if status == AttemptStatus::Succeeded && run.ctx.writes {
         let path = diff_path(&run.ctx.dir, &attempt_id);
         match git::frozen_diff(&run.ctx.worktree, &path).await {
-            Ok(stat) if stat.files.is_empty() => {
+            Ok(stat) if stat.files.is_empty() && !builder_reported_failure => {
                 status = AttemptStatus::InvalidOutput;
                 error = Some(AttemptError {
                     code: ErrorCode::NoChangedFiles,
@@ -2924,6 +2936,7 @@ fn classify(
     exit: &ExitInfo,
     raw: &RawResult,
     structured_valid: bool,
+    validation_message: Option<&str>,
 ) -> (AttemptStatus, Option<AttemptError>) {
     // A pid that stopped matching its recorded `lstart` was never signalled, so neither the
     // cancellation nor the deadline below actually reached anything: the honest terminal state is
@@ -3009,8 +3022,8 @@ fn classify(
             AttemptStatus::InvalidOutput,
             Some(AttemptError {
                 code: ErrorCode::SchemaInvalid,
-                message: "the final message is missing or does not validate against the role's \
-                          result schema"
+                message: validation_message
+                    .unwrap_or("the final output does not validate against the role's result schema")
                     .to_string(),
             }),
         );
@@ -3070,14 +3083,136 @@ async fn write_result(dir: &Path, raw: &RawResult, structured_valid: bool) -> Pa
 /// Does the worker's structured output satisfy the role's schema? A schema that does not compile is
 /// treated as "nothing validates": the alternative is accepting unvalidated output, and the
 /// checked-in schemas are compile-tested (T12), so this can only be a caller bug.
-fn validates(schema: &Value, instance: &Value) -> bool {
+const MAX_SCHEMA_DIAGNOSTICS: usize = 4;
+const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 1_024;
+const MAX_FIELD_PATH_BYTES: usize = 160;
+
+/// Explain a rejected worker result without ever formatting the rejected value. Provider adapters
+/// deliberately preserve `text` when JSON parsing fails, so absence, parse failure and schema
+/// failure remain three different observations here. The returned message is safe to copy into an
+/// event, retry prompt or replacement handoff: only schema-owned constraints, field paths and
+/// aggregate counts are rendered, under one fixed byte ceiling.
+fn output_validation_error(schema: &Value, raw: &RawResult) -> Result<(), String> {
+    let Some(instance) = raw.structured.as_ref() else {
+        return Err(match raw.text.as_ref() {
+            Some(text) => format!(
+                "the final output is not valid JSON (observed {} bytes); return exactly one JSON document matching the role's result schema",
+                text.len()
+            ),
+            None => "the worker produced no final output; return exactly one JSON document matching the role's result schema".to_string(),
+        });
+    };
     match jsonschema::validator_for(schema) {
-        Ok(validator) => validator.is_valid(instance),
+        Ok(validator) => {
+            let mut errors = validator.iter_errors(instance);
+            let mut details = Vec::new();
+            for error in errors.by_ref().take(MAX_SCHEMA_DIAGNOSTICS) {
+                details.push(schema_diagnostic(&error));
+            }
+            if details.is_empty() {
+                return Ok(());
+            }
+            let more = errors.next().is_some();
+            let mut message = format!(
+                "the final JSON does not validate against the role's result schema: {}",
+                details.join("; ")
+            );
+            if more {
+                message.push_str(&format!(
+                    "; additional violations omitted (showing first {MAX_SCHEMA_DIAGNOSTICS})"
+                ));
+            }
+            truncate_diagnostic(message)
+        }
         Err(err) => {
             tracing::error!(%err, "the role's result schema does not compile");
-            false
+            Err("the role's result schema could not be evaluated".to_string())
         }
     }
+}
+
+fn schema_diagnostic(error: &jsonschema::ValidationError<'_>) -> String {
+    let path = sanitized_field_path(error.instance_path().as_str());
+    let observed = error.instance();
+    let constraint = match error.kind() {
+        ValidationErrorKind::MaxLength { limit } => format!(
+            "maxLength {limit}, observed length {}",
+            observed.as_str().map(str::chars).map(Iterator::count).unwrap_or(0)
+        ),
+        ValidationErrorKind::MinLength { limit } => format!(
+            "minLength {limit}, observed length {}",
+            observed.as_str().map(str::chars).map(Iterator::count).unwrap_or(0)
+        ),
+        ValidationErrorKind::MaxItems { limit } => format!(
+            "maxItems {limit}, observed count {}",
+            observed.as_array().map_or(0, Vec::len)
+        ),
+        ValidationErrorKind::MinItems { limit } => format!(
+            "minItems {limit}, observed count {}",
+            observed.as_array().map_or(0, Vec::len)
+        ),
+        ValidationErrorKind::MaxProperties { limit } => format!(
+            "maxProperties {limit}, observed count {}",
+            observed.as_object().map_or(0, serde_json::Map::len)
+        ),
+        ValidationErrorKind::MinProperties { limit } => format!(
+            "minProperties {limit}, observed count {}",
+            observed.as_object().map_or(0, serde_json::Map::len)
+        ),
+        ValidationErrorKind::Required { property } => {
+            let property = property.as_str().map(sanitized_field_name).unwrap_or("field");
+            return format!("{path}: required field `{property}` is absent");
+        }
+        ValidationErrorKind::AdditionalProperties { unexpected } => {
+            format!("additionalProperties, observed {} unexpected field(s)", unexpected.len())
+        }
+        kind => kind.keyword().to_string(),
+    };
+    format!("{path}: violated {constraint}")
+}
+
+fn sanitized_field_path(path: &str) -> String {
+    if path.is_empty() {
+        return "$".to_string();
+    }
+    let mut out = String::from("$");
+    for segment in path.split('/').skip(1) {
+        out.push('/');
+        out.push_str(sanitized_field_name(segment));
+        if out.len() >= MAX_FIELD_PATH_BYTES {
+            out.truncate(MAX_FIELD_PATH_BYTES - 3);
+            while !out.is_char_boundary(out.len()) {
+                out.pop();
+            }
+            out.push_str("...");
+            break;
+        }
+    }
+    out
+}
+
+fn sanitized_field_name(name: &str) -> &str {
+    if !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'~'))
+    {
+        name
+    } else {
+        "<field>"
+    }
+}
+
+fn truncate_diagnostic(mut message: String) -> Result<(), String> {
+    if message.len() > MAX_SCHEMA_DIAGNOSTIC_BYTES {
+        message.truncate(MAX_SCHEMA_DIAGNOSTIC_BYTES - 3);
+        while !message.is_char_boundary(message.len()) {
+            message.pop();
+        }
+        message.push_str("...");
+    }
+    Err(message)
 }
 
 /// `<runDir>/diffs/<attemptId>.patch`, derived from the attempt dir — which the design fixes as
@@ -3307,6 +3442,84 @@ mod tests {
     use super::*;
     use crate::core::types::{LineageId, Origin, ProviderName, RoleName, Task};
 
+    fn build_schema() -> Value {
+        serde_json::from_str(include_str!("../../schemas/build-result.json"))
+            .expect("checked-in build schema")
+    }
+
+    fn validation_message(raw: RawResult) -> String {
+        output_validation_error(&build_schema(), &raw).expect_err("fixture must be invalid")
+    }
+
+    #[test]
+    fn schema_diagnostics_are_distinct_bounded_and_never_echo_values() {
+        let secret = "private-value-that-must-not-appear";
+        let observed_summary_length = secret.chars().count() + 4_001;
+        let overflow = validation_message(RawResult {
+            text: Some("provider text is preserved separately".into()),
+            structured: Some(serde_json::json!({
+                "status": "succeeded",
+                "filesChanged": [],
+                "summary": format!("{secret}{}", "x".repeat(4_001))
+            })),
+            ok: true,
+            ..RawResult::default()
+        });
+        assert!(overflow.contains("$/summary: violated maxLength 4000"), "{overflow}");
+        assert!(
+            overflow.contains(&format!("observed length {observed_summary_length}")),
+            "{overflow}"
+        );
+        assert!(!overflow.contains(secret), "raw value leaked: {overflow}");
+
+        let missing = validation_message(RawResult {
+            text: Some(secret.into()),
+            structured: Some(serde_json::json!({"status": "succeeded", "filesChanged": []})),
+            ok: true,
+            ..RawResult::default()
+        });
+        assert!(missing.contains("required field `summary` is absent"), "{missing}");
+        assert!(!missing.contains(secret));
+
+        let malformed = validation_message(RawResult {
+            text: Some(format!("{{{secret}")),
+            ok: true,
+            ..RawResult::default()
+        });
+        assert!(malformed.contains("not valid JSON"), "{malformed}");
+        assert!(
+            malformed.contains(&format!("observed {} bytes", secret.len() + 1)),
+            "{malformed}"
+        );
+        assert!(!malformed.contains(secret));
+
+        let absent = validation_message(RawResult {
+            ok: true,
+            ..RawResult::default()
+        });
+        assert!(absent.contains("produced no final output"), "{absent}");
+        assert!(!absent.contains("resultPath"), "no artifact exists: {absent}");
+
+        for message in [&overflow, &missing, &malformed, &absent] {
+            assert!(message.len() <= MAX_SCHEMA_DIAGNOSTIC_BYTES, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_valid_result_has_no_schema_diagnostic() {
+        let raw = RawResult {
+            ok: true,
+            text: Some("valid".into()),
+            structured: Some(serde_json::json!({
+                "status": "succeeded",
+                "filesChanged": ["src/lib.rs"],
+                "summary": "implemented the task"
+            })),
+            ..RawResult::default()
+        };
+        assert_eq!(output_validation_error(&build_schema(), &raw), Ok(()));
+    }
+
     #[tokio::test]
     async fn version_probes_clean_up_descendants_on_success_overflow_timeout_and_cancellation() {
         use std::os::unix::fs::PermissionsExt;
@@ -3355,6 +3568,7 @@ mod tests {
         reg.append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: dir.join("repo"),
                 state_dir: dir.to_path_buf(),

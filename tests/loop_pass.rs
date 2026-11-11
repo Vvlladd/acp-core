@@ -34,6 +34,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use agent_control_plane::core::gates::GatePayload;
@@ -153,6 +154,19 @@ fn expected_worktree(repo_root: &Path, run: &RunId, agent: &AgentId) -> PathBuf 
         .join(".acp/worktrees")
         .join(run.as_uuid().simple().to_string())
         .join(agent8)
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The `<stateDir>/runs/<runId>/gates/<gateId>.payload.json` the design's on-disk layout names —
@@ -441,11 +455,23 @@ fn a_review_failure_resumes_the_same_builder_and_the_second_review_is_a_new_agen
 fn two_review_failures_close_the_lineage_and_replace_it_in_a_new_worktree() {
     common::with_shared_env(|| async {
         let world = LoopWorld::new("fail_then_pass", &[(FAKE_RESET_STATE, "1")]);
+        std::fs::write(world.repo_root().join("original-base.marker"), "original\n")
+            .expect("write original base marker");
+        git(world.repo_root(), &["add", "original-base.marker"]);
+        git(world.repo_root(), &["commit", "-m", "original base"]);
+        let original_base = head_sha(world.repo_root());
+        std::fs::write(world.repo_root().join("current-head.marker"), "newer\n")
+            .expect("write current HEAD marker");
+        git(world.repo_root(), &["add", "current-head.marker"]);
+        git(world.repo_root(), &["commit", "-m", "newer head"]);
+        assert_ne!(head_sha(world.repo_root()), original_base);
         let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
         let handle = actor.handle.clone();
 
+        let mut request = delegate_builder(loop_task("T36-replacement"));
+        request.base_ref = Some(original_base.clone());
         let out = handle
-            .delegate(delegate_builder(loop_task("T36-replacement")))
+            .delegate(request)
             .await
             .expect("the delegation is accepted");
         let run = out.run_id;
@@ -502,6 +528,18 @@ fn two_review_failures_close_the_lineage_and_replace_it_in_a_new_worktree() {
             "the replacement starts clean, in a new worktree"
         );
         assert!(worktrees[1].is_dir());
+        for worktree in &worktrees {
+            assert_eq!(
+                head_sha(worktree),
+                original_base,
+                "every builder lineage stays on the run's original resolved commit"
+            );
+            assert!(worktree.join("original-base.marker").is_file());
+            assert!(
+                !worktree.join("current-head.marker").exists(),
+                "content added only at the supervising checkout's HEAD must not leak into a replacement"
+            );
+        }
 
         let builders = agents_of(&events, RoleName::Builder);
         assert_eq!(builders.len(), 2, "the replacement is a new builder agent");
@@ -518,6 +556,55 @@ fn two_review_failures_close_the_lineage_and_replace_it_in_a_new_worktree() {
             _ => None,
         });
         assert_ne!(lineages[0], lineages[1], "and a new lineage");
+
+        quiesce(&handle).await;
+        actor.stop().await;
+    });
+}
+
+/// A daemon-spawned lead has no worktree and therefore records an empty creation `baseSha`. Its
+/// first delegated builder's durable worktree event becomes the pinned provenance for replacement.
+#[test]
+fn a_lead_owned_run_replaces_from_its_first_builders_resolved_base() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("fail_then_pass", &[(FAKE_RESET_STATE, "1")]);
+        std::fs::write(world.repo_root().join("lead-base.marker"), "original\n")
+            .expect("write lead base marker");
+        git(world.repo_root(), &["add", "lead-base.marker"]);
+        git(world.repo_root(), &["commit", "-m", "lead builder base"]);
+        let original_base = head_sha(world.repo_root());
+        std::fs::write(world.repo_root().join("later-head.marker"), "newer\n")
+            .expect("write later HEAD marker");
+        git(world.repo_root(), &["add", "later-head.marker"]);
+        git(world.repo_root(), &["commit", "-m", "later owner head"]);
+
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let handle = actor.handle.clone();
+        let lead = handle
+            .start_lead(loop_task("T36-lead-owned-replacement"), "Coordinate the task.".into())
+            .await
+            .expect("the lead starts");
+        let mut request = delegate_builder(loop_task("T36-lead-owned-replacement"));
+        request.run_id = Some(lead.run_id);
+        request.base_ref = Some(original_base.clone());
+        handle
+            .delegate(request)
+            .await
+            .expect("the lead-owned builder delegation is accepted");
+
+        let events = wait_for_log(&world, &lead.run_id, "the lead-owned replacement", |events| {
+            worktrees_created(events).len() >= 2
+        })
+        .await;
+        let worktrees = worktrees_created(&events);
+        assert_eq!(worktrees.len(), 2);
+        for worktree in &worktrees {
+            assert_eq!(head_sha(worktree), original_base);
+            assert!(worktree.join("lead-base.marker").is_file());
+            assert!(!worktree.join("later-head.marker").exists());
+        }
+        let run = world.reopen().run(&lead.run_id).cloned().expect("lead run");
+        assert!(run.base_sha.is_empty(), "lead creation intentionally resolved no base");
 
         quiesce(&handle).await;
         actor.stop().await;

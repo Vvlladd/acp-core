@@ -102,7 +102,7 @@ fn roles_cfg() -> RolesConfig {
         defaults: Defaults {
             base_ref: "HEAD".into(),
             max_depth: 2,
-            run_budget_usd: 15.0,
+            run_budget_usd: Some(15.0),
             spawn_budget_usd: 2.0,
             attempt_timeout_sec: 1800,
             await_result_max_sec: 300,
@@ -185,6 +185,7 @@ impl World {
         let mut registry = Registry::open(dir.path()).expect("open registry");
         let run = RunId::new_v4();
         let created = EventPayload::RunCreated {
+            run_budget_usd: None,
             execution: None,
             repo_root: dir.path().join("repo"),
             state_dir: dir.path().to_path_buf(),
@@ -532,7 +533,47 @@ fn budget_run_exceeded_when_the_spawn_cap_would_cross_the_run_budget() {
         PolicyCode::BudgetRunExceeded
     );
     let headroom = check_budget(run, 1.0, &cfg).expect("14 + 1 fits");
-    assert!((headroom - 0.0).abs() < 1e-9, "headroom was {headroom}");
+    assert_eq!(headroom, Some(0.0));
+}
+
+#[test]
+fn unlimited_run_has_no_headroom_number_but_keeps_usage_visible() {
+    let mut world = World::new();
+    let cfg = roles_cfg();
+    let agent = world.writer(&world.dir.path().join("wt"));
+    world.attempt(agent, Some(40.0));
+    let mut run = world.registry.run(&world.run).expect("run").clone();
+    run.run_budget_usd = None;
+    run.budget_recorded = true;
+
+    assert_eq!(run.spend_usd, 40.0);
+    assert_eq!(check_budget(&run, 2.0, &cfg).expect("unlimited"), None);
+}
+
+#[test]
+fn historical_run_without_capture_uses_the_explicit_legacy_config_cap() {
+    let mut world = World::new();
+    let mut cfg = roles_cfg();
+    cfg.defaults.run_budget_usd = Some(10.0);
+    let agent = world.writer(&world.dir.path().join("wt"));
+    world.attempt(agent, Some(9.0));
+    let run = world.registry.run(&world.run).expect("historical run");
+    assert!(!run.budget_recorded);
+
+    let error = check_budget(run, 2.0, &cfg).expect_err("9 + 2 exceeds configured 10");
+    assert_eq!(error.detail.expect("detail")["runBudgetUsd"], 10.0);
+}
+
+#[test]
+fn run_budget_config_accepts_null_and_rejects_negative_finite_values() {
+    let mut value = serde_json::to_value(roles_cfg()).expect("serialize roles");
+    value["defaults"]["runBudgetUsd"] = serde_json::Value::Null;
+    let unlimited: RolesConfig = serde_json::from_value(value.clone()).expect("explicit unlimited");
+    assert_eq!(unlimited.defaults.run_budget_usd, None);
+
+    value["defaults"]["runBudgetUsd"] = serde_json::json!(-0.01);
+    let error = serde_json::from_value::<RolesConfig>(value).expect_err("negative cap");
+    assert!(error.to_string().contains("finite non-negative"));
 }
 
 #[test]
@@ -552,7 +593,7 @@ fn budget_spawn_exceeded_when_a_role_asks_for_more_than_the_per_spawn_cap() {
     assert_eq!(err.detail.expect("detail")["spawnBudgetUsd"], 2.0);
 
     let ok = check_delegate(&fresh_builder(), &world.ctx(&shipped), None).expect("2 == the cap");
-    assert!((ok.headroom_usd - 13.0).abs() < 1e-9, "{}", ok.headroom_usd);
+    assert_eq!(ok.headroom_usd, Some(13.0));
 }
 
 #[test]
@@ -835,6 +876,37 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
 }
 
 #[test]
+fn blocked_and_failed_runs_reject_resume_before_a_process_can_be_cancelled_on_adoption() {
+    use agent_control_plane::core::types::RunStatus;
+    let cfg = roles_cfg();
+    let mut world = World::new();
+    let agent = world.writer(&world.dir.path().join("wt"));
+    let attempt = world.attempt(agent, None);
+    world.append(EventPayload::AgentSession {
+        agent_id: agent,
+        attempt_id: attempt,
+        session_id: "preserved-session".into(),
+        src_line: 1,
+    });
+    check_send_message(&agent, &world.ctx(&cfg)).unwrap();
+    for status in [RunStatus::Blocked, RunStatus::Failed] {
+        world.append(EventPayload::RunStatus_ {
+            status,
+            reason: Some("interrupted work".into()),
+        });
+        world.registry = Registry::open(world.dir.path()).unwrap();
+        let err = check_send_message(&agent, &world.ctx(&cfg)).unwrap_err();
+        assert_eq!(err.code, PolicyCode::RunBlocked);
+        assert!(err.reason.contains("confirm recovery"));
+    }
+    world.append(EventPayload::RunStatus_ {
+        status: RunStatus::Running,
+        reason: None,
+    });
+    check_send_message(&agent, &world.ctx(&cfg)).unwrap();
+}
+
+#[test]
 fn agent_approve_not_allowed_over_mcp_for_an_integrate_gate() {
     let cfg = roles_cfg();
     let integrate = gate(GateKind::Integrate);
@@ -880,7 +952,7 @@ fn a_delegation_that_passes_every_check_resolves_the_role_defaults() {
     assert_eq!(resolved.base_ref, "HEAD");
     assert!(resolved.writes);
     assert!((resolved.spawn_budget_usd - 2.0).abs() < 1e-9);
-    assert!((resolved.headroom_usd - 13.0).abs() < 1e-9);
+    assert_eq!(resolved.headroom_usd, Some(13.0));
     assert_eq!(resolved.attempt_timeout_sec, 1800);
 }
 
@@ -1013,4 +1085,23 @@ fn cancelled_run_refuses_fresh_and_resumed_work_after_replay() {
     request.session = SessionSpec::Resume(agent);
     assert_eq!(check_delegate(&request, &world.ctx(&cfg), None).unwrap_err().code, PolicyCode::RunBlocked);
     check_delegate(&fresh_builder(), &world.ctx(&cfg), None).unwrap();
+}
+
+
+#[test]
+fn legacy_run_retains_cap_after_upgrade_to_embedded_unlimited_default() {
+    let mut world = World::new();
+    let cfg: RolesConfig = serde_json::from_str(include_str!("../roles/roles.json")).unwrap();
+    assert_eq!(cfg.defaults.run_budget_usd, None);
+    let agent = world.writer(&world.dir.path().join("wt"));
+    world.attempt(agent, Some(14.0));
+    let run = world.registry.run(&world.run).unwrap();
+    assert!(!run.budget_recorded);
+    let err = check_budget(run, 2.0, &cfg).expect_err("upgrade must retain the old $15 cap");
+    assert_eq!(err.code, PolicyCode::BudgetRunExceeded);
+    assert_eq!(err.detail.unwrap()["runBudgetUsd"], 15.0);
+    let mut req = fresh_builder();
+    req.run_id = Some(world.run);
+    let err = check_delegate(&req, &world.ctx(&cfg), None).expect_err("delegate also retains cap");
+    assert_eq!(err.code, PolicyCode::BudgetRunExceeded);
 }

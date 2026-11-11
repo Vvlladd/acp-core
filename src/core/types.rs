@@ -482,6 +482,10 @@ pub enum LoopBranch {
     /// 17d — the lineage is out of strikes: close it and replace it, or escalate.
     #[serde(rename = "17d")]
     Replace,
+    /// The builder produced a schema-valid result but explicitly reported that the task failed.
+    /// The preserved draft needs human recovery before any selected check may run.
+    #[serde(rename = "builder_failed")]
+    BuilderFailed,
     /// Steps 13-14 — the builder succeeded and a reviewer was started.
     #[serde(rename = "review")]
     Review,
@@ -655,6 +659,13 @@ pub struct Run {
     pub loop_state: LoopState,
     pub created_at: String,
     pub spend_usd: f64,
+    /// The cap captured for this run. `None` is explicit unlimited when `budget_recorded` is true;
+    /// historical absence retains a finite configured cap, or the former embedded $15 default.
+    pub run_budget_usd: Option<f64>,
+    /// Replay-only compatibility bit. Historical `run.created` records have no captured cap and
+    /// therefore retain the finite legacy default even if the new configuration is unlimited.
+    #[serde(skip)]
+    pub budget_recorded: bool,
     pub agent_ids: Vec<AgentId>,
     pub gate_ids: Vec<GateId>,
     pub integrated_sha: Option<String>,
@@ -663,6 +674,19 @@ pub struct Run {
     /// The step switches captured at creation (B3), or `None` on pre-B3 runs — both `true` then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steps: Option<RunSteps>,
+}
+
+impl Run {
+    /// A new default cannot retroactively remove a historical spending cap. An explicitly
+    /// finite legacy configuration still applies until a human records this run's own cap.
+    #[must_use]
+    pub fn effective_budget_usd(&self, configured: Option<f64>) -> Option<f64> {
+        if self.budget_recorded {
+            self.run_budget_usd
+        } else {
+            configured.or(Some(15.0))
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
@@ -996,13 +1020,28 @@ pub struct Limits {
 pub struct Defaults {
     pub base_ref: String,
     pub max_depth: u8,
-    pub run_budget_usd: f64,
+    /// `null` in roles.json means explicitly unlimited; a number is a finite admission cap.
+    #[serde(deserialize_with = "deserialize_run_budget")]
+    pub run_budget_usd: Option<f64>,
     pub spawn_budget_usd: f64,
     pub attempt_timeout_sec: u64,
     pub await_result_max_sec: u64,
     pub strikes_before_replacement: u8,
     pub max_lineages: u8,
     pub denylist_globs: Vec<String>,
+}
+
+fn deserialize_run_budget<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|limit| !limit.is_finite() || limit < 0.0) {
+        return Err(serde::de::Error::custom(
+            "runBudgetUsd must be null or a finite non-negative number",
+        ));
+    }
+    Ok(value)
 }
 
 /// One model's price card, in US dollars per million tokens.
@@ -1227,8 +1266,28 @@ pub const EVENT_KINDS: &[&str] = &[
     "audit.prepared",
     "audit.checked",
     "security.verdict",
+    "run.budget_changed",
+    "run.budget_blocked",
     "run.recovered",
 ];
+
+/// The exact work whose admission was refused by a finite run cap.  Keeping this in the log is
+/// what makes a human continuation independent of mutable loop state and restart timing.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum BudgetContinuationAction {
+    LoopDecision { attempt_id: AttemptId },
+    SpawnAgent { agent_id: AgentId, attempt_id: AttemptId },
+    ReplaceLineage { lineage_id: LineageId, source_attempt_id: AttemptId },
+}
+
+// Missing on legacy records differs from explicitly unlimited (`null`).
+fn deserialize_captured_budget<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer).map(Some)
+}
 
 /// The envelope every event carries; the registry assigns `seq` and `ts` on append.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -1284,6 +1343,13 @@ pub enum EventPayload {
     AuditChecked { check: AuditCheck },
     #[serde(rename = "run.created")]
     RunCreated {
+        /// Atomic creation-time cap: absent is legacy; explicit null is unlimited.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_captured_budget"
+        )]
+        run_budget_usd: Option<Option<f64>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         execution: Option<RunExecution>,
         repo_root: PathBuf,
@@ -1309,6 +1375,25 @@ pub enum EventPayload {
     RunStatus_ {
         status: RunStatus,
         reason: Option<String>,
+    },
+    /// Captures the authoritative per-run cap. The field is deliberately nullable: `null` is
+    /// explicit unlimited, never an infinity or sentinel.
+    #[serde(rename = "run.budget_changed")]
+    RunBudgetChanged {
+        run_budget_usd: Option<f64>,
+        previous_run_budget_usd: Option<f64>,
+        actor: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<BudgetContinuationAction>,
+    },
+    /// An admission stopped solely on the run cap. The typed action binds an explicit human
+    /// continuation to the exact decision, created agent, or closed-lineage replacement owed.
+    #[serde(rename = "run.budget_blocked")]
+    RunBudgetBlocked {
+        action: BudgetContinuationAction,
+        spend_usd: f64,
+        spawn_cap_usd: f64,
+        run_budget_usd: f64,
     },
     #[serde(rename = "loop.state")]
     LoopStateChanged {
@@ -1593,6 +1678,8 @@ mod tests {
             EventPayload::SecurityVerdict { .. } => "security.verdict",
             EventPayload::RunCreated { .. } => "run.created",
             EventPayload::RunStatus_ { .. } => "run.status",
+            EventPayload::RunBudgetChanged { .. } => "run.budget_changed",
+            EventPayload::RunBudgetBlocked { .. } => "run.budget_blocked",
             EventPayload::LoopStateChanged { .. } => "loop.state",
             EventPayload::WorktreeCreated { .. } => "worktree.created",
             EventPayload::WorktreeRetired { .. } => "worktree.retired",
@@ -1631,6 +1718,7 @@ mod tests {
         let lineage = LineageId::new_v4();
         vec![
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: PathBuf::from("/repo"),
                 state_dir: PathBuf::from("/state"),
@@ -1862,6 +1950,10 @@ mod tests {
                 diff_hash: "c".repeat(64), outcome: AuditOutcome::NothingToRun, summary: "No test command".into() } },
             EventPayload::SecurityVerdict { attempt_id: attempt, builder_attempt_id: attempt,
                 verdict: Verdict::Pass, findings: vec![], diff_hash: "c".repeat(64) },
+            EventPayload::RunBudgetChanged { run_budget_usd: None,
+                previous_run_budget_usd: Some(15.0), actor: "cli".into(), continuation: None },
+            EventPayload::RunBudgetBlocked { action: BudgetContinuationAction::LoopDecision { attempt_id: attempt }, spend_usd: 14.0,
+                spawn_cap_usd: 2.0, run_budget_usd: 15.0 },
             EventPayload::RunRecovered { recovery: crate::core::recovery::Record {
                 request: crate::core::recovery::Request { run_id: RunId::new_v4(), source_agent_id: agent,
                     expected_seq: 10, request_id: uuid::Uuid::new_v4(),
@@ -1922,7 +2014,7 @@ mod tests {
         assert_eq!(EVENT_KINDS[24], "agent.message");
         assert_eq!(EVENT_KINDS[28], "run.delegated");
         assert_eq!(EVENT_KINDS.last(), Some(&"run.recovered"));
-        assert_eq!(EVENT_KINDS.len(), 33);
+        assert_eq!(EVENT_KINDS.len(), 35);
     }
 
     #[test]
@@ -1959,6 +2051,7 @@ mod tests {
                 run_id,
             },
             payload: EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: PathBuf::from("/repo"),
                 state_dir: PathBuf::from("/state"),
@@ -2094,6 +2187,10 @@ mod tests {
             (serde_json::to_value(Origin::ControlPlane), "control-plane"),
             (serde_json::to_value(AttemptKind::Resume), "resume"),
             (serde_json::to_value(LoopBranch::Lead), "lead"),
+            (
+                serde_json::to_value(LoopBranch::BuilderFailed),
+                "builder_failed",
+            ),
             (serde_json::to_value(LoopBranch::Verify), "verify"),
             (serde_json::to_value(Severity::Blocking), "blocking"),
             (

@@ -98,6 +98,8 @@ const TRANSCRIPTS: &[(&str, &str)] = &[
     ("worker_commits", "worker_commits"), // byte-identical to pass-1; the commit is the side effect
     ("denylist", "pass"),
     ("no_changes", "pass"), // the transcript claims a change; the bin deliberately makes none
+    ("builder_failed", "pass"), // schema-valid task failure, with a preserved changed draft
+    ("builder_failed_no_changes", "pass"), // task failure must outrank no_changed_files
     ("invalid", "invalid"),
     ("split_line", "split_line"),
     ("lead_messages", "lead_messages"),
@@ -334,7 +336,7 @@ fn main() {
             // is empty and the attempt is `invalid_output{no_changed_files}` (Rev 25).
             if !matches!(
                 scenario.as_str(),
-                "no_changes" | "lead_chat" | "lead_messages"
+                "no_changes" | "builder_failed_no_changes" | "lead_chat" | "lead_messages"
             ) {
                 write_source();
             }
@@ -346,6 +348,26 @@ fn main() {
             let transcript = transcript(&scenario, invocation);
             if scenario == "lead_messages" {
                 stream_lead_messages(&transcript, delay_ms);
+            } else if matches!(
+                scenario.as_str(),
+                "builder_failed" | "builder_failed_no_changes"
+            ) {
+                let failed: Vec<String> = transcript
+                    .iter()
+                    .map(|line| {
+                        line.replace(
+                            r#"\"status\":\"succeeded\""#,
+                            r#"\"status\":\"failed\""#,
+                        )
+                        .replace(r#""status":"succeeded""#, r#""status":"failed""#)
+                        .replace(
+                            "Added src/adder.ts exporting add(a, b) and re-exported it from src/index.ts. Type check passes; no existing behaviour changed.",
+                            "Could not complete the task because the build environment is unavailable.",
+                        )
+                    })
+                    .collect();
+                let failed: Vec<&str> = failed.iter().map(String::as_str).collect();
+                stream(&failed, delay_ms, split);
             } else {
                 stream(&transcript, delay_ms, split);
             }

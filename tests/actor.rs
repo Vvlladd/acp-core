@@ -35,6 +35,7 @@
 //! restart.
 
 mod common;
+use agent_control_plane::core::RunBudgetRequest;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,7 @@ use agent_control_plane::core::supervisor::{
 };
 use agent_control_plane::core::types::{
     Actor, AgentId, AgentStatus, AttemptError, AttemptId, AttemptKind, AttemptStatus, CancelBy,
+    BudgetContinuationAction,
     ErrorCode, Event, EventPayload, False, GateId, GateKind, GateStatus, LineageId, LoopBranch,
     LoopState, Origin, ProviderName, ReviewFinding, RoleName, RoleSpec, RunId, RunStatus,
     SandboxMode, SchemaName, Severity, Task, Verdict, VerifyStatus,
@@ -257,16 +259,22 @@ fn task(title: &str, description: &str) -> Task {
 
 /// One run in the projection, with `repo_root` pointing at `repo`.
 fn seed_run(core: &mut Core, repo: &Path, title: &str) -> RunId {
+    seed_run_at_base(core, repo, title, "0".repeat(40))
+}
+
+/// Replacement fixtures need a real pinned commit; mailbox-only fixtures need no Git lookup.
+fn seed_run_at_base(core: &mut Core, repo: &Path, title: &str, base_sha: String) -> RunId {
     let run = RunId::new_v4();
     core.registry
         .append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: repo.to_path_buf(),
                 state_dir: core.state_dir.clone(),
                 base_ref: "main".to_string(),
-                base_sha: "0".repeat(40),
+                base_sha,
                 task: task(title, "the actor stays answerable"),
                 version: 1,
                 lead: None,
@@ -335,6 +343,49 @@ fn finish_attempt(core: &mut Core, run: &RunId, agent: AgentId) -> AttemptId {
                 post_sha: Some("0".repeat(40)),
                 duration_ms: 10,
                 error: None,
+            },
+        )
+        .expect("attempt.finished");
+    attempt
+}
+
+fn finish_failed_attempt(
+    core: &mut Core,
+    run: &RunId,
+    agent: AgentId,
+    error: AttemptError,
+) -> AttemptId {
+    let attempt = AttemptId::new_v4();
+    core.registry
+        .append(
+            run,
+            EventPayload::AttemptStarted {
+                attempt_id: attempt,
+                agent_id: agent,
+                attempt_kind: AttemptKind::Resume,
+                dir: core.state_dir.join("failed-attempt"),
+                argv: vec!["claude".to_string()],
+                cwd: core.repo_root.clone(),
+                pid: 4243,
+                pgid: 4243,
+                start_time: "Sat Aug 23 00:01:00 2026".to_string(),
+                pre_sha: "0".repeat(40),
+                timeout_sec: 900,
+                spawn_budget_usd: 2.0,
+            },
+        )
+        .expect("attempt.started");
+    core.registry
+        .append(
+            run,
+            EventPayload::AttemptFinished {
+                attempt_id: attempt,
+                status: AttemptStatus::InvalidOutput,
+                exit_code: Some(0),
+                signal: None,
+                post_sha: Some("0".repeat(40)),
+                duration_ms: 10,
+                error: Some(error),
             },
         )
         .expect("attempt.finished");
@@ -1204,6 +1255,7 @@ fn seed_lineage(core: &mut Core, run: &RunId, agent: AgentId, worktree: &Path) -
         .expect("the agent was seeded")
         .lineage_id
         .expect("a seeded builder has a lineage");
+    let base_sha = core.registry.run(run).expect("the run was seeded").base_sha.clone();
     core.registry
         .append(
             run,
@@ -1212,7 +1264,7 @@ fn seed_lineage(core: &mut Core, run: &RunId, agent: AgentId, worktree: &Path) -
                 lineage_id: lineage,
                 path: worktree.to_path_buf(),
                 branch: "acp/lineage-1".to_string(),
-                base_sha: "0".repeat(40),
+                base_sha,
             },
         )
         .expect("worktree.created");
@@ -1372,19 +1424,110 @@ async fn an_agent_that_never_started_is_reissued_once_on_restart() {
     drop(core);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_worktree_budget_denial_continues_the_promised_agent_and_attempt() {
+    install_fake_clis();
+    let state = common::temp_state_dir();
+    let repo = common::temp_git_repo();
+    let Wiring {
+        mut core,
+        mut rx,
+        signals: _signals,
+    } = wire(state.path(), repo.path());
+    let run = seed_run(&mut core, repo.path(), "late worktree budget admission");
+    let promised = core.delegate(DelegateRequest {
+        run_id: Some(run),
+        role: RoleName::Builder,
+        task: task("late-budget", "finish the already selected builder"),
+        model: None,
+        session: SessionSpec::Fresh,
+        base_ref: None,
+        worktree: None,
+        steps: None,
+        caller_run_id: None,
+    }).expect("initial admission has headroom");
+
+    // The asynchronous worktree was admitted under the old cap. Before its completion reaches
+    // the actor, the authoritative per-run cap changes; actual process admission must re-check it.
+    core.registry.append(&run, EventPayload::RunBudgetChanged {
+        run_budget_usd: Some(0.0),
+        previous_run_budget_usd: Some(15.0),
+        actor: "test-race".into(),
+        continuation: None,
+    }).expect("lower cap");
+    let ready = tokio::time::timeout(LIMIT, rx.recv()).await
+        .expect("worktree helper timed out").expect("mailbox open");
+    assert!(matches!(&ready, Command::WorktreeReady { result, .. } if result.is_ok()), "{ready:?}");
+    core.handle_command(ready).await;
+
+    assert_eq!(core.registry.run(&run).expect("run").status, RunStatus::Blocked);
+    let action = core.registry.events(&run, None, usize::MAX).iter().rev()
+        .find_map(|event| match event.payload {
+            EventPayload::RunBudgetBlocked { action, .. } => Some(action),
+            _ => None,
+        }).expect("typed late denial");
+    assert_eq!(action, BudgetContinuationAction::SpawnAgent {
+        agent_id: promised.agent_id,
+        attempt_id: promised.attempt_id,
+    });
+
+    let continued = core.update_run_budget(RunBudgetRequest {
+        run_id: run,
+        expected_seq: core.registry.run(&run).expect("run").last_seq,
+        run_budget_usd: None,
+        continue_blocked: true,
+    }, Actor::Socket { client_name: "test-human".into() }).await.expect("continue exact spawn");
+    assert!(continued.continued);
+    let spawned = tokio::time::timeout(LIMIT, rx.recv()).await
+        .expect("spawn helper timed out").expect("mailbox open");
+    assert!(matches!(&spawned, Command::SpawnReady { attempt, result }
+        if *attempt == promised.attempt_id && result.is_ok()), "{spawned:?}");
+    core.handle_command(spawned).await;
+    assert_eq!(core.registry.agent(&promised.agent_id).expect("agent").attempt_ids,
+        vec![promised.attempt_id]);
+    end_attempt(&mut core, promised.agent_id).await;
+}
+
 /// Restart rule (b): a run whose 17d closed a lineage but never got its new worktree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_that_never_got_its_worktree_is_reissued_once_on_restart() {
+    replacement_restart_case(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_budget_blocked_replacement_continues_the_replacement_not_the_builder_success() {
+    replacement_restart_case(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_budget_replacement_survives_a_restart_after_the_cap_change() {
+    replacement_restart_case(true, true).await;
+}
+
+async fn replacement_restart_case(budget_block: bool, crash_after_change: bool) {
     install_fake_clis();
     let state = common::temp_state_dir();
     let repo = common::temp_git_repo();
 
     let run = {
         let Wiring { mut core, .. } = wire(state.path(), repo.path());
-        let run = seed_run(&mut core, repo.path(), "a replacement that never landed");
+        let run = seed_run_at_base(
+            &mut core,
+            repo.path(),
+            "a replacement that never landed",
+            common::head_sha(repo.path()),
+        );
         let agent = seed_agent(&mut core, &run, repo.path());
         let lineage = seed_lineage(&mut core, &run, agent, repo.path());
         let attempt = finish_attempt(&mut core, &run, agent);
+        if budget_block {
+            core.registry.append(&run, EventPayload::RunBudgetChanged {
+                run_budget_usd: Some(0.0),
+                previous_run_budget_usd: None,
+                actor: "human".into(),
+                continuation: None,
+            }).expect("zero cap");
+        }
 
         // Everything 17d writes, ending with the marker that stops it being re-driven.
         for payload in [
@@ -1423,6 +1566,43 @@ async fn a_replacement_that_never_got_its_worktree_is_reissued_once_on_restart()
         mut rx,
         signals: _signals,
     } = wire(state.path(), repo.path());
+
+    if budget_block {
+        let record = core.registry.run(&run).expect("run");
+        assert_eq!(record.status, RunStatus::Blocked);
+        let source = core.registry.events(&run, None, usize::MAX).iter().rev()
+            .find_map(|event| match event.payload {
+                EventPayload::RunBudgetBlocked { action, .. } => Some(action),
+                _ => None,
+            }).expect("durable budget action");
+        assert!(matches!(source, BudgetContinuationAction::ReplaceLineage { .. }));
+        let seq = record.last_seq;
+        assert_quiet(&mut rx, "the denied replacement must not create a worktree").await;
+        if crash_after_change {
+            // Exact crash prefix: the cap/intent is durable, Running and dispatch are absent.
+            core.registry.append(&run, EventPayload::RunBudgetChanged {
+                run_budget_usd: Some(15.0),
+                previous_run_budget_usd: Some(0.0),
+                actor: "human".into(),
+                continuation: Some(source),
+            }).expect("human cap change");
+            drop(core);
+            let wiring = wire(state.path(), repo.path());
+            core = wiring.core;
+            rx = wiring.rx;
+        } else {
+            let changed = core.update_run_budget(RunBudgetRequest {
+                run_id: run,
+                expected_seq: seq,
+                run_budget_usd: Some(15.0),
+                continue_blocked: true,
+            }, Actor::Socket { client_name: "test-human".into() }).await.expect("continue exact replacement");
+            assert!(changed.continued);
+        }
+        assert_eq!(core.registry.run(&run).unwrap().loop_state, LoopState::Replacing,
+            "a crash after consuming the continuation must still owe replacement work");
+        core.reconcile_intents();
+    }
 
     // The worktree helper 17d never got to report.
     let cmd = tokio::time::timeout(LIMIT, rx.recv())
@@ -1496,7 +1676,12 @@ async fn a_restart_reissued_replacement_inherits_the_verify_failure_text() {
 
         let run = {
             let Wiring { mut core, .. } = wire(state.path(), repo.path());
-            let run = seed_run(&mut core, repo.path(), "verify strike-out reissue");
+            let run = seed_run_at_base(
+                &mut core,
+                repo.path(),
+                "verify strike-out reissue",
+                common::head_sha(repo.path()),
+            );
             let agent = seed_agent(&mut core, &run, repo.path());
             let lineage = seed_lineage(&mut core, &run, agent, repo.path());
             let attempt = finish_attempt(&mut core, &run, agent);
@@ -1614,6 +1799,125 @@ async fn a_restart_reissued_replacement_inherits_the_verify_failure_text() {
         end_attempt(&mut core, replacement).await;
         drop(core);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_reissued_replacement_inherits_the_schema_failure_text() {
+    install_fake_clis();
+    let state = common::temp_state_dir();
+    let repo = common::temp_git_repo();
+    let diagnostic = "the final JSON does not validate against the role's result schema: \
+                      $/summary: violated maxLength 4000, observed length 4297";
+
+    let run = {
+        let Wiring { mut core, .. } = wire(state.path(), repo.path());
+        let run = seed_run_at_base(
+            &mut core,
+            repo.path(),
+            "schema strike-out reissue",
+            common::head_sha(repo.path()),
+        );
+        let agent = seed_agent(&mut core, &run, repo.path());
+        let lineage = seed_lineage(&mut core, &run, agent, repo.path());
+        let earlier = finish_attempt(&mut core, &run, agent);
+        core.registry
+            .append(
+                &run,
+                EventPayload::ReviewVerdict {
+                    attempt_id: AttemptId::new_v4(),
+                    builder_attempt_id: earlier,
+                    verdict: Verdict::Fail,
+                    findings: vec![ReviewFinding {
+                        severity: Severity::Blocking,
+                        file: None,
+                        line: None,
+                        problem: "stale review finding".to_string(),
+                        fix: None,
+                    }],
+                    diff_hash: None,
+                },
+            )
+            .expect("stale verdict");
+        let closing = finish_failed_attempt(
+            &mut core,
+            &run,
+            agent,
+            AttemptError {
+                code: ErrorCode::SchemaInvalid,
+                message: diagnostic.to_string(),
+            },
+        );
+        for payload in [
+            EventPayload::LineageClosed {
+                lineage_id: lineage,
+                reason: "out of strikes after 2".to_string(),
+            },
+            EventPayload::WorktreeRetired {
+                path: repo.path().to_path_buf(),
+                reason: "the lineage was closed after 2 strikes".to_string(),
+                resumable: False,
+            },
+            EventPayload::AgentStatusChanged {
+                agent_id: agent,
+                status: AgentStatus::Closed,
+                reason: Some("the lineage is out of strikes".to_string()),
+            },
+            EventPayload::LoopStateChanged {
+                state: LoopState::Replacing,
+                builder_agent_id: Some(agent),
+                attempt_no: 2,
+                strikes: 2,
+            },
+            EventPayload::LoopDispatched {
+                attempt_id: closing,
+                branch: LoopBranch::Replace,
+            },
+        ] {
+            core.registry.append(&run, payload).expect("append");
+        }
+        run
+    };
+
+    let Wiring {
+        mut core,
+        mut rx,
+        signals: _signals,
+    } = wire(state.path(), repo.path());
+    let cmd = tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .expect("the reissued worktree never reported")
+        .expect("the mailbox is open");
+    assert!(matches!(&cmd, Command::WorktreeReady { result, .. } if result.is_ok()));
+    core.handle_command(cmd).await;
+    let cmd = tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .expect("the replacement's spawn never reported")
+        .expect("the mailbox is open");
+    assert!(matches!(&cmd, Command::SpawnReady { .. }), "{cmd:?}");
+    core.handle_command(cmd).await;
+
+    let replacement = *core
+        .registry
+        .run(&run)
+        .expect("the run")
+        .agent_ids
+        .last()
+        .expect("the replacement agent");
+    let attempt_dir = core
+        .registry
+        .agent(&replacement)
+        .and_then(|handle| handle.attempt_ids.first())
+        .and_then(|attempt| core.registry.attempt(attempt))
+        .map(|attempt| attempt.dir.clone())
+        .expect("the replacement attempt dir");
+    let prompt = std::fs::read_to_string(attempt_dir.join("prompt.txt"))
+        .expect("the replacement prompt was rendered");
+    assert!(prompt.contains("schema_invalid"), "{prompt}");
+    assert!(prompt.contains(diagnostic), "{prompt}");
+    assert!(!prompt.contains("stale review finding"), "{prompt}");
+    assert!(prompt.contains(&repo.path().display().to_string()), "{prompt}");
+
+    end_attempt(&mut core, replacement).await;
 }
 
 /// Nothing reaches the mailbox for [`QUIET`]. The wait is the assertion: a helper posts from a

@@ -40,15 +40,17 @@ use crate::core::supervisor::{
 };
 use crate::core::team::{self, Effort, ValidTeam};
 use crate::core::types::{
-    require_all_properties, strip_dollar_schema, AgentId, AgentStatus, AttemptError, AttemptId,
-    AttemptKind, AttemptStatus, BuildResult, CancelBy, DelegatedTarget, ErrorCode, Event,
-    EventPayload, False, GateId, GateKind, GateStatus, LineageId, LoopBranch, LoopState,
+    require_all_properties, strip_dollar_schema, Actor, AgentId, AgentStatus, AttemptError, AttemptId,
+    AttemptKind, AttemptStatus, BudgetContinuationAction, BuildResult, BuildStatus, CancelBy,
+    DelegatedTarget, ErrorCode, Event, EventPayload, False, GateId, GateKind, GateStatus, LineageId,
+    LoopBranch, LoopState,
     MessageRole, Origin, ProviderName, ReviewFinding, ReviewVerdict, RoleName, RolesConfig, Run,
-    RunId, RunStatus, RunSteps, RunExecution, RunMode, SchemaName, Severity, Task, Verdict, VerifyReport, VerifyStatus,
+    RunExecution, RunId, RunMode, RunStatus, RunSteps, SchemaName, Severity, Task, Verdict,
+    VerifyReport, VerifyStatus,
 };
 use crate::core::{
     clamp_untrusted, handoff, is_terminal, Core, CoreError, DelegateOut, GateResolution,
-    WorktreeInfo,
+    RunBudgetOut, RunBudgetRequest, WorktreeInfo,
 };
 use crate::providers::claude::ClaudeAdapter;
 use crate::providers::codex::CodexAdapter;
@@ -57,6 +59,17 @@ use crate::roles::loader;
 use crate::workspace::git::GitError;
 
 pub use crate::core::SendResult;
+
+fn budget_spawn_action(mut err: PolicyError, agent: AgentId, attempt: AttemptId) -> PolicyError {
+    if err.code == PolicyCode::BudgetRunExceeded {
+        let detail = err.detail.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(object) = detail.as_object_mut() {
+            object.insert("continuationAgentId".into(), serde_json::json!(agent));
+            object.insert("continuationAttemptId".into(), serde_json::json!(attempt));
+        }
+    }
+    err
+}
 
 #[path = "audit.rs"]
 pub mod audit;
@@ -133,6 +146,7 @@ pub struct PendingWorktree {
     /// the path back on success — and it reads it to say *which* worktree could not be made.
     worktree: PathBuf,
     base_ref: String,
+    run_budget_usd: Option<f64>,
     task: Task,
     prompt: String,
     lead: Option<String>,
@@ -410,6 +424,7 @@ impl Core {
         self.registry.append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: Some(self.roles.defaults.run_budget_usd),
                 execution: Some(execution.clone()),
                 repo_root: self.repo_root.clone(),
                 state_dir: self.state_dir.clone(),
@@ -460,9 +475,11 @@ impl Core {
             spawn_budget_usd,
         };
         if let Err(err) = self.start_attempt(spawn) {
-            self.block_run(
+            self.block_action(
                 &run,
-                &format!("the lead could not be started: {}", err.reason),
+                BudgetContinuationAction::SpawnAgent { agent_id: agent, attempt_id: attempt },
+                "the lead could not be started",
+                &err,
             );
             return Err(CoreError::Policy(err));
         }
@@ -739,6 +756,7 @@ impl Core {
                 writes: resolved.writes,
                 worktree: worktree.clone(),
                 base_ref: resolved.base_ref.clone(),
+                run_budget_usd: cfg.defaults.run_budget_usd,
                 task: req.task.clone(),
                 prompt,
                 lead: team.as_ref().and_then(lead_label),
@@ -978,7 +996,12 @@ impl Core {
                 &reason,
                 p.task.id,
             ));
-            self.block_run(&p.run, &reason);
+            self.block_action(
+                &p.run,
+                BudgetContinuationAction::SpawnAgent { agent_id: p.agent, attempt_id: p.attempt },
+                "the builder could not be started",
+                &err,
+            );
         }
     }
 
@@ -1376,9 +1399,11 @@ impl Core {
             return;
         };
         if let Err(err) = self.start_attempt(spawn) {
-            self.block_run(
+            self.block_action(
                 &run,
-                &format!("the retry could not be started: {}", err.reason),
+                BudgetContinuationAction::SpawnAgent { agent_id: *agent, attempt_id: attempt },
+                "the retry could not be started",
+                &err,
             );
         }
     }
@@ -1434,6 +1459,16 @@ impl Core {
             tracing::debug!(%attempt, "no terminal attempt to dispatch");
             return;
         };
+        // A successful provider turn and a schema-valid document only establish that ACP can
+        // trust the *shape* of the builder's answer. The answer's own task outcome is a separate
+        // fact. In particular, do this before the ordinary branch table: a worker that admitted
+        // failure did not falsely claim a successful draft and must not take a content-repair
+        // strike. The structured status is the discriminator; prose is only the bounded
+        // diagnostic and is never parsed for an environment cause.
+        if self.builder_reported_failure(&f) {
+            self.branch_builder_failed(&f);
+            return;
+        }
         match branch {
             Branch::Environment => self.branch_environment(&f),
             Branch::Escalate => self.branch_escalate(&f),
@@ -1464,6 +1499,24 @@ impl Core {
         );
         self.block_run(&f.run, &reason);
         self.mark(f, LoopBranch::Environment);
+    }
+
+    /// A schema-valid builder result whose task outcome is `failed` preserves the draft and stops
+    /// before verification, review, security, or an integrate gate. Recovery is deliberately the
+    /// existing human-confirmed path: it keeps all history and re-runs every recorded check after
+    /// a later builder actually reports success.
+    fn branch_builder_failed(&mut self, f: &Finished) {
+        let summary = f
+            .structured
+            .clone()
+            .and_then(|value| serde_json::from_value::<BuildResult>(value).ok())
+            .map(|result| result.summary)
+            .unwrap_or_else(|| "the builder reported that it did not complete the task".into());
+        self.block_run(
+            &f.run,
+            &format!("builder_reported_failure: {summary}"),
+        );
+        self.mark(f, LoopBranch::BuilderFailed);
     }
 
     /// A denylist hit (step 11) or an unverifiable workspace: an `escalate` gate and a blocked run,
@@ -1534,8 +1587,7 @@ impl Core {
         {
             if !self.verifier_created_since(&f.run, f.finish_seq) {
                 if let Err(err) = self.start_verifier(&f.run, f.agent, &frozen) {
-                    let reason = format!("the verifier could not be started: {}", err.reason);
-                    self.block_run(&f.run, &reason);
+                    self.block_policy(&f.run, f.attempt, "the verifier could not be started", &err);
                 }
             }
             self.mark(f, LoopBranch::Verify);
@@ -1550,8 +1602,7 @@ impl Core {
         }
         if !self.reviewer_created_since(&f.run, f.finish_seq) {
             if let Err(err) = self.start_reviewer(&f.run, f.agent, &frozen) {
-                let reason = format!("the reviewer could not be started: {}", err.reason);
-                self.block_run(&f.run, &reason);
+                self.block_policy(&f.run, f.attempt, "the reviewer could not be started", &err);
             }
         }
         self.mark(f, LoopBranch::Review);
@@ -1711,7 +1762,7 @@ impl Core {
                 match self.send_message(&target.agent, &prompt, false).await {
                     SendResult::Ok { .. } => {}
                     SendResult::Rejected { code, reason } => {
-                        self.block_run(&f.run, &format!("{code}: {reason}"));
+                        self.block_rejection(&f.run, f.attempt, code, &reason);
                     }
                 }
             }
@@ -1724,7 +1775,7 @@ impl Core {
             match self.retry_fresh(&target.lineage).await {
                 SendResult::Ok { .. } => {}
                 SendResult::Rejected { code, reason } => {
-                    self.block_run(&f.run, &format!("{code}: {reason}"));
+                    self.block_rejection(&f.run, f.attempt, code, &reason);
                 }
             }
         }
@@ -1773,12 +1824,23 @@ impl Core {
             )
         });
         if burnt >= 2 || lineages >= max_lineages {
-            let reason = format!(
-                "{burnt} of {lineages} lineages are out of strikes; the task needs a human"
-            );
+            let recovered = self
+                .registry
+                .events(&f.run, None, usize::MAX)
+                .iter()
+                .any(|event| matches!(event.payload, EventPayload::RunRecovered { .. }));
+            let reason = if recovered {
+                format!(
+                    "human-confirmed recovery round exhausted: {burnt} of {lineages} retained lineages are out of strikes; the task needs another human decision"
+                )
+            } else {
+                format!(
+                    "{burnt} of {lineages} lineages are out of strikes; the task needs a human"
+                )
+            };
             if !self.gate_since(&f.run, f.finish_seq) {
                 let summary = format!(
-                    "Two builder lineages failed review on this task.\n\n{}\n\n{}",
+                    "Builder lineages exhausted the task's automatic allowance.\n\n{}\n\n{}",
                     reason,
                     self.violation_summary(&target.agent)
                 );
@@ -1792,8 +1854,15 @@ impl Core {
         self.emit(&f.run, loop_state(LoopState::Replacing, target, strikes));
         if !self.agent_created_since(&f.run, f.finish_seq, RoleName::Builder) {
             if let Err(err) = self.start_replacement(f, target, cause) {
-                let reason = format!("a replacement builder could not be started: {}", err.reason);
-                self.block_run(&f.run, &reason);
+                self.block_action(
+                    &f.run,
+                    BudgetContinuationAction::ReplaceLineage {
+                        lineage_id: target.lineage,
+                        source_attempt_id: f.attempt,
+                    },
+                    "a replacement builder could not be started",
+                    &err,
+                );
             }
         }
         self.mark(f, LoopBranch::Replace);
@@ -1947,6 +2016,7 @@ impl Core {
     /// [`Command::Tick`], so a `Core` built outside a runtime still reconciles a moment later.
     /// Running it twice is a no-op: the first pass fills the pending maps, and the second sees them.
     pub fn reconcile_intents(&mut self) {
+        self.reconcile_budget_continuations();
         self.drive_audits();
         for agent in self.agents_owed_a_spawn() {
             self.reissue_spawn(&agent);
@@ -1961,6 +2031,65 @@ impl Core {
         // runs exist re-drive through those runs' own markers; a `started` item whose delegate
         // died before `run.created` is reissued inside the drive.
         self.drive_plans();
+    }
+
+    fn reconcile_budget_continuations(&mut self) {
+        let runs: Vec<RunId> = self.registry.runs().map(|run| run.run_id).collect();
+        for run in runs {
+            let events = self.registry.events(&run, None, usize::MAX);
+            let Some((seq, action)) = events.iter().rev().find_map(|event| match event.payload {
+                EventPayload::RunBudgetChanged { continuation: Some(action), .. } => {
+                    Some((event.base.seq, action))
+                }
+                _ => None,
+            }) else { continue; };
+            let completed = events.iter().any(|event| {
+                if event.base.seq <= seq { return false; }
+                match (action, &event.payload) {
+                    (BudgetContinuationAction::SpawnAgent { attempt_id, .. },
+                        EventPayload::AttemptStarted { attempt_id: started, .. }) => *started == attempt_id,
+                    (BudgetContinuationAction::LoopDecision { attempt_id },
+                        EventPayload::LoopDispatched { attempt_id: dispatched, .. }) => *dispatched == attempt_id,
+                    (BudgetContinuationAction::ReplaceLineage { source_attempt_id, .. },
+                        EventPayload::LoopDispatched { attempt_id: dispatched, branch: LoopBranch::Replace }) => {
+                            *dispatched == source_attempt_id
+                        }
+                    // A precise dispatch can be consumed by another denial before it creates an
+                    // attempt. That denial needs a new human opt-in; a restart must not silently
+                    // replay the older authorization. The following blocked status also consumes
+                    // non-budget policy failures on this path.
+                    (_, EventPayload::RunBudgetBlocked { .. }
+                        | EventPayload::RunStatus_ { status: RunStatus::Blocked, .. }) => true,
+                    _ => false,
+                }
+            });
+            if completed { continue; }
+            let Some(record) = self.registry.run(&run) else { continue; };
+            if !matches!(record.status, RunStatus::Blocked | RunStatus::Running)
+                || !self.validate_budget_action(&run, action)
+            {
+                continue;
+            }
+            if record.status == RunStatus::Blocked {
+                self.emit(&run, EventPayload::RunStatus_ { status: RunStatus::Running, reason: None });
+            }
+            match action {
+                BudgetContinuationAction::SpawnAgent { agent_id, attempt_id } => {
+                    self.reissue_spawn_as(&agent_id, attempt_id);
+                }
+                BudgetContinuationAction::ReplaceLineage { .. } => {
+                    // A crash immediately after the cap-change event can still leave the
+                    // visible loop state Blocked. The durable action, not that old state,
+                    // selects replacement; its pending-worktree guard prevents duplicates.
+                    self.reissue_replacement(&run);
+                }
+                BudgetContinuationAction::LoopDecision { .. } => {
+                    if !self.pending_budget_continuations.contains(&(run, action)) {
+                        self.pending_budget_continuations.push((run, action));
+                    }
+                }
+            }
+        }
     }
 
     /// Agents the log says were announced and never started, oldest first.
@@ -1995,6 +2124,10 @@ impl Core {
 
     /// Starts the spawn `agent.created` promised, with the prompt its branch would have built.
     pub(super) fn reissue_spawn(&mut self, agent: &AgentId) {
+        self.reissue_spawn_as(agent, AttemptId::new_v4());
+    }
+
+    pub(super) fn reissue_spawn_as(&mut self, agent: &AgentId, attempt: AttemptId) {
         if !self.agent_accepts_a_spawn(agent) {
             return;
         }
@@ -2017,7 +2150,7 @@ impl Core {
                 .worktree
                 .clone()
                 .unwrap_or_else(|| handle.cwd.clone());
-            self.pending_retry.insert(*agent, AttemptId::new_v4());
+            self.pending_retry.insert(*agent, attempt);
             self.spawn_porcelain_helper(*agent, worktree);
             return;
         }
@@ -2096,13 +2229,22 @@ impl Core {
             RoleName::Builder => match parent {
                 Some(parent) if self.lineage_of(&parent) != lineage => {
                     let (findings, files) = self.abandoned_context(&run, &parent);
-                    handoff::build_replacement_prompt(&task, &findings, &files)
+                    let preserved = self
+                        .registry
+                        .agent(&parent)
+                        .and_then(|agent| agent.worktree.clone());
+                    handoff::build_replacement_prompt(
+                        &task,
+                        &findings,
+                        &files,
+                        preserved.as_deref(),
+                    )
                 }
                 _ => handoff::build_builder_prompt(&task, &schema_hint(role)),
             },
         };
 
-        let Some(spawn) = self.spawn_for_agent(agent, AttemptId::new_v4(), prompt) else {
+        let Some(spawn) = self.spawn_for_agent(agent, attempt, prompt) else {
             self.block_run(
                 &run,
                 "an agent is owed a spawn but is not startable from the log",
@@ -2110,9 +2252,11 @@ impl Core {
             return;
         };
         if let Err(err) = self.start_attempt(spawn) {
-            self.block_run(
+            self.block_action(
                 &run,
-                &format!("a reissued spawn was refused: {}", err.reason),
+                BudgetContinuationAction::SpawnAgent { agent_id: *agent, attempt_id: attempt },
+                "a reissued spawn was refused",
+                &err,
             );
         }
     }
@@ -2272,10 +2416,7 @@ impl Core {
             .map_or(self.roles.defaults.spawn_budget_usd, |r| r.spawn_budget_usd);
         let attempt = AttemptId::new_v4();
         if let Err(err) = self.resume_attempt(owed.agent, attempt, prompt, spawn_cap) {
-            self.block_run(
-                &owed.run,
-                &format!("a reissued repair was refused: {}", err.reason),
-            );
+            self.block_policy(&owed.run, owed.marked, "a reissued repair was refused", &err);
         }
     }
 
@@ -2315,9 +2456,50 @@ impl Core {
         })
     }
 
+    /// Recover the source of the latest closed lineage from event order. A committed dispatch
+    /// is authoritative; before that crash boundary the last terminal attempt in this lineage
+    /// is the decision still being finalized. Do not compare wall-clock timestamp strings.
+    fn replacement_source(&self, run: &RunId, lineage: LineageId) -> Option<AttemptId> {
+        let events = self.registry.events(run, None, usize::MAX);
+        let closed_index = events.iter().rposition(|event| {
+            matches!(event.payload, EventPayload::LineageClosed { .. })
+        })?;
+        if !matches!(events[closed_index].payload,
+            EventPayload::LineageClosed { lineage_id, .. } if lineage_id == lineage)
+        {
+            return None;
+        }
+        let belongs = |id: &AttemptId| {
+            self.registry.attempt(id).is_some_and(|attempt| {
+                attempt.run_id == *run && is_terminal(attempt.status)
+                    && self.registry.agent(&attempt.agent_id).is_some_and(|agent| {
+                        agent.lineage_id == Some(lineage)
+                    })
+            })
+        };
+        events[closed_index + 1..].iter().rev().find_map(|event| {
+            match event.payload {
+                EventPayload::LoopDispatched { attempt_id, branch: LoopBranch::Replace }
+                    if belongs(&attempt_id) => Some(attempt_id),
+                _ => None,
+            }
+        }).or_else(|| {
+            events[..closed_index].iter().rev().find_map(|event| {
+                match event.payload {
+                    EventPayload::AttemptFinished { attempt_id, .. }
+                        if belongs(&attempt_id) => Some(attempt_id),
+                    _ => None,
+                }
+            })
+        })
+    }
+
     /// Restarts 17d's replacement from the log: the closed lineage names what was abandoned.
     fn reissue_replacement(&mut self, run: &RunId) {
-        if !self.run_accepts_workers(run) {
+        if !self.run_accepts_workers(run)
+            || self.pending_worktree.values().any(|pending| pending.run == *run)
+            || !self.registry.run(run).is_some_and(|record| self.replacement_is_owed(record))
+        {
             return;
         }
         let Some(closed) = self
@@ -2335,15 +2517,21 @@ impl Core {
         };
         tracing::info!(%run, lineage = %closed.lineage_id, "reissuing a replacement the log shows was never created");
         let (findings, _) = self.abandoned_context(run, &agent);
-        // The ReviewFail label is safe even when the closer was a verify failure:
-        // `start_replacement` reads the cause only to derive findings, and `abandoned_context`
-        // already synthesized the verify failures into findings. The first cause-dependent line
-        // added to the replacement prompt must revisit this.
+        // The ReviewFail label is safe for every reconstructed closer: `start_replacement` reads
+        // the cause only to derive findings, and `abandoned_context` has already synthesized
+        // review, verification and builder-attempt errors into the same bounded finding shape.
         let cause = StrikeCause::ReviewFail(findings);
+        // Use the durable replacement decision, never a timestamp-selected checker or the
+        // builder's success as a new loop decision. Builder failures can close a lineage too.
+        let source_attempt = self.replacement_source(run, closed.lineage_id);
+        let Some(source_attempt) = source_attempt else {
+            self.block_run(run, "a reissued replacement has no terminal source attempt");
+            return;
+        };
         let f = Finished {
             // The replacement is started from the *run*, not from an attempt: nothing here appends
             // an attempt-scoped event, and `start_replacement` only reads `f.run`.
-            attempt: AttemptId::new_v4(),
+            attempt: source_attempt,
             run: *run,
             agent,
             status: AttemptStatus::Failed,
@@ -2352,37 +2540,84 @@ impl Core {
             finish_seq: 0,
             parent: None,
         };
+        // Keep the ordinary replacement intent recoverable after its continuation marker is
+        // durable but before WorktreeReady arrives. The previous budget block set this to Blocked.
+        self.emit(run, loop_state(LoopState::Replacing, &target, target.strikes));
         if let Err(err) = self.start_replacement(&f, &target, &cause) {
-            self.block_run(
+            self.block_action(
                 run,
-                &format!("a reissued replacement was refused: {}", err.reason),
+                BudgetContinuationAction::ReplaceLineage {
+                    lineage_id: closed.lineage_id,
+                    source_attempt_id: f.attempt,
+                },
+                "a reissued replacement was refused",
+                &err,
             );
         }
+        // This records consumption even if admission blocks again; the new block retains its
+        // own exact action. A crash before this marker is recovered by the owed-worktree guard.
+        self.mark(&f, LoopBranch::Replace);
     }
 
     /// What the abandoned lineage left behind: the findings that closed it and the files it had
     /// changed — the two inputs of `build_replacement_prompt`.
     ///
-    /// B1 (T64 review F8): the lineage can be closed by a review FAIL **or** by verify failures,
-    /// and the newest of the two is what actually closed it — a restart-reissued replacement
-    /// must not walk into the same broken build because the log's last *verdict* predates the
-    /// verify failure that struck the lineage out. Verify failures are synthesized into blocking
-    /// findings exactly as `start_replacement` does in-process.
-    // KNOWN residual: the THIRD closer — `StrikeCause::Failure` (a builder crash/timeout) — is
-    // not reconstructible here; a restart-reissue after a failure strike-out gets the newest
-    // verdict/report findings rather than the crash error the in-process path would have used.
-    // Pre-existing, narrower than F8, recorded rather than fixed.
+    /// The newest relevant event is the closer: review FAIL, verify FAIL, or a builder attempt's
+    /// bounded error. Filtering by this lineage's builder attempts prevents another lineage's
+    /// newer report from becoming the replacement's reason. Each form is synthesized exactly as
+    /// `start_replacement` does in-process, including `schema_invalid` after a restart.
     fn abandoned_context(&self, run: &RunId, agent: &AgentId) -> (Vec<ReviewFinding>, Vec<String>) {
         let lineage = self.lineage_of(agent);
+        let attempts: Vec<AttemptId> = lineage
+            .and_then(|lineage| {
+                self.registry
+                    .run(run)
+                    .and_then(|state| state.lineages.iter().find(|item| item.lineage_id == lineage))
+            })
+            .map(|state| {
+                state
+                    .agent_ids
+                    .iter()
+                    .filter_map(|id| self.registry.agent(id))
+                    .flat_map(|handle| handle.attempt_ids.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                self.registry
+                    .agent(agent)
+                    .map(|handle| handle.attempt_ids.clone())
+                    .unwrap_or_default()
+            });
         let events = self.registry.events(run, None, usize::MAX);
         let newest = events.iter().rev().find_map(|e| match &e.payload {
-            EventPayload::ReviewVerdict { findings, .. } | EventPayload::SecurityVerdict { findings, .. } => Some(findings.clone()),
+            EventPayload::AttemptFinished {
+                attempt_id,
+                error: Some(error),
+                ..
+            } if attempts.contains(attempt_id) => Some(vec![ReviewFinding {
+                severity: Severity::Blocking,
+                file: None,
+                line: None,
+                problem: format!("{}: {}", error_key(error.code), error.message),
+                fix: None,
+            }]),
+            EventPayload::ReviewVerdict {
+                builder_attempt_id,
+                findings,
+                ..
+            }
+            | EventPayload::SecurityVerdict {
+                builder_attempt_id,
+                findings,
+                ..
+            } if attempts.contains(builder_attempt_id) => Some(findings.clone()),
             EventPayload::VerifyReport {
+                builder_attempt_id,
                 status: VerifyStatus::Fail,
                 summary,
                 failures,
                 ..
-            } => {
+            } if attempts.contains(builder_attempt_id) => {
                 let mut findings: Vec<ReviewFinding> = failures
                     .iter()
                     .map(|line| ReviewFinding {
@@ -2473,6 +2708,13 @@ impl Core {
     /// something the worker did.
     fn start_attempt(&mut self, s: StartSpawn) -> Result<(), PolicyError> {
         let cfg = Arc::clone(&self.roles);
+        let run = self.registry.run(&s.run).ok_or_else(|| {
+            PolicyError::new(PolicyCode::RunBlocked, "the attempt's run is not on record")
+        })?;
+        // Re-check at the actual process-admission boundary. A worktree helper or restart can
+        // separate the original decision from this spawn, during which another attempt may have
+        // consumed headroom or a human may have changed this run's cap.
+        policy::check_budget(run, s.spawn_budget_usd, &cfg)?;
         let role = loader::role_spec(&cfg, s.role)
             .map_err(|err| PolicyError::new(PolicyCode::UnknownRole, err.to_string()))?;
         let role_prompt = loader::role_prompt(&cfg, s.role)
@@ -2858,7 +3100,7 @@ impl Core {
             session_id: None,
             timeout_sec: resolved.attempt_timeout_sec,
             spawn_budget_usd: resolved.spawn_budget_usd,
-        })
+        }).map_err(|err| budget_spawn_action(err, agent, attempt))
     }
 
     /// B1: a fresh verifier in the builder's worktree — the mirror of [`Self::start_reviewer`],
@@ -2950,7 +3192,7 @@ impl Core {
             session_id: None,
             timeout_sec: resolved.attempt_timeout_sec,
             spawn_budget_usd: resolved.spawn_budget_usd,
-        })
+        }).map_err(|err| budget_spawn_action(err, agent, attempt))
     }
 
     /// B1's mirror of [`Self::retry_reviewer`]: one replacement verifier per frozen diff, then
@@ -2986,13 +3228,7 @@ impl Core {
         };
         // The early return above already covered the created-since case; start unconditionally.
         if let Err(err) = self.start_verifier(&f.run, builder, frozen) {
-            self.block_run(
-                &f.run,
-                &format!(
-                    "a replacement verifier could not be started: {}",
-                    err.reason
-                ),
-            );
+            self.block_policy(&f.run, f.attempt, "a replacement verifier could not be started", &err);
         }
         self.mark(f, LoopBranch::Verify);
     }
@@ -3108,8 +3344,7 @@ impl Core {
                 return;
             };
             if let Err(err) = self.start_reviewer(&f.run, builder_agent, &frozen) {
-                let reason = format!("the reviewer could not be started: {}", err.reason);
-                self.block_run(&f.run, &reason);
+                self.block_policy(&f.run, f.attempt, "the reviewer could not be started", &err);
             }
         }
         self.mark(f, LoopBranch::Verify);
@@ -3155,13 +3390,7 @@ impl Core {
         };
         // The early return above already covered the created-since case; start unconditionally.
         if let Err(err) = self.start_review_role(&f.run, builder, frozen, role) {
-            self.block_run(
-                &f.run,
-                &format!(
-                    "a replacement reviewer could not be started: {}",
-                    err.reason
-                ),
-            );
+            self.block_policy(&f.run, f.attempt, "a replacement reviewer could not be started", &err);
         }
         self.mark(f, LoopBranch::Review);
     }
@@ -3180,13 +3409,17 @@ impl Core {
                 "the run has no task on record",
             ));
         };
+        let base_sha = self.replacement_base_sha(&f.run)?;
         let request = DelegateRequest {
             run_id: Some(f.run),
             role: RoleName::Builder,
             task: task.clone(),
             model: None,
             session: SessionSpec::Fresh,
-            base_ref: None,
+            // Policy still checks the internal delegation, but replacement worktrees are pinned
+            // to the immutable commit captured when the run was created. In particular, neither
+            // a moving named ref nor a changed roles default gets another chance to choose a base.
+            base_ref: Some(base_sha.clone()),
             worktree: None,
             steps: None,
             // Internal (the loop's own replacement), not a lead's own delegate call.
@@ -3240,7 +3473,12 @@ impl Core {
                 .unwrap_or_default(),
         };
         let prior_files = self.lineage_files(&f.run, &target.lineage);
-        let prompt = handoff::build_replacement_prompt(&task, &findings, &prior_files);
+        let prompt = handoff::build_replacement_prompt(
+            &task,
+            &findings,
+            &prior_files,
+            Some(&target.worktree),
+        );
 
         self.pending_worktree.insert(
             lineage,
@@ -3260,7 +3498,8 @@ impl Core {
                 origin: Origin::ControlPlane,
                 writes: resolved.writes,
                 worktree: worktree.clone(),
-                base_ref: resolved.base_ref.clone(),
+                base_ref: base_sha.clone(),
+                run_budget_usd: None, // Existing run: never recaptured by a replacement.
                 task,
                 prompt,
                 lead: None,
@@ -3278,13 +3517,7 @@ impl Core {
                 caller_run_id: None,
             },
         );
-        self.spawn_worktree_from_ref(
-            lineage,
-            self.repo_root.clone(),
-            worktree,
-            branch,
-            resolved.base_ref,
-        );
+        self.spawn_worktree_helper(lineage, self.repo_root.clone(), worktree, branch, base_sha);
         Ok(())
     }
 
@@ -3448,6 +3681,7 @@ impl Core {
         self.registry.append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: Some(self.roles.defaults.run_budget_usd),
                 execution: Some(execution.clone()),
                 repo_root: self.repo_root.clone(),
                 state_dir: self.state_dir.clone(),
@@ -4001,6 +4235,304 @@ impl Core {
         self.drive_plans();
     }
 
+    /// Preserve the exact loop decision when (and only when) the per-run cap refused its next
+    /// admission. Generic policy failures remain ordinary non-resumable blocks.
+    pub(super) fn block_policy(
+        &mut self,
+        run: &RunId,
+        attempt: AttemptId,
+        context: &str,
+        err: &PolicyError,
+    ) {
+        let action = err.detail.as_ref().and_then(|detail| {
+            Some(BudgetContinuationAction::SpawnAgent {
+                agent_id: detail.get("continuationAgentId")?.as_str()?.parse().ok()?,
+                attempt_id: detail.get("continuationAttemptId")?.as_str()?.parse().ok()?,
+            })
+        }).unwrap_or(BudgetContinuationAction::LoopDecision { attempt_id: attempt });
+        self.block_action(
+            run,
+            action,
+            context,
+            err,
+        );
+    }
+
+    fn block_action(
+        &mut self,
+        run: &RunId,
+        action: BudgetContinuationAction,
+        context: &str,
+        err: &PolicyError,
+    ) {
+        if err.code == PolicyCode::BudgetRunExceeded {
+            let detail = err.detail.as_ref();
+            let spend_usd = detail.and_then(|v| v["spendUsd"].as_f64());
+            let spawn_cap_usd = detail.and_then(|v| v["spawnCapUsd"].as_f64());
+            let run_budget_usd = detail.and_then(|v| v["runBudgetUsd"].as_f64());
+            if let (Some(spend_usd), Some(spawn_cap_usd), Some(run_budget_usd)) =
+                (spend_usd, spawn_cap_usd, run_budget_usd)
+            {
+                self.emit(
+                    run,
+                    EventPayload::RunBudgetBlocked {
+                        action,
+                        spend_usd,
+                        spawn_cap_usd,
+                        run_budget_usd,
+                    },
+                );
+            }
+        }
+        self.block_run(run, &format!("{context}: {}", err.reason));
+    }
+
+    fn block_rejection(
+        &mut self,
+        run: &RunId,
+        attempt: AttemptId,
+        code: PolicyCode,
+        reason: &str,
+    ) {
+        if code == PolicyCode::BudgetRunExceeded {
+            if let Some(current) = self.registry.run(run) {
+                let effective = current.effective_budget_usd(self.roles.defaults.run_budget_usd);
+                if let Some(run_budget_usd) = effective {
+                    let spend_usd = current.spend_usd;
+                    let spawn_cap_usd = self
+                        .roles
+                        .roles
+                        .get(&RoleName::Builder)
+                        .map_or(self.roles.defaults.spawn_budget_usd, |role| role.spawn_budget_usd);
+                    self.emit(
+                        run,
+                        EventPayload::RunBudgetBlocked {
+                            action: BudgetContinuationAction::LoopDecision { attempt_id: attempt },
+                            spend_usd,
+                            spawn_cap_usd,
+                            run_budget_usd,
+                        },
+                    );
+                }
+            }
+        }
+        self.block_run(run, &format!("{code}: {reason}"));
+    }
+
+    fn validate_budget_action(&self, run: &RunId, action: BudgetContinuationAction) -> bool {
+        match action {
+            BudgetContinuationAction::LoopDecision { attempt_id } => self
+                .registry
+                .attempt(&attempt_id)
+                .filter(|attempt| attempt.run_id == *run && is_terminal(attempt.status))
+                .and_then(|attempt| self.registry.agent(&attempt.agent_id).map(|agent| (attempt, agent)))
+                .is_some_and(|(attempt, agent)| !matches!(
+                    branch_of(agent.role, attempt.status, attempt.error.as_ref()),
+                    Branch::None | Branch::Lead | Branch::Environment | Branch::Escalate
+                )),
+            BudgetContinuationAction::SpawnAgent { agent_id, attempt_id } => {
+                self.registry.attempt(&attempt_id).is_none()
+                    && self.registry.agent(&agent_id).is_some_and(|agent| {
+                        agent.run_id == *run
+                            && agent.attempt_ids.is_empty()
+                            && !matches!(agent.status, AgentStatus::Closed | AgentStatus::Cancelled)
+                    })
+            }
+            BudgetContinuationAction::ReplaceLineage { lineage_id, source_attempt_id } => {
+                let Some(source) = self.registry.attempt(&source_attempt_id) else { return false; };
+                let Some(source_agent) = self.registry.agent(&source.agent_id) else { return false; };
+                source.run_id == *run
+                    && source_agent.lineage_id == Some(lineage_id)
+                    && is_terminal(source.status)
+                    && self.replacement_source(run, lineage_id) == Some(source_attempt_id)
+                    && self.registry.run(run).is_some_and(|record| {
+                        record.lineages.iter().any(|lineage| lineage.lineage_id == lineage_id && lineage.closed)
+                    })
+                    && self.replacement_is_owed(self.registry.run(run).expect("checked above"))
+            }
+        }
+    }
+
+    pub(super) async fn dispatch_budget_action(&mut self, run: RunId, action: BudgetContinuationAction) {
+        match action {
+            BudgetContinuationAction::LoopDecision { attempt_id } => {
+                self.on_attempt_finished(attempt_id).await;
+            }
+            BudgetContinuationAction::ReplaceLineage { .. } => {
+                self.reissue_replacement(&run);
+            }
+            BudgetContinuationAction::SpawnAgent { agent_id, attempt_id } => {
+                self.reissue_spawn_as(&agent_id, attempt_id);
+            }
+        }
+        // Every dispatcher above re-checks ordinary admission and evidence. If it could not
+        // produce work it records its own precise block; never manufacture success here.
+        let _ = run;
+    }
+
+    /// Socket-only cap mutation. Continuation re-dispatches the terminal attempt named by the
+    /// latest budget denial; it never guesses from loop state or revives an arbitrary block.
+    pub async fn update_run_budget(
+        &mut self,
+        request: RunBudgetRequest,
+        by: Actor,
+    ) -> Result<RunBudgetOut, CoreError> {
+        if request
+            .run_budget_usd
+            .is_some_and(|limit| !limit.is_finite() || limit < 0.0)
+        {
+            return Err(PolicyError::new(
+                PolicyCode::BudgetRunExceeded,
+                "runBudgetUsd must be null or a finite non-negative number",
+            )
+            .into());
+        }
+        let run = self
+            .registry
+            .run(&request.run_id)
+            .cloned()
+            .ok_or(CoreError::UnknownRun(request.run_id))?;
+        if run.last_seq != request.expected_seq {
+            return Err(PolicyError::new(
+                PolicyCode::RunBlocked,
+                format!(
+                    "run state changed: expected sequence {}, current sequence is {}",
+                    request.expected_seq, run.last_seq
+                ),
+            )
+            .into());
+        }
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Integrated | RunStatus::Cancelled | RunStatus::Failed
+        ) {
+            return Err(PolicyError::new(
+                PolicyCode::RunBlocked,
+                "a terminal run's budget cannot be changed",
+            )
+            .into());
+        }
+        if run.status == RunStatus::AwaitingGate
+            || run.gate_ids.iter().any(|gate| self.registry.gate(gate).is_some_and(|gate| gate.status == GateStatus::Pending))
+        {
+            return Err(PolicyError::new(
+                PolicyCode::GatePending,
+                "a pending human gate must be resolved before changing the run budget",
+            ).into());
+        }
+        let active_attempt = run.agent_ids.iter().any(|agent| {
+            self.registry.agent(agent).is_some_and(|handle| {
+                handle.attempt_ids.iter().any(|id| {
+                    self.registry.attempt(id).is_some_and(|attempt| !is_terminal(attempt.status))
+                })
+            })
+        });
+        let helper_active = self.pending_worktree.values().any(|pending| pending.run == request.run_id)
+            || self.pending_spawn.values().any(|pending| pending.ctx.run == request.run_id)
+            || self.pending_retry.keys().any(|agent| self.registry.agent(agent).is_some_and(|handle| handle.run_id == request.run_id));
+        if active_attempt || helper_active {
+            return Err(PolicyError::new(
+                PolicyCode::RunBlocked,
+                "work is active or being prepared; change the budget after it becomes idle",
+            ).into());
+        }
+
+        let continuation = if request.continue_blocked {
+            if run.status != RunStatus::Blocked {
+                return Err(PolicyError::new(
+                    PolicyCode::RunBlocked,
+                    "only the current budget-blocked decision can be continued",
+                )
+                .into());
+            }
+            let events = self.registry.events(&request.run_id, None, usize::MAX);
+            let Some((index, action)) = events.iter().enumerate().rev().find_map(|(index, event)| {
+                match event.payload {
+                    EventPayload::RunBudgetBlocked { action, .. } => Some((index, action)),
+                    _ => None,
+                }
+            }) else {
+                return Err(PolicyError::new(
+                    PolicyCode::RunBlocked,
+                    "the run is not blocked on a resumable budget decision",
+                )
+                .into());
+            };
+            let mut blocked_status = false;
+            let mut blocked_loop = false;
+            let mut dispatched = false;
+            let fresh = events[index + 1..].iter().all(|event| match &event.payload {
+                EventPayload::RunStatus_ { status: RunStatus::Blocked, .. }
+                    if !blocked_status && !blocked_loop && !dispatched => {
+                    blocked_status = true;
+                    true
+                }
+                EventPayload::LoopStateChanged { state: LoopState::Blocked, .. }
+                    if blocked_status && !blocked_loop && !dispatched => {
+                    blocked_loop = true;
+                    true
+                }
+                EventPayload::LoopDispatched { attempt_id, branch }
+                    if blocked_loop && !dispatched && match action {
+                        BudgetContinuationAction::LoopDecision { attempt_id: expected } => {
+                            *attempt_id == expected
+                        }
+                        BudgetContinuationAction::ReplaceLineage { source_attempt_id, .. } => {
+                            *attempt_id == source_attempt_id && *branch == LoopBranch::Replace
+                        }
+                        BudgetContinuationAction::SpawnAgent { .. } => false,
+                    } => {
+                    dispatched = true;
+                    true
+                }
+                EventPayload::RunBudgetChanged { .. } if blocked_loop => true,
+                _ => false,
+            }) && blocked_status && blocked_loop;
+            let actionable = self.validate_budget_action(&request.run_id, action);
+            if !fresh || !actionable {
+                return Err(PolicyError::new(
+                    PolicyCode::RunBlocked,
+                    "the budget-blocked decision is stale; start a new human-directed action",
+                )
+                .into());
+            }
+            Some(action)
+        } else {
+            None
+        };
+
+        self.registry.append(
+            &request.run_id,
+            EventPayload::RunBudgetChanged {
+                run_budget_usd: request.run_budget_usd,
+                previous_run_budget_usd: run.effective_budget_usd(self.roles.defaults.run_budget_usd),
+                actor: by.as_str().to_string(),
+                continuation,
+            },
+        )?;
+        if let Some(action) = continuation {
+            self.registry.append(
+                &request.run_id,
+                EventPayload::RunStatus_ {
+                    status: RunStatus::Running,
+                    reason: None,
+                },
+            )?;
+            self.dispatch_budget_action(request.run_id, action).await;
+        }
+        let current = self
+            .registry
+            .run(&request.run_id)
+            .ok_or(CoreError::UnknownRun(request.run_id))?;
+        Ok(RunBudgetOut {
+            run_id: request.run_id,
+            run_budget_usd: current.run_budget_usd,
+            spend_usd: current.spend_usd,
+            last_seq: current.last_seq,
+            continued: continuation.is_some(),
+        })
+    }
+
     /// The branch's last append: everything it did is durable behind this.
     fn mark(&mut self, f: &Finished, branch: LoopBranch) {
         self.emit(
@@ -4035,6 +4567,18 @@ impl Core {
             finish_seq,
             parent: agent.parent_agent_id,
         })
+    }
+
+    fn builder_reported_failure(&self, f: &Finished) -> bool {
+        f.status == AttemptStatus::Succeeded
+            && self
+                .registry
+                .agent(&f.agent)
+                .is_some_and(|agent| agent.role == RoleName::Builder)
+            && f.structured
+                .clone()
+                .and_then(|value| serde_json::from_value::<BuildResult>(value).ok())
+                .is_some_and(|result| result.status == BuildStatus::Failed)
     }
 
     /// The builder facts a branch acts on.
@@ -4073,6 +4617,100 @@ impl Core {
 
     fn task_of(&self, run: &RunId) -> Option<Task> {
         self.registry.run(run).map(|r| r.task.clone())
+    }
+
+    /// The immutable base for a new builder lineage.
+    ///
+    /// A direct build run records the resolved commit in both `run.created` and its first builder
+    /// worktree event, and those records must agree. A daemon-spawned lead is intentionally created
+    /// without resolving a worktree base; for that genuine lead-owned route, the first builder
+    /// worktree is the durable authority. The strict lowercase SHA-1 shape matches the validation
+    /// at the git boundary (`workspace::git::add_worktree`).
+    fn replacement_base_sha(&self, run_id: &RunId) -> Result<String, PolicyError> {
+        let Some(run) = self.registry.run(run_id) else {
+            return Err(PolicyError::new(
+                PolicyCode::ResumeTargetMissing,
+                "the replacement run has no durable base provenance",
+            ));
+        };
+        if run.base_ref.is_empty() {
+            return Err(PolicyError::new(
+                PolicyCode::InvalidBaseRef,
+                "the replacement run's durable base provenance is missing or invalid",
+            ));
+        }
+        let mut lead_owned = false;
+        let mut first_builder_base = None;
+        for event in self.registry.events(run_id, None, usize::MAX).iter() {
+            if let EventPayload::AgentCreated {
+                agent_id,
+                role: RoleName::Lead,
+                lineage_id: None,
+                worktree: None,
+                ..
+            } = &event.payload
+            {
+                lead_owned = self
+                    .registry
+                    .agent(agent_id)
+                    .is_some_and(|agent| agent.run_id == *run_id && agent.role == RoleName::Lead);
+                continue;
+            }
+            let EventPayload::WorktreeCreated {
+                agent_id, base_sha, ..
+            } = &event.payload
+            else {
+                continue;
+            };
+            let Some(agent) = self.registry.agent(agent_id) else {
+                return Err(PolicyError::new(
+                    PolicyCode::InvalidBaseRef,
+                    "the replacement run's first worktree has no recorded agent",
+                ));
+            };
+            if agent.run_id != *run_id || agent.role != RoleName::Builder {
+                return Err(PolicyError::new(
+                    PolicyCode::InvalidBaseRef,
+                    "the replacement run's first worktree is not owned by its builder",
+                ));
+            }
+            first_builder_base = Some(base_sha.clone());
+            break;
+        }
+        let Some(first_builder_base) = first_builder_base else {
+            return Err(PolicyError::new(
+                PolicyCode::InvalidBaseRef,
+                "the replacement run has no durable builder base provenance",
+            ));
+        };
+        let valid_sha = |sha: &str| {
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        if !valid_sha(&first_builder_base) {
+            return Err(PolicyError::new(
+                PolicyCode::InvalidBaseRef,
+                "the replacement run's first builder base is invalid",
+            ));
+        }
+        if run.base_sha.is_empty() {
+            if !lead_owned {
+                return Err(PolicyError::new(
+                    PolicyCode::InvalidBaseRef,
+                    "the replacement run's creation base is missing without a recorded lead owner",
+                ));
+            }
+            return Ok(first_builder_base);
+        }
+        if !valid_sha(&run.base_sha) || run.base_sha != first_builder_base {
+            return Err(PolicyError::new(
+                PolicyCode::InvalidBaseRef,
+                "the replacement run's durable base records are invalid or inconsistent",
+            ));
+        }
+        Ok(run.base_sha.clone())
     }
 
     fn lineage_strikes(&self, run: &RunId, lineage: &LineageId) -> u8 {
@@ -4429,6 +5067,7 @@ fn run_created(
     base_sha: String,
 ) -> EventPayload {
     EventPayload::RunCreated {
+        run_budget_usd: Some(p.run_budget_usd),
         execution: p.execution.clone(),
         repo_root,
         state_dir,
@@ -4898,6 +5537,7 @@ mod tests {
             writes: true,
             worktree: PathBuf::from("/repo/worktree"),
             base_ref: "HEAD".to_string(),
+            run_budget_usd: None,
             task: Task {
                 id: "T50".to_string(),
                 title: "bound the team name".to_string(),

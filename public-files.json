@@ -15,6 +15,7 @@
     "docs/INSTALLATION.md",
     "docs/PROTOCOL.md",
     "docs/RELEASING.md",
+    "docs/design-claude-effort.md",
     "docs/distribution/upstream-licenses/jsonschema-LICENSE",
     "docs/distribution/upstream-licenses/rust-sdk-LICENSE",
     "docs/distribution/upstream-licenses/simd-LICENSE",

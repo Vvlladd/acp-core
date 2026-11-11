@@ -10,7 +10,7 @@
   "defaults": {
     "baseRef": "HEAD",
     "maxDepth": 2,
-    "runBudgetUsd": 15,
+    "runBudgetUsd": null,
     "spawnBudgetUsd": 2,
     "attemptTimeoutSec": 1800,
     "awaitResultMaxSec": 300,

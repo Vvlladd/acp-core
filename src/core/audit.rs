@@ -167,6 +167,7 @@ impl Core {
         self.registry.append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: Some(self.roles.defaults.run_budget_usd),
                 steps: Some(execution.steps),
                 execution: Some(execution),
                 repo_root: self.repo_root.clone(),

@@ -1291,7 +1291,7 @@ fn live_full_loop() {
         // B1's verify step has its own probe (`live_verifier`); running a third real agent here
         // would silently change what Phase-1 acceptance measured and its budget.
         roles.roles.remove(&RoleName::Verifier);
-        roles.defaults.run_budget_usd = 0.20;
+        roles.defaults.run_budget_usd = Some(0.20);
         roles.defaults.spawn_budget_usd = 0.10;
         roles.defaults.attempt_timeout_sec = LIVE_TIMEOUT.as_secs();
         let builder = roles
@@ -1395,7 +1395,7 @@ fn live_verifier() {
             repo: temp_git_repo(),
         });
         let mut roles = (*embedded_roles()).clone();
-        roles.defaults.run_budget_usd = 0.40;
+        roles.defaults.run_budget_usd = Some(0.40);
         roles.defaults.spawn_budget_usd = 0.15;
         roles.defaults.attempt_timeout_sec = LIVE_TIMEOUT.as_secs();
         let builder = roles.roles.get_mut(&RoleName::Builder).expect("builder");
@@ -1559,7 +1559,7 @@ fn live_codex_builder() {
         });
         let mut roles = (*embedded_roles()).clone();
         roles.roles.remove(&RoleName::Verifier);
-        roles.defaults.run_budget_usd = 0.35;
+        roles.defaults.run_budget_usd = Some(0.35);
         roles.defaults.spawn_budget_usd = 0.20;
         roles.defaults.attempt_timeout_sec = LIVE_TIMEOUT.as_secs();
         let builder = roles.roles.get_mut(&RoleName::Builder).expect("builder");
@@ -1680,7 +1680,7 @@ fn live_plan_sequence() {
             repo: temp_git_repo(),
         });
         let mut roles = (*embedded_roles()).clone();
-        roles.defaults.run_budget_usd = 0.22;
+        roles.defaults.run_budget_usd = Some(0.22);
         roles.defaults.spawn_budget_usd = 0.10;
         roles.defaults.attempt_timeout_sec = LIVE_TIMEOUT.as_secs();
         let builder = roles

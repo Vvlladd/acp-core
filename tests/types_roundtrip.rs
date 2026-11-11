@@ -393,6 +393,16 @@ const EVENT_FIXTURES: &str = r#"[
   },
   {
     "seq":33, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
+    "kind":"run.budget_changed", "runBudgetUsd":null,
+    "previousRunBudgetUsd":15.0, "actor":"cli"
+  },
+  {
+    "seq":34, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
+    "kind":"run.budget_blocked", "action":{"kind":"loopDecision","attemptId":"33333333-3333-4333-8333-333333333333"},
+    "spendUsd":14.0, "spawnCapUsd":2.0, "runBudgetUsd":15.0
+  },
+  {
+    "seq":35, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
     "kind":"run.recovered", "recovery": {
       "request": { "runId":"11111111-1111-4111-8111-111111111111",
         "sourceAgentId":"22222222-2222-4222-8222-222222222222", "expectedSeq":32,
@@ -482,6 +492,7 @@ fn structured_build_result() -> Value {
 fn payloads() -> Vec<EventPayload> {
     vec![
         EventPayload::RunCreated {
+            run_budget_usd: None,
             execution: None,
             repo_root: PathBuf::from(REPO_ROOT),
             state_dir: PathBuf::from(STATE_DIR),
@@ -734,6 +745,10 @@ fn payloads() -> Vec<EventPayload> {
         } },
         EventPayload::SecurityVerdict { attempt_id: attempt_id(), builder_attempt_id: attempt_id(),
             verdict: Verdict::Pass, findings: vec![], diff_hash: DIFF_HASH.into() },
+        EventPayload::RunBudgetChanged { run_budget_usd: None,
+            previous_run_budget_usd: Some(15.0), actor: "cli".into(), continuation: None },
+        EventPayload::RunBudgetBlocked { action: agent_control_plane::core::types::BudgetContinuationAction::LoopDecision { attempt_id: attempt_id() }, spend_usd: 14.0,
+            spawn_cap_usd: 2.0, run_budget_usd: 15.0 },
         EventPayload::RunRecovered { recovery: agent_control_plane::core::recovery::Record {
             request: agent_control_plane::core::recovery::Request { run_id: run_id(), source_agent_id: agent_id(),
                 expected_seq: 32, request_id: uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap(),
@@ -768,8 +783,8 @@ fn event(seq: usize, payload: EventPayload) -> Event {
 fn every_design_event_kind_has_exactly_one_fixture() {
     assert_eq!(
         EVENT_KINDS.len(),
-        33,
-        "T94 appends an atomic recovery record"
+        35,
+        "budget control appends mutation and exact blocked-decision records"
     );
     let fixtures = fixtures();
     let kinds: Vec<&str> = fixtures

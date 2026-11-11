@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::core::types::{
@@ -46,15 +47,21 @@ const RUNS_DIR: &str = "runs";
 const EVENTS_FILE: &str = "events.jsonl";
 /// `<state_dir>/audit.jsonl` — policy rejections, which never touch a run log.
 const AUDIT_FILE: &str = "audit.jsonl";
+const COMPATIBILITY_EXAMPLE_LIMIT: usize = 8;
+const MAX_RECOVERABLE_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Anything that can stop the log being read or written. Never returned for a *malformed* log
-/// line: a partial trailing line left by a kill mid-write is skipped, not propagated.
+/// Anything that can stop the log being read or written. A syntactically partial trailing line
+/// is tolerated; incompatible event schemas must not authorize execution from an incomplete replay.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
+    #[error("history contains {count} incompatible event record(s); use a matching ACP build; inspect with acp status --json before continuing")]
+    IncompatibleHistory { count: usize },
+    #[error("an inspection-only registry cannot append events")]
+    InspectionOnly,
     #[error("{op} {path}: {source}")]
     Io {
         op: &'static str,
@@ -68,6 +75,35 @@ pub enum RegistryError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+/// Bounded, non-operational facts recovered from valid JSON records whose event schema this build
+/// cannot decode. These values are for status display only and are never folded into [`State`].
+#[derive(Clone, Default, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatibilitySummary {
+    pub incompatible_records: usize,
+    pub run_created_records: usize,
+    pub attempt_started_records: usize,
+    pub other_records: usize,
+    pub run_examples: Vec<IncompatibleRun>,
+    pub run_examples_truncated: bool,
+    pub attempt_examples: Vec<IncompatibleAttempt>,
+    pub attempt_examples_truncated: bool,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompatibleRun {
+    pub run_id: RunId,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompatibleAttempt {
+    pub run_id: RunId,
+    pub attempt_id: AttemptId,
+    pub agent_id: AgentId,
 }
 
 fn io_err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> RegistryError + 'a {
@@ -203,6 +239,7 @@ pub fn reduce(s: &mut State, e: &Event) {
             }
         }
         EventPayload::RunCreated {
+            run_budget_usd,
             repo_root,
             state_dir,
             base_ref,
@@ -225,6 +262,8 @@ pub fn reduce(s: &mut State, e: &Event) {
                 loop_state: LoopState::Building,
                 created_at: e.base.ts.clone(),
                 spend_usd: 0.0,
+                run_budget_usd: run_budget_usd.unwrap_or(Some(15.0)),
+                budget_recorded: run_budget_usd.is_some(),
                 agent_ids: Vec::new(),
                 gate_ids: Vec::new(),
                 integrated_sha: None,
@@ -241,6 +280,15 @@ pub fn reduce(s: &mut State, e: &Event) {
                 run.blocked_reason = reason.clone();
             }
         }
+
+        EventPayload::RunBudgetChanged { run_budget_usd, .. } => {
+            if let Some(run) = s.runs.get_mut(&run_id) {
+                run.run_budget_usd = *run_budget_usd;
+                run.budget_recorded = true;
+            }
+        }
+
+        EventPayload::RunBudgetBlocked { .. } => {}
 
         EventPayload::LoopStateChanged { state, .. } => {
             if let Some(run) = s.runs.get_mut(&run_id) {
@@ -709,18 +757,33 @@ pub struct Registry {
     events: HashMap<RunId, Vec<Arc<Event>>>,
     audit: Option<File>,
     tx: broadcast::Sender<Arc<Event>>,
+    inspection_only: bool,
+    skipped_event_lines: usize,
+    incompatible_event_lines: usize,
+    compatibility: CompatibilitySummary,
 }
 
 impl Registry {
     /// Replays every `runs/*/events.jsonl` under `state_dir` through [`reduce`]. Takes no lock —
     /// `acp status` reads a state dir with no daemon running (design, § Process model).
     ///
-    /// A malformed line (the partial tail a kill mid-write leaves behind) is skipped, not
-    /// propagated: the well-formed events around it still load.
+    /// Only a final unterminated fragment with an EOF parse error is skipped. Incompatible event
+    /// schemas and all other malformed records fail closed; use `open_for_inspection` to inspect
+    /// the readable history and bounded compatibility metadata.
     ///
     /// # Errors
-    /// Fails only on genuine I/O: the state dir cannot be created, or a log cannot be read.
+    /// Fails on genuine I/O or, for an execution registry, any incompatible event record.
     pub fn open(state_dir: &Path) -> Result<Self, RegistryError> {
+        Self::open_inner(state_dir, false)
+    }
+
+    /// Inspect compatible portions of a log without authorizing execution or appends when this
+    /// reader cannot understand all event schemas. Status must disclose the incomplete projection.
+    pub fn open_for_inspection(state_dir: &Path) -> Result<Self, RegistryError> {
+        Self::open_inner(state_dir, true)
+    }
+
+    fn open_inner(state_dir: &Path, inspection_only: bool) -> Result<Self, RegistryError> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut registry = Self {
             state_dir: state_dir.to_path_buf(),
@@ -729,11 +792,21 @@ impl Registry {
             events: HashMap::new(),
             audit: None,
             tx,
+            inspection_only,
+            skipped_event_lines: 0,
+            incompatible_event_lines: 0,
+            compatibility: CompatibilitySummary::default(),
         };
 
-        create_dir_0700(state_dir)?;
         let runs_dir = state_dir.join(RUNS_DIR);
-        create_dir_0700(&runs_dir)?;
+        if inspection_only {
+            if !runs_dir.exists() {
+                return Ok(registry);
+            }
+        } else {
+            create_dir_0700(state_dir)?;
+            create_dir_0700(&runs_dir)?;
+        }
 
         let mut dirs = Vec::new();
         for entry in fs::read_dir(&runs_dir).map_err(io_err("read_dir", &runs_dir))? {
@@ -746,6 +819,11 @@ impl Registry {
         dirs.sort();
         for dir in dirs {
             registry.replay(&dir.join(EVENTS_FILE))?;
+        }
+        if !inspection_only && registry.incompatible_event_lines > 0 {
+            return Err(RegistryError::IncompatibleHistory {
+                count: registry.incompatible_event_lines,
+            });
         }
         Ok(registry)
     }
@@ -760,6 +838,9 @@ impl Registry {
     /// Fails if the run directory or log cannot be opened or written, or the event cannot be
     /// encoded (a non-finite `costUsd` is the only realistic case).
     pub fn append(&mut self, run: &RunId, e: NewEvent) -> Result<Arc<Event>, RegistryError> {
+        if self.inspection_only {
+            return Err(RegistryError::InspectionOnly);
+        }
         let seq = self
             .events
             .get(run)
@@ -781,7 +862,7 @@ impl Registry {
 
         let path = self.log_path(run);
         if !self.logs.contains_key(run) {
-            self.logs.insert(*run, open_append(&path)?);
+            self.logs.insert(*run, open_append(&path, true)?);
         }
         let file = self.logs.get_mut(run).expect("just inserted");
         append_line(file, &line, &path)?;
@@ -807,6 +888,23 @@ impl Registry {
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Counts only; diagnostics never echo raw event values, prompts or provider errors.
+    #[must_use]
+    pub fn skipped_event_lines(&self) -> usize {
+        self.skipped_event_lines
+    }
+
+    #[must_use]
+    pub fn incompatible_event_lines(&self) -> usize {
+        self.incompatible_event_lines
+    }
+
+    /// Read-only compatibility metadata. It cannot be used to resume or mutate a run.
+    #[must_use]
+    pub fn compatibility_summary(&self) -> &CompatibilitySummary {
+        &self.compatibility
     }
 
     #[must_use]
@@ -939,13 +1037,16 @@ impl Registry {
     }
 
     fn write_audit(&mut self, entry: &AuditEntry) -> Result<(), RegistryError> {
+        if self.inspection_only {
+            return Err(RegistryError::InspectionOnly);
+        }
         let line = serde_json::to_string(entry).map_err(|source| RegistryError::Encode {
             what: "an audit entry",
             source,
         })?;
         let path = self.state_dir.join(AUDIT_FILE);
         if self.audit.is_none() {
-            self.audit = Some(open_append(&path)?);
+            self.audit = Some(open_append(&path, false)?);
         }
         let file = self.audit.as_mut().expect("just inserted");
         append_line(file, &line, &path)
@@ -966,21 +1067,43 @@ impl Registry {
             Err(err) => return Err(io_err("open", path)(err)),
         };
 
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line = match line {
+        let mut reader = BufReader::new(file);
+        let mut bytes = Vec::new();
+        let mut index = 0usize;
+        loop {
+            bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut bytes)
+                .map_err(io_err("read", path))?;
+            if read == 0 {
+                break;
+            }
+            index = index.saturating_add(1);
+            let terminated = bytes.last() == Some(&b'\n');
+            let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            if (!terminated || body.contains(&0x1e)) && tail_marker_completion(body).is_some_and(|remaining| {
+                !terminated || (remaining.is_empty() && body.contains(&0x1e))
+            }) {
+                self.skipped_event_lines = self.skipped_event_lines.saturating_add(1);
+                tracing::warn!(path = %path.display(), line = index,
+                    "skipping an interrupted event fragment with a valid recovery boundary");
+                continue;
+            }
+            let line = match std::str::from_utf8(&bytes) {
                 Ok(line) => line,
-                // Not UTF-8: the same class of damage as a partial line, and just as skippable.
-                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                    tracing::warn!(path = %path.display(), line = index + 1, %err,
-                        "skipping an undecodable event line");
+                Err(_) => {
+                    self.skipped_event_lines = self.skipped_event_lines.saturating_add(1);
+                    self.incompatible_event_lines = self.incompatible_event_lines.saturating_add(1);
+                    self.record_unreadable();
+                    tracing::warn!(path = %path.display(), line = index,
+                        "skipping an incompatible undecodable event record");
                     continue;
                 }
-                Err(err) => return Err(io_err("read", path)(err)),
             };
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Event>(&line) {
+            match decode_event_strict(line) {
                 Ok(event) => {
                     let event = Arc::new(event);
                     reduce(&mut self.state, event.as_ref());
@@ -989,15 +1112,157 @@ impl Registry {
                         .or_default()
                         .push(event);
                 }
-                // A kill mid-write leaves half an object with no newline: tolerated, never fatal.
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), line = index + 1, %err,
-                        "skipping a malformed event line");
+                Err(_) => {
+                    self.skipped_event_lines = self.skipped_event_lines.saturating_add(1);
+                    self.incompatible_event_lines = self.incompatible_event_lines.saturating_add(1);
+                    self.record_incompatible(line);
+                    tracing::warn!(path = %path.display(), line = index,
+                        "skipping an incompatible event record");
                 }
             }
         }
         Ok(())
     }
+
+    /// Extract only identifiers from the two historical field families known to affect status.
+    /// Unknown fields and all other values (including prompts and provider errors) stay unread.
+    fn record_incompatible(&mut self, line: &str) {
+        self.compatibility.incompatible_records = self.compatibility.incompatible_records.saturating_add(1);
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            self.compatibility.other_records = self.compatibility.other_records.saturating_add(1);
+            return;
+        };
+        match value.get("kind").and_then(serde_json::Value::as_str) {
+            Some("run.created") => {
+                self.compatibility.run_created_records = self.compatibility.run_created_records.saturating_add(1);
+                let run_id = value.get("runId").and_then(serde_json::Value::as_str).and_then(|id| id.parse::<RunId>().ok());
+                if let Some(run_id) = run_id {
+                    if self.compatibility.run_examples.len() < COMPATIBILITY_EXAMPLE_LIMIT {
+                        self.compatibility.run_examples.push(IncompatibleRun { run_id });
+                    } else { self.compatibility.run_examples_truncated = true; }
+                } else {
+                    self.compatibility.run_examples_truncated = true;
+                }
+            }
+            Some("attempt.started") => {
+                self.compatibility.attempt_started_records = self.compatibility.attempt_started_records.saturating_add(1);
+                let run_id = value.get("runId").and_then(serde_json::Value::as_str).and_then(|id| id.parse::<RunId>().ok());
+                let attempt_id = value.get("attemptId").and_then(serde_json::Value::as_str).and_then(|id| id.parse::<AttemptId>().ok());
+                let agent_id = value.get("agentId").and_then(serde_json::Value::as_str).and_then(|id| id.parse::<AgentId>().ok());
+                let ids = (run_id, attempt_id, agent_id);
+                if let (Some(run_id), Some(attempt_id), Some(agent_id)) = ids {
+                    if self.compatibility.attempt_examples.len() < COMPATIBILITY_EXAMPLE_LIMIT {
+                        self.compatibility.attempt_examples.push(IncompatibleAttempt { run_id, attempt_id, agent_id });
+                    } else { self.compatibility.attempt_examples_truncated = true; }
+                } else {
+                    self.compatibility.attempt_examples_truncated = true;
+                }
+            }
+            _ => self.compatibility.other_records = self.compatibility.other_records.saturating_add(1),
+        }
+    }
+
+    fn record_unreadable(&mut self) {
+        self.compatibility.incompatible_records = self.compatibility.incompatible_records.saturating_add(1);
+        self.compatibility.other_records = self.compatibility.other_records.saturating_add(1);
+    }
+}
+
+/// Decode one durable event without silently projecting fields this build does not know. The
+/// public `Event` type remains forward-tolerant for read-only protocol clients; operational replay
+/// is the fail-closed boundary.
+fn decode_event_strict(line: &str) -> Result<Event, serde_json::Error> {
+    // Parse the original bytes first. Going through `Value` would collapse duplicate object
+    // members and could turn a record the typed wire parser rejects into an accepted event.
+    let event: Event = serde_json::from_str(line)?;
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    let canonical = serde_json::to_value(&event)?;
+    // Reuse one probe tree for every omitted-field check. Mutating and restoring a leaf avoids
+    // cloning the complete event once per optional field (notably inside bounded plan arrays).
+    let mut probe = value.clone();
+    let mut path = Vec::new();
+    if contains_unknown_field(&value, &canonical, &mut probe, &mut path) {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "event contains a field unknown to this build",
+        ));
+    }
+    Ok(event)
+}
+
+#[derive(Clone)]
+enum JsonStep {
+    Key(String),
+    Index(usize),
+}
+
+fn contains_unknown_field(
+    original: &serde_json::Value,
+    canonical: &serde_json::Value,
+    probe: &mut serde_json::Value,
+    path: &mut Vec<JsonStep>,
+) -> bool {
+    match (original, canonical) {
+        (serde_json::Value::Object(original), serde_json::Value::Object(canonical)) => {
+            for (key, value) in original {
+                path.push(JsonStep::Key(key.clone()));
+                let unknown = match canonical.get(key) {
+                    Some(known) => contains_unknown_field(value, known, probe, path),
+                    None => field_is_ignored(probe, path),
+                };
+                path.pop();
+                if unknown {
+                    return true;
+                }
+            }
+            false
+        }
+        (serde_json::Value::Array(original), serde_json::Value::Array(canonical)) => {
+            for (index, (value, known)) in original.iter().zip(canonical).enumerate() {
+                path.push(JsonStep::Index(index));
+                let unknown = contains_unknown_field(value, known, probe, path);
+                path.pop();
+                if unknown {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// A field omitted by canonical serialization can still be a known optional field. Replacing it
+/// with a deliberately incompatible object distinguishes that case from serde's ignored fields:
+/// known typed fields reject the probe, while an unknown field is ignored again.
+fn field_is_ignored(root: &mut serde_json::Value, path: &[JsonStep]) -> bool {
+    let replace = |root: &mut serde_json::Value, replacement| {
+        let mut cursor = root;
+        for step in path {
+            cursor = match step {
+                JsonStep::Key(key) => &mut cursor[key],
+                JsonStep::Index(index) => &mut cursor[index],
+            };
+        }
+        std::mem::replace(cursor, replacement)
+    };
+    let probes = [
+        serde_json::json!({"__acpUnknownFieldProbe": true}),
+        serde_json::Value::String("__acpUnknownFieldProbe".into()),
+        serde_json::json!(["__acpUnknownFieldProbe"]),
+        serde_json::Value::Bool(true),
+        serde_json::json!(1),
+    ];
+    let original = replace(root, probes[0].clone());
+    for probe in probes.iter().skip(1) {
+        if Event::deserialize(&*root).is_err() {
+            replace(root, original);
+            return false;
+        }
+        replace(root, probe.clone());
+    }
+    let ignored = Event::deserialize(&*root).is_ok();
+    replace(root, original);
+    ignored
 }
 
 /// The agent statuses that count as "might be writing" for C5.
@@ -1022,7 +1287,7 @@ fn create_dir_0700(path: &Path) -> Result<(), RegistryError> {
 /// event lands on a line of its own instead of being concatenated onto the fragment (which would
 /// make the *new* event unreadable too). The fragment itself is left alone: nothing on this path
 /// ever deletes log bytes.
-fn open_append(path: &Path) -> Result<File, RegistryError> {
+fn open_append(path: &Path, event_log: bool) -> Result<File, RegistryError> {
     if let Some(parent) = path.parent() {
         create_dir_0700(parent)?;
     }
@@ -1041,10 +1306,58 @@ fn open_append(path: &Path) -> Result<File, RegistryError> {
         let mut last = [0_u8; 1];
         file.read_exact(&mut last).map_err(io_err("read", path))?;
         if last[0] != b'\n' {
+            if event_log {
+                let start = len.saturating_sub(MAX_RECOVERABLE_TAIL_BYTES + 1);
+                file.seek(SeekFrom::Start(start)).map_err(io_err("seek", path))?;
+                let mut suffix = Vec::new();
+                (&mut file).take(MAX_RECOVERABLE_TAIL_BYTES + 1)
+                    .read_to_end(&mut suffix).map_err(io_err("read", path))?;
+                let last_newline = suffix.iter().rposition(|byte| *byte == b'\n');
+                if start > 0 && last_newline.is_none() {
+                    return Err(io_err("recover_tail", path)(io::Error::new(
+                        io::ErrorKind::InvalidData, "unterminated event exceeds the recovery bound")));
+                }
+                let tail = &suffix[last_newline.map_or(0, |index| index + 1)..];
+                // A complete event lacking only its newline needs no recovery annotation.
+                if serde_json::from_slice::<Event>(tail).is_err()
+                    && !tail.iter().all(u8::is_ascii_whitespace)
+                {
+                    let completion = tail_marker_completion(tail).ok_or_else(|| {
+                        io_err("recover_tail", path)(io::Error::new(
+                            io::ErrorKind::InvalidData, "unterminated event is not a recoverable interrupted append"))
+                    })?;
+                    file.write_all(&completion).map_err(io_err("write", path))?;
+                }
+            }
             file.write_all(b"\n").map_err(io_err("write", path))?;
         }
     }
     Ok(file)
+}
+
+/// The non-JSON record separator cannot occur literally in a serialized event. Before appending
+/// past a known interrupted tail, retain its bytes and append a deterministic SHA-256 annotation.
+/// A complete annotation identifies that exact fragment on later replays. A crash at any byte of
+/// the annotation remains a final recoverable prefix; the next append completes only its suffix.
+/// This is an integrity boundary, not authentication against someone able to rewrite the log.
+fn tail_marker_completion(tail: &[u8]) -> Option<Vec<u8>> {
+    if tail.len() as u64 > MAX_RECOVERABLE_TAIL_BYTES {
+        return None;
+    }
+    let marker_at = tail.iter().position(|byte| *byte == 0x1e).unwrap_or(tail.len());
+    let fragment = &tail[..marker_at];
+    if fragment.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    if !serde_json::from_slice::<Event>(fragment).err()?.is_eof() {
+        return None;
+    }
+    let marker = format!("\x1eACP-TAIL-V1:{:x}", Sha256::digest(fragment));
+    if fragment.len().saturating_add(marker.len()) as u64 > MAX_RECOVERABLE_TAIL_BYTES {
+        return None;
+    }
+    let present = &tail[marker_at..];
+    marker.as_bytes().strip_prefix(present).map(<[u8]>::to_vec)
 }
 
 fn append_line(file: &mut File, line: &str, path: &Path) -> Result<(), RegistryError> {
@@ -1110,6 +1423,50 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn created(dir: &std::path::Path) -> EventPayload {
+        EventPayload::RunCreated {
+            run_budget_usd: None,
+            execution: None,
+            repo_root: dir.join("repo"),
+            state_dir: dir.to_path_buf(),
+            base_ref: "HEAD".into(),
+            base_sha: "0".repeat(40),
+            task: crate::core::types::Task {
+                id: "budget-replay".into(),
+                title: "budget replay".into(),
+                description: "verify durable budget replay".into(),
+                files: vec![],
+                acceptance: vec!["reopens".into()],
+            },
+            version: 1,
+            lead: None,
+            team_name: None,
+            steps: None,
+        }
+    }
+
+    #[test]
+    fn run_budget_replays_and_historical_absence_keeps_legacy_cap() {
+        let dir = TempDir::new().expect("tempdir");
+        let legacy = RunId::new_v4();
+        let unlimited = RunId::new_v4();
+        {
+            let mut registry = Registry::open(dir.path()).expect("registry");
+            registry.append(&legacy, created(dir.path())).expect("legacy run");
+            registry.append(&unlimited, created(dir.path())).expect("new run");
+            registry.append(&unlimited, EventPayload::RunBudgetChanged {
+                run_budget_usd: None,
+                previous_run_budget_usd: Some(15.0),
+                actor: "configuration".into(),
+                continuation: None,
+            }).expect("budget event");
+        }
+        let replayed = Registry::open(dir.path()).expect("reopen");
+        assert_eq!(replayed.run(&legacy).expect("legacy").run_budget_usd, Some(15.0));
+        assert_eq!(replayed.run(&unlimited).expect("unlimited").run_budget_usd, None);
+    }
 
     #[test]
     fn rfc3339_renders_known_epochs() {

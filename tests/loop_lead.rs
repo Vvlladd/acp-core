@@ -398,6 +398,7 @@ fn cancelling_a_pending_lead_adopts_and_kills_it_before_releasing_the_slot() {
             .append(
                 &replay_run,
                 EventPayload::RunCreated {
+                    run_budget_usd: None,
                     execution: None,
                     repo_root: world.repo_root().to_path_buf(),
                     state_dir: world.state_dir().to_path_buf(),

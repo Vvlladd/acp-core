@@ -184,6 +184,11 @@ pub enum Command {
         query: StatusQuery,
         reply: Reply<StatusOut>,
     },
+    RunBudget {
+        request: RunBudgetRequest,
+        by: Actor,
+        reply: Reply<RunBudgetOut>,
+    },
     Cancel {
         agent: AgentId,
         reply: Reply<CancelOut>,
@@ -418,10 +423,29 @@ pub struct StatusOut {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gates: Vec<Gate>,
     pub spend_usd: f64,
-    pub run_budget_usd: f64,
+    pub run_budget_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     pub events: Vec<Event>,
+}
+
+/// Socket-only mutation of one run's durable admission cap.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RunBudgetRequest {
+    pub run_id: RunId,
+    pub expected_seq: u64,
+    pub run_budget_usd: Option<f64>,
+    pub continue_blocked: bool,
+}
+
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBudgetOut {
+    pub run_id: RunId,
+    pub run_budget_usd: Option<f64>,
+    pub spend_usd: f64,
+    pub last_seq: u64,
+    pub continued: bool,
 }
 
 /// What `cancel` answered (design, § MCP tools).
@@ -564,6 +588,8 @@ pub struct Core {
     /// the door's reply on the fast path (it is sent before the loop runs) and keeps the whole
     /// reaction inside the same mailbox turn, which [`Core::after_turn`] drains.
     settled: Vec<(GateId, GateResolution)>,
+    /// Durable socket continuations recovered before their precise dispatch completed.
+    pending_budget_continuations: Vec<(RunId, crate::core::types::BudgetContinuationAction)>,
     /// Why the actor must stop, once it must.
     ///
     /// There is one such reason: the event log — "the only durable truth" — could not be written
@@ -620,6 +646,7 @@ impl Core {
             pending_retry: HashMap::new(),
             pending_audit: HashMap::new(),
             settled: Vec::new(),
+            pending_budget_continuations: Vec::new(),
             driving_plans: false,
             reconciled: false,
             fatal: None,
@@ -763,6 +790,11 @@ impl Core {
                 let out = self.status(&query);
                 let _ = reply.send(Ok(out));
             }
+            Command::RunBudget { request, by, reply } => {
+                let out = self.update_run_budget(request, by).await;
+                let _ = reply.send(out);
+                self.after_turn().await;
+            }
             Command::Cancel { agent, reply } => {
                 let out = self.cancel_agent(&agent).await;
                 let _ = reply.send(out);
@@ -862,6 +894,9 @@ impl Core {
     /// attempts to the loop, then resolve and prune the parked `await_result` waiters.
     async fn after_turn(&mut self) {
         self.drive_audits();
+        for (run, action) in std::mem::take(&mut self.pending_budget_continuations) {
+            self.dispatch_budget_action(run, action).await;
+        }
         // Gates first: a denial that resumes a builder is part of the same turn that resolved it.
         for (gate, resolution) in std::mem::take(&mut self.settled) {
             self.on_gate_resolved(gate, &resolution).await;
@@ -1265,7 +1300,7 @@ impl Core {
     #[must_use]
     pub fn status(&self, q: &StatusQuery) -> StatusOut {
         let limit = q.last_events.min(MAX_LAST_EVENTS);
-        let runs: Vec<Run> = match (q.run_id, q.agent_id) {
+        let mut runs: Vec<Run> = match (q.run_id, q.agent_id) {
             (Some(run), _) => self.registry.run(&run).cloned().into_iter().collect(),
             (None, Some(agent)) => self
                 .registry
@@ -1276,6 +1311,9 @@ impl Core {
                 .collect(),
             (None, None) => self.registry.runs().cloned().collect(),
         };
+        for run in &mut runs {
+            run.run_budget_usd = run.effective_budget_usd(self.roles.defaults.run_budget_usd);
+        }
 
         let mut agents = Vec::new();
         let mut attempts = Vec::new();
@@ -1348,6 +1386,7 @@ impl Core {
                 .then_with(|| a.gate_id.as_uuid().cmp(b.gate_id.as_uuid()))
         });
 
+        let run_budget_usd = runs.first().map_or(self.roles.defaults.run_budget_usd, |r| r.run_budget_usd);
         StatusOut {
             schema_version: STATUS_SCHEMA_VERSION,
             runs,
@@ -1355,7 +1394,7 @@ impl Core {
             attempts,
             gates,
             spend_usd,
-            run_budget_usd: self.roles.defaults.run_budget_usd,
+            run_budget_usd,
             blocked_reason,
             events,
         }
@@ -1712,6 +1751,16 @@ impl CoreHandle {
         self.ask(|reply| Command::Status { query, reply }).await
     }
 
+    /// Change a run cap and optionally replay its exact current budget-blocked loop decision.
+    /// This handle is intentionally called only by the socket door.
+    pub async fn run_budget(
+        &self,
+        request: RunBudgetRequest,
+        by: Actor,
+    ) -> Result<RunBudgetOut, CoreError> {
+        self.ask(|reply| Command::RunBudget { request, by, reply }).await
+    }
+
     /// # Errors
     /// [`CoreError::Unavailable`].
     pub async fn cancel(&self, agent: AgentId) -> Result<CancelOut, CoreError> {
@@ -1866,7 +1915,7 @@ pub fn spawn_signal_forwarder(
 mod tests {
     use super::*;
     use crate::core::supervisor::PsProbe;
-    use crate::core::types::{Origin, Task};
+    use crate::core::types::{BudgetContinuationAction, Origin, Task};
     use crate::roles::loader::load_roles;
     use std::fs;
     use std::time::Instant;
@@ -1907,6 +1956,7 @@ mod tests {
             .append(
                 &run,
                 EventPayload::RunCreated {
+                    run_budget_usd: None,
                     execution: None,
                     repo_root: core.repo_root.clone(),
                     state_dir: core.state_dir.clone(),
@@ -2485,6 +2535,238 @@ mod tests {
             2,
             "the cancelled attempt plus exactly one accepted follow-up"
         );
+    }
+
+    #[tokio::test]
+    async fn budget_continuation_is_explicit_exact_and_invalidated_by_a_later_block() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir_all(dir.path().join("repo")).expect("repo");
+        let (mut core, _rx) = core(&dir);
+        let (run, agent) = seed(&mut core);
+        let lineage = core.registry.agent(&agent).and_then(|agent| agent.lineage_id).expect("lineage");
+        core.registry.append(&run, EventPayload::WorktreeCreated {
+            agent_id: agent,
+            lineage_id: lineage,
+            path: core.repo_root.clone(),
+            branch: "acp/test".into(),
+            base_sha: "0".repeat(40),
+        }).expect("worktree");
+        core.registry.append(&run, EventPayload::RunBudgetChanged {
+            run_budget_usd: Some(0.0), previous_run_budget_usd: None,
+            actor: "test".into(),
+            continuation: None,
+        }).expect("finite cap");
+        let attempt = finish_attempt(&mut core, &run, agent, AttemptStatus::Failed);
+        core.on_attempt_finished(attempt).await;
+
+        assert_eq!(core.registry.run(&run).expect("run").status, RunStatus::Blocked);
+        let events = core.registry.events(&run, None, usize::MAX);
+        assert!(events.iter().any(|event| {
+            matches!(event.payload, EventPayload::RunBudgetBlocked {
+                action: crate::core::types::BudgetContinuationAction::LoopDecision { attempt_id }, ..
+            } if attempt_id == attempt)
+        }), "events: {events:?}");
+
+        let expected_seq = core.registry.run(&run).expect("run").last_seq;
+        let event_count = core.registry.events(&run, None, usize::MAX).len();
+        let stale = core.update_run_budget(RunBudgetRequest {
+            run_id: run, expected_seq: expected_seq - 1,
+            run_budget_usd: None, continue_blocked: false,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect_err("stale sequence");
+        assert!(matches!(stale, CoreError::Policy(ref error) if error.code == PolicyCode::RunBlocked));
+        assert_eq!(core.registry.events(&run, None, usize::MAX).len(), event_count);
+
+        let changed = core.update_run_budget(RunBudgetRequest {
+            run_id: run, expected_seq, run_budget_usd: None, continue_blocked: false,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect("remove cap");
+        assert!(!changed.continued);
+        assert_eq!(core.registry.run(&run).expect("run").status, RunStatus::Blocked,
+            "changing the cap alone never starts work");
+
+        let continued = core.update_run_budget(RunBudgetRequest {
+            run_id: run,
+            expected_seq: core.registry.run(&run).expect("run").last_seq,
+            run_budget_usd: None,
+            continue_blocked: true,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect("continue exact decision");
+        assert!(continued.continued);
+        assert_eq!(core.registry.run(&run).expect("run").status, RunStatus::Running);
+        assert!(core.registry.run(&run).expect("run").agent_ids.len() > 1,
+            "the pending fresh retry was admitted on the same run");
+
+        // Reusing the old denial after any later generic transition is forbidden.
+        core.registry.append(&run, EventPayload::RunStatus_ {
+            status: RunStatus::Blocked, reason: Some("unrelated failure".into()),
+        }).expect("generic block");
+        let error = core.update_run_budget(RunBudgetRequest {
+            run_id: run,
+            expected_seq: core.registry.run(&run).expect("run").last_seq,
+            run_budget_usd: Some(50.0),
+            continue_blocked: true,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect_err("stale denial");
+        assert!(matches!(error, CoreError::Policy(ref error) if error.code == PolicyCode::RunBlocked));
+    }
+
+    #[tokio::test]
+    async fn budget_spawn_continuation_recovers_exact_attempt_after_restart() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir_all(dir.path().join("repo")).expect("repo");
+        let (mut first, _rx) = core(&dir);
+        let (run, agent) = seed(&mut first);
+        let attempt = AttemptId::new_v4();
+        let action = crate::core::types::BudgetContinuationAction::SpawnAgent {
+            agent_id: agent,
+            attempt_id: attempt,
+        };
+        first.registry.append(&run, EventPayload::RunBudgetBlocked {
+            action, spend_usd: 2.0, spawn_cap_usd: 2.0, run_budget_usd: 2.0,
+        }).expect("budget block");
+        first.registry.append(&run, EventPayload::RunStatus_ {
+            status: RunStatus::Blocked, reason: Some("budget".into()),
+        }).expect("blocked");
+        first.registry.append(&run, EventPayload::LoopStateChanged {
+            state: LoopState::Blocked, builder_agent_id: Some(agent), attempt_no: 0, strikes: 0,
+        }).expect("blocked loop");
+        first.registry.append(&run, EventPayload::RunBudgetChanged {
+            run_budget_usd: None, previous_run_budget_usd: Some(2.0),
+            actor: "cli".into(), continuation: Some(action),
+        }).expect("durable continuation intent");
+        drop(first);
+
+        let (restored, _rx) = core(&dir);
+        assert_eq!(restored.registry.run(&run).expect("run").status, RunStatus::Running);
+        assert!(restored.pending_spawn.contains_key(&attempt),
+            "restart must preserve the exact owed attempt rather than minting another one");
+        assert_eq!(restored.pending_spawn.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reissued_spawn_budget_denial_preserves_ids_and_needs_another_opt_in() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir_all(dir.path().join("repo")).expect("repo");
+        let (mut first, _rx) = core(&dir);
+        let (run, agent) = seed(&mut first);
+        first.registry.append(&run, EventPayload::RunBudgetChanged {
+            run_budget_usd: Some(0.0), previous_run_budget_usd: Some(15.0),
+            actor: "test".into(), continuation: None,
+        }).expect("zero cap");
+
+        let exact_attempt = AttemptId::new_v4();
+        first.reissue_spawn_as(&agent, exact_attempt);
+        let action = first.registry.events(&run, None, usize::MAX).iter().rev()
+            .find_map(|event| match event.payload {
+                EventPayload::RunBudgetBlocked { action, .. } => Some(action),
+                _ => None,
+            }).expect("typed denial");
+        assert_eq!(action, BudgetContinuationAction::SpawnAgent {
+            agent_id: agent, attempt_id: exact_attempt,
+        });
+
+        // Continuing without enough headroom consumes this authorization and records a new
+        // denial. Restart must wait for another explicit human continuation, not retry forever.
+        let first_result = first.update_run_budget(RunBudgetRequest {
+            run_id: run,
+            expected_seq: first.registry.run(&run).expect("run").last_seq,
+            run_budget_usd: Some(0.0),
+            continue_blocked: true,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect("first continuation");
+        assert!(first_result.continued);
+        assert_eq!(first.registry.run(&run).expect("run").status, RunStatus::Blocked);
+        drop(first);
+
+        let (mut restarted, _rx) = core(&dir);
+        assert!(restarted.pending_spawn.is_empty(),
+            "a later denial consumes the earlier continuation across restart");
+        let second = restarted.update_run_budget(RunBudgetRequest {
+            run_id: run,
+            expected_seq: restarted.registry.run(&run).expect("run").last_seq,
+            run_budget_usd: None,
+            continue_blocked: true,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect("fresh continuation");
+        assert!(second.continued);
+        assert!(restarted.pending_spawn.contains_key(&exact_attempt));
+        assert_eq!(restarted.pending_spawn.len(), 1);
+        assert!(restarted.registry.agent(&agent).expect("agent").attempt_ids.is_empty(),
+            "the denied admission did not invent an attempt record");
+    }
+
+    #[tokio::test]
+    async fn budget_mutation_rejects_an_older_active_attempt_atomically() {
+        for continue_blocked in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let (mut core, _rx) = core(&dir);
+            let (run, agent) = seed(&mut core);
+            let older = AttemptId::new_v4();
+            core.registry.append(&run, EventPayload::AttemptStarted {
+                attempt_id: older, agent_id: agent,
+                attempt_kind: crate::core::types::AttemptKind::Fresh,
+                dir: core.state_dir.join("older-attempt"), argv: vec!["fake-worker".into()],
+                cwd: core.repo_root.clone(), pid: 4242, pgid: 4242,
+                start_time: "Sat Aug 23 00:00:00 2026".into(), pre_sha: "0".repeat(40),
+                timeout_sec: 900, spawn_budget_usd: 2.0,
+            }).expect("older attempt remains active");
+            let newer = finish_attempt(&mut core, &run, agent, AttemptStatus::Succeeded);
+            core.registry.append(&run, EventPayload::RunBudgetBlocked {
+                action: BudgetContinuationAction::LoopDecision { attempt_id: newer },
+                spend_usd: 2.0, spawn_cap_usd: 2.0, run_budget_usd: 2.0,
+            }).expect("budget block");
+            core.registry.append(&run, EventPayload::RunStatus_ {
+                status: RunStatus::Blocked, reason: Some("budget".into()),
+            }).expect("blocked run");
+            core.registry.append(&run, EventPayload::LoopStateChanged {
+                state: LoopState::Blocked, builder_agent_id: Some(agent), attempt_no: 2, strikes: 0,
+            }).expect("blocked loop");
+            let before = core.registry.run(&run).unwrap().clone();
+            let events = core.registry.events(&run, None, usize::MAX).len();
+            let error = core.update_run_budget(RunBudgetRequest {
+                run_id: run, expected_seq: before.last_seq, run_budget_usd: None,
+                continue_blocked,
+            }, Actor::Socket { client_name: "cli".into() }).await
+                .expect_err("an earlier active attempt must block every budget mutation");
+            assert!(matches!(error, CoreError::Policy(ref error)
+                if error.code == PolicyCode::RunBlocked && error.reason.contains("work is active")));
+            let after = core.registry.run(&run).unwrap();
+            assert_eq!(after.last_seq, before.last_seq);
+            assert_eq!(after.run_budget_usd, before.run_budget_usd);
+            assert_eq!(after.status, RunStatus::Blocked);
+            assert_eq!(core.registry.events(&run, None, usize::MAX).len(), events);
+            assert_eq!(core.registry.attempt(&older).unwrap().status, AttemptStatus::Running);
+            assert!(core.pending_spawn.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_spawn_continuation_rejects_cross_run_ownership() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir_all(dir.path().join("repo")).expect("repo");
+        let (mut core, _rx) = core(&dir);
+        let (run, _own_agent) = seed(&mut core);
+        let (_other_run, other_agent) = seed(&mut core);
+        let action = BudgetContinuationAction::SpawnAgent {
+            agent_id: other_agent,
+            attempt_id: AttemptId::new_v4(),
+        };
+        core.registry.append(&run, EventPayload::RunBudgetBlocked {
+            action, spend_usd: 2.0, spawn_cap_usd: 2.0, run_budget_usd: 2.0,
+        }).expect("forged block fixture");
+        core.registry.append(&run, EventPayload::RunStatus_ {
+            status: RunStatus::Blocked, reason: Some("budget".into()),
+        }).expect("blocked");
+        core.registry.append(&run, EventPayload::LoopStateChanged {
+            state: LoopState::Blocked, builder_agent_id: None, attempt_no: 0, strikes: 0,
+        }).expect("blocked loop");
+        let before = core.registry.events(&run, None, usize::MAX).len();
+
+        let error = core.update_run_budget(RunBudgetRequest {
+            run_id: run,
+            expected_seq: core.registry.run(&run).expect("run").last_seq,
+            run_budget_usd: None,
+            continue_blocked: true,
+        }, Actor::Socket { client_name: "cli".into() }).await.expect_err("foreign agent rejected");
+        assert!(matches!(error, CoreError::Policy(ref error) if error.code == PolicyCode::RunBlocked));
+        assert_eq!(core.registry.events(&run, None, usize::MAX).len(), before,
+            "ownership failure is atomic");
+        assert!(core.pending_spawn.is_empty());
     }
 
     /// A crash between `attempt.finished` and the branch's own events: the log shows a strike (17b

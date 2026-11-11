@@ -107,7 +107,7 @@ use crate::core::types::{
     Task,
 };
 use crate::core::{
-    CoreError, CoreHandle, GateRequest, SendResult, StatusQuery, DEFAULT_LAST_EVENTS,
+    CoreError, CoreHandle, GateRequest, RunBudgetRequest, SendResult, StatusQuery, DEFAULT_LAST_EVENTS,
     MAX_LAST_EVENTS,
 };
 use crate::providers::find_on_path;
@@ -734,6 +734,9 @@ impl Connection {
             "send_message" => self.send_message(parse_params(params)?).await,
             "await_result" => self.await_result(parse_params(params)?).await,
             "get_status" => self.get_status(parse_params(params)?).await,
+            "run.budget.get" => self.run_budget_get(parse_params(params)?).await,
+            "run.budget.set" => self.run_budget_set(parse_params(params)?).await,
+            "run.budget.remove" => self.run_budget_remove(parse_params(params)?).await,
             "cancel" => self.cancel(parse_params(params)?).await,
             "request_human_gate" => self.request_human_gate(parse_params(params)?).await,
             "resolve_gate" => self.resolve_gate(parse_params(params)?).await,
@@ -920,6 +923,64 @@ impl Connection {
                 agent_id: params.agent_id,
                 last_events,
             })
+            .await
+            .map_err(RpcError::from_core)?;
+        to_value(&out)
+    }
+
+    async fn run_budget_get(&self, params: RunBudgetGetParams) -> Result<Value, RpcError> {
+        let out = self
+            .core
+            .status(StatusQuery {
+                run_id: Some(params.run_id),
+                agent_id: None,
+                last_events: 0,
+            })
+            .await
+            .map_err(RpcError::from_core)?;
+        let run = out
+            .runs
+            .first()
+            .ok_or_else(|| RpcError::from_core(CoreError::UnknownRun(params.run_id)))?;
+        Ok(json!({
+            "runId": run.run_id,
+            "runBudgetUsd": run.run_budget_usd,
+            "spendUsd": run.spend_usd,
+            "lastSeq": run.last_seq,
+            "status": run.status,
+            "blockedReason": run.blocked_reason,
+        }))
+    }
+
+    async fn run_budget_set(&self, params: RunBudgetSetParams) -> Result<Value, RpcError> {
+        if !params.run_budget_usd.is_finite() || params.run_budget_usd < 0.0 {
+            return Err(RpcError::invalid_params(
+                "runBudgetUsd must be a finite non-negative number".to_string(),
+            ));
+        }
+        self.run_budget_change(params.change, Some(params.run_budget_usd)).await
+    }
+
+    async fn run_budget_remove(&self, params: RunBudgetChangeParams) -> Result<Value, RpcError> {
+        self.run_budget_change(params, None).await
+    }
+
+    async fn run_budget_change(
+        &self,
+        params: RunBudgetChangeParams,
+        run_budget_usd: Option<f64>,
+    ) -> Result<Value, RpcError> {
+        let out = self
+            .core
+            .run_budget(
+                RunBudgetRequest {
+                    run_id: params.run_id,
+                    expected_seq: params.expected_seq,
+                    run_budget_usd,
+                    continue_blocked: params.continue_blocked,
+                },
+                self.actor(),
+            )
             .await
             .map_err(RpcError::from_core)?;
         to_value(&out)
@@ -1242,6 +1303,29 @@ struct GetStatusParams {
     agent_id: Option<AgentId>,
     #[serde(default)]
     last_events: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunBudgetGetParams {
+    run_id: RunId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunBudgetChangeParams {
+    run_id: RunId,
+    expected_seq: u64,
+    #[serde(default)]
+    continue_blocked: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunBudgetSetParams {
+    #[serde(flatten)]
+    change: RunBudgetChangeParams,
+    run_budget_usd: f64,
 }
 
 #[derive(Deserialize)]

@@ -67,6 +67,7 @@ fn seed_run(core: &mut Core, execution: RunExecution) -> RunId {
         .append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 steps: Some(execution.steps),
                 execution: Some(execution),
                 repo_root: core.repo_root.clone(),

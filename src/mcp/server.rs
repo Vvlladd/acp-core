@@ -808,7 +808,7 @@ pub struct GetStatusOut {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gates: Vec<Gate>,
     pub spend_usd: f64,
-    pub run_budget_usd: f64,
+    pub run_budget_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     /// The newest events, oldest first, exactly as `events.jsonl` holds them.

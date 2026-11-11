@@ -140,6 +140,19 @@ fn reviewers(events: &[Arc<Event>]) -> Vec<AgentId> {
         .collect()
 }
 
+fn downstream_checkers(events: &[Arc<Event>]) -> Vec<RoleName> {
+    agents_created(events)
+        .into_iter()
+        .filter(|agent| {
+            matches!(
+                agent.role,
+                RoleName::Verifier | RoleName::Reviewer | RoleName::Security
+            )
+        })
+        .map(|agent| agent.role)
+        .collect()
+}
+
 fn violations(events: &[Arc<Event>]) -> Vec<(ViolationKind, Option<Vec<String>>)> {
     pick(events, |p| match p {
         EventPayload::PolicyViolated { violation, .. } => {
@@ -295,9 +308,17 @@ fn an_invalid_result_strikes_via_17b_and_the_repair_prompt_demands_the_schema() 
 
         let prompt = rendered_prompt(&started[1].dir);
         assert!(
-            prompt.contains("does not validate against the role's result schema"),
+            prompt.contains("required field `filesChanged` is absent")
+                && prompt.contains("$/status: violated enum")
+                && prompt.contains("required field `summary` is absent"),
             "the repair prompt quotes what was recorded: {prompt}"
         );
+        assert!(
+            !prompt.contains("status: done"),
+            "the invalid values themselves must not enter the diagnostic: {prompt}"
+        );
+        assert!(prompt.contains("implementation draft is still in this worktree"));
+        assert!(prompt.contains("raw final output, when present"));
         assert!(
             prompt.contains("exactly one JSON document matching the build-result schema"),
             "…and re-states the contract the next message must meet: {prompt}"
@@ -306,6 +327,91 @@ fn an_invalid_result_strikes_via_17b_and_the_repair_prompt_demands_the_schema() 
             prompt.contains(ADVISORY_OPEN),
             "the recorded error is worker-authored text and travels as data (S3): {prompt}"
         );
+    });
+}
+
+/// A clean provider exit and a schema-valid document are transport/schema success, not proof that
+/// the task succeeded. The structured `failed` outcome preserves its changed draft and blocks at
+/// a distinct durable branch without spending a checker attempt or consuming a content strike.
+#[test]
+fn a_schema_valid_failed_builder_result_preserves_the_draft_and_blocks_all_checks() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("builder_failed", &[]);
+        let (run, _builder, events) = run_until(
+            &world,
+            "T37-builder-failed",
+            embedded_roles(),
+            "the builder task outcome blocks",
+            |events| branches(events).contains(&LoopBranch::BuilderFailed),
+        )
+        .await;
+
+        assert_eq!(
+            finished(&events),
+            vec![(AttemptStatus::Succeeded, None)],
+            "the provider process and build-result schema both succeeded"
+        );
+        assert_eq!(branches(&events), vec![LoopBranch::BuilderFailed]);
+        assert!(
+            strikes(&events).is_empty(),
+            "an admitted task failure is not a review finding"
+        );
+        assert!(
+            downstream_checkers(&events).is_empty(),
+            "no selected checker was admitted"
+        );
+        assert!(gate_summaries(&events, GateKind::Integrate).is_empty());
+        assert_eq!(attempts_started(&events).len(), 1, "only the paid builder ran");
+        assert!(
+            events.iter().any(|event| matches!(
+                event.payload,
+                EventPayload::DiffFrozen { ref files, .. }
+                    if files.contains(&"src/adder.ts".into())
+            )),
+            "the failed draft's exact changed-file evidence remains recorded"
+        );
+        assert!(blocked_reasons(&events).iter().any(|reason| {
+            reason.contains("builder_reported_failure")
+                && reason.contains("build environment is unavailable")
+        }));
+        assert_eq!(
+            world.reopen().run(&run).unwrap().status,
+            RunStatus::Blocked
+        );
+    });
+}
+
+/// An explicit task failure with no edits is not the old "claimed success but changed nothing"
+/// case. Its schema-valid status remains the durable reason, with no automatic repair strike.
+#[test]
+fn a_schema_valid_failed_builder_result_with_no_edits_is_not_no_changed_files() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("builder_failed_no_changes", &[]);
+        let (_run, _builder, events) = run_until(
+            &world,
+            "T37-builder-failed-empty",
+            embedded_roles(),
+            "the empty failed outcome blocks",
+            |events| branches(events).contains(&LoopBranch::BuilderFailed),
+        )
+        .await;
+
+        assert_eq!(
+            finished(&events),
+            vec![(AttemptStatus::Succeeded, None)],
+            "the provider and schema succeeded; the explicit task failure is preserved"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event.payload,
+                EventPayload::DiffFrozen { ref files, .. } if files.is_empty()
+            )),
+            "the empty failed draft retains exact frozen evidence"
+        );
+        assert_eq!(branches(&events), vec![LoopBranch::BuilderFailed]);
+        assert!(strikes(&events).is_empty());
+        assert!(downstream_checkers(&events).is_empty());
+        assert_eq!(attempts_started(&events).len(), 1);
     });
 }
 

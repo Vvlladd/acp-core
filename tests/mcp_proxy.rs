@@ -34,7 +34,9 @@ const MCP_PROTOCOL: &str = "2025-11-25";
 
 fn short_state() -> TempDir {
     tempfile::Builder::new()
-        .prefix("acp-proxy-")
+        // A random leading C after a hyphen would look like the forbidden -C flag
+        // inside the lead's inline MCP configuration. Keep the fixture prefix unambiguous.
+        .prefix("acp-proxy")
         .rand_bytes(5)
         .tempdir_in("/tmp")
         .expect("short proxy state dir")

@@ -28,6 +28,7 @@ fn seed() -> (TempDir, Core, RunId, AgentId, AttemptId, AgentId, AttemptId) {
         .append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 steps: Some(execution.steps),
                 execution: Some(execution),
                 repo_root: core.repo_root.clone(),

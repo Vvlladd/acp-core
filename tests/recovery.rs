@@ -4,7 +4,7 @@ mod common;
 use agent_control_plane::core::recovery::{Record, Request};
 use agent_control_plane::core::team::Assignment;
 use agent_control_plane::core::types::*;
-use agent_control_plane::core::{Actor, CoreHandle, StatusQuery};
+use agent_control_plane::core::{Actor, CoreHandle, SendResult, StatusQuery};
 use common::{
     delegate_builder, embedded_roles, loop_task, quiesce, start_actor, wait_for_status, ActorOpts,
     LoopActor, LoopWorld,
@@ -74,6 +74,19 @@ fn recovery_changes_only_builder_preserves_draft_and_reruns_checks() {
             .clone()
             .unwrap();
         std::fs::write(worktree.join("preserved.txt"), "human draft\n").unwrap();
+        let available = actor.handle.recovery_preview(run).await.unwrap();
+        let allowance = &available
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent_id == source)
+            .unwrap()
+            .allowance;
+        assert_eq!(allowance.retained_strikes, 0);
+        assert_eq!(allowance.same_lineage_repair_attempts, 1);
+        assert_eq!(allowance.automatic_replacement_lineages, 1);
+        assert_eq!(allowance.replacement_builder_attempts, 2);
+        assert_eq!(allowance.maximum_builder_attempts, 4);
+        assert!(!allowance.one_shot);
         let request = request(&actor.handle, run, source).await;
         common::configure_fakes(world.repo_root(), "pass", &[]);
         let outcome = actor
@@ -163,6 +176,120 @@ fn recovery_changes_only_builder_preserves_draft_and_reruns_checks() {
             outcome,
             "duplicate after completion is read-only"
         );
+        quiesce(&actor.handle).await;
+        actor.stop().await;
+    });
+}
+
+#[test]
+fn failed_builder_outcome_recovers_explicitly_and_then_runs_every_selected_check() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("builder_failed", &[]);
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let delegated = actor
+            .handle
+            .delegate(delegate_builder(loop_task("builder-failed-recovery")))
+            .await
+            .unwrap();
+        wait_for_status(
+            &actor.handle,
+            StatusQuery::default(),
+            "builder-reported failure blocks",
+            |status| {
+                status.runs.iter().any(|run| {
+                    run.run_id == delegated.run_id && run.status == RunStatus::Blocked
+                })
+            },
+        )
+        .await;
+
+        let before = world.reopen().run(&delegated.run_id).unwrap().clone();
+        let before_events = world.events(&delegated.run_id);
+        assert!(before
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("builder_reported_failure")));
+        assert!(
+            !before_events.iter().any(|event| matches!(
+                event.payload,
+                EventPayload::AgentCreated {
+                    role: RoleName::Verifier | RoleName::Reviewer | RoleName::Security,
+                    ..
+                }
+            )),
+            "failed output admits no downstream checker"
+        );
+
+        actor.stop().await;
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let request = request(&actor.handle, delegated.run_id, delegated.agent_id).await;
+        common::configure_fakes(world.repo_root(), "pass", &[]);
+        actor
+            .handle
+            .recover_run(request.clone(), human())
+            .await
+            .unwrap();
+        wait_for_status(
+            &actor.handle,
+            StatusQuery::default(),
+            "successful continuation reaches the human gate",
+            |status| {
+                status.gates.iter().any(|gate| {
+                    gate.run_id == delegated.run_id
+                        && gate.kind == GateKind::Integrate
+                        && gate.status == GateStatus::Pending
+                })
+            },
+        )
+        .await;
+
+        let after = world.reopen().run(&delegated.run_id).unwrap().clone();
+        assert!(
+            after.spend_usd >= before.spend_usd,
+            "historical spend is retained"
+        );
+        assert_eq!(
+            after.lineages.first().map(|lineage| lineage.strikes),
+            before.lineages.first().map(|lineage| lineage.strikes),
+            "recovery does not erase historical strikes"
+        );
+        let before_execution = before.execution.unwrap();
+        let after_execution = after.execution.unwrap();
+        assert_eq!(after_execution.steps, before_execution.steps);
+        for role in ["verifier", "reviewer", "security"] {
+            assert_eq!(
+                after_execution.assignments.get(role),
+                before_execution.assignments.get(role),
+                "the selected {role} and its effort are retained"
+            );
+        }
+
+        let events = world.events(&delegated.run_id);
+        let recovered_seq = events
+            .iter()
+            .find(|event| matches!(event.payload, EventPayload::RunRecovered { .. }))
+            .unwrap()
+            .base
+            .seq;
+        let roles_after_recovery: Vec<RoleName> = events
+            .iter()
+            .filter(|event| event.base.seq > recovered_seq)
+            .filter_map(|event| match event.payload {
+                EventPayload::AgentCreated { role, .. } => Some(role),
+                _ => None,
+            })
+            .collect();
+        if after_execution.steps.verify {
+            assert!(roles_after_recovery.contains(&RoleName::Verifier));
+        }
+        if after_execution.steps.review {
+            assert!(roles_after_recovery.contains(&RoleName::Reviewer));
+        }
+        if after_execution.steps.security {
+            assert!(roles_after_recovery.contains(&RoleName::Security));
+        }
+        assert!(events.iter().any(|event| event.base.seq > recovered_seq
+            && matches!(event.payload, EventPayload::ReviewVerdict { .. })));
         quiesce(&actor.handle).await;
         actor.stop().await;
     });
@@ -328,6 +455,188 @@ fn concurrent_confirmations_start_only_one_replacement() {
 }
 
 #[test]
+fn a_finalized_cancelled_attempt_does_not_keep_recovery_busy_after_restart() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("hang", &[]);
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let out = actor.handle.delegate(delegate_builder(loop_task("cancel-recover")))
+            .await.unwrap();
+        wait_for_status(&actor.handle, StatusQuery::default(), "worker started", |s| {
+            s.attempts.iter().any(|a| a.agent_id == out.agent_id && a.status == AttemptStatus::Running)
+                && world.reopen().agent(&out.agent_id).is_some_and(|agent| agent.resumable)
+        }).await;
+        actor.handle.cancel(out.agent_id).await.unwrap();
+        assert!(actor
+            .handle
+            .recovery_preview(out.run_id)
+            .await
+            .unwrap()
+            .unavailable_reason
+            .is_some(), "the same live session must not recover while cancellation finalizes");
+        wait_for_status(&actor.handle, StatusQuery::default(), "cancellation finalized", |s| {
+            s.attempts.iter().any(|a| a.agent_id == out.agent_id && a.status == AttemptStatus::Cancelled)
+        }).await;
+        actor.stop().await;
+        world.reopen().append(
+            &out.run_id,
+            EventPayload::RunStatus_ {
+                status: RunStatus::Blocked,
+                reason: Some("run budget requires human recovery".into()),
+            },
+        ).unwrap();
+        let before = world.reopen().run(&out.run_id).unwrap().clone();
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let rejected = actor.handle.send_message(out.agent_id, "resume".into()).await.unwrap();
+        assert!(matches!(rejected, SendResult::Rejected {
+            code: agent_control_plane::core::policy::PolicyCode::RunBlocked,
+            reason,
+        } if reason.contains("confirm recovery")));
+        let recovery = request(&actor.handle, out.run_id, out.agent_id).await;
+        common::configure_fakes(world.repo_root(), "pass", &[]);
+        actor.handle.recover_run(recovery, human()).await.unwrap();
+        wait_for_status(&actor.handle, StatusQuery::default(), "recovered task reaches approval", |s| {
+            s.gates.iter().any(|g| g.run_id == out.run_id && g.kind == GateKind::Integrate && g.status == GateStatus::Pending)
+        }).await;
+        let after = world.reopen().run(&out.run_id).unwrap().clone();
+        assert!(after.spend_usd >= before.spend_usd);
+        assert_eq!(after.execution.as_ref().unwrap().steps, before.execution.as_ref().unwrap().steps);
+        assert!(world.events(&out.run_id).iter().any(|e| matches!(e.payload,
+            EventPayload::AttemptFinished { status: AttemptStatus::Cancelled, .. })));
+        quiesce(&actor.handle).await;
+        actor.stop().await;
+    });
+}
+
+#[test]
+fn a_finalized_lost_attempt_without_a_dispatch_marker_is_recoverable_after_restart() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("auth_fail", &[]);
+        let (actor, run, source) = interrupted(&world).await;
+        actor.stop().await;
+        let mut reg = world.reopen();
+        let worktree = reg.agent(&source).unwrap().worktree.clone().unwrap();
+        let base_sha = reg.run(&run).unwrap().base_sha.clone();
+        let lost = AttemptId::new_v4();
+        reg.append(
+            &run,
+            EventPayload::AttemptStarted {
+                attempt_id: lost,
+                agent_id: source,
+                attempt_kind: AttemptKind::Resume,
+                dir: worktree.clone(),
+                argv: vec!["fake-provider".into()],
+                cwd: worktree,
+                pid: 0,
+                pgid: 0,
+                start_time: String::new(),
+                pre_sha: base_sha,
+                timeout_sec: 60,
+                spawn_budget_usd: 1.0,
+            },
+        )
+        .unwrap();
+        reg.append(
+            &run,
+            EventPayload::AttemptFinished {
+                attempt_id: lost,
+                status: AttemptStatus::Lost,
+                exit_code: None,
+                signal: None,
+                post_sha: None,
+                duration_ms: 1,
+                error: None,
+            },
+        )
+        .unwrap();
+        drop(reg);
+
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let preview = actor.handle.recovery_preview(run).await.unwrap();
+        assert_eq!(preview.unavailable_reason, None);
+        assert!(world.events(&run).iter().any(|event| matches!(
+            event.payload,
+            EventPayload::AttemptFinished {
+                attempt_id,
+                status: AttemptStatus::Lost,
+                ..
+            } if attempt_id == lost
+        )));
+        actor.stop().await;
+    });
+}
+
+#[test]
+fn preview_reports_retained_strikes_and_exact_one_shot_allowance() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("auth_fail", &[]);
+        let (actor, run, source) = interrupted(&world).await;
+        actor.stop().await;
+        let mut reg = world.reopen();
+        let source_lineage = reg.agent(&source).unwrap().lineage_id.unwrap();
+        let second_agent = AgentId::new_v4();
+        let base_sha = reg.run(&run).unwrap().base_sha.clone();
+        reg.append(
+            &run,
+            EventPayload::WorktreeCreated {
+                agent_id: second_agent,
+                lineage_id: LineageId::new_v4(),
+                path: world.repo_root().join("unused-replacement"),
+                branch: "acp/unused-replacement".into(),
+                base_sha,
+            },
+        )
+        .unwrap();
+        reg.append(
+            &run,
+            EventPayload::LineageStrike {
+                lineage_id: source_lineage,
+                agent_id: source,
+                reason: "historical failed review".into(),
+                strikes: 2,
+            },
+        )
+        .unwrap();
+        drop(reg);
+
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let preview = actor.handle.recovery_preview(run).await.unwrap();
+        let allowance = &preview
+            .candidates
+            .iter()
+            .find(|candidate| candidate.agent_id == source)
+            .unwrap()
+            .allowance;
+        assert_eq!(allowance.retained_strikes, 2);
+        assert_eq!(allowance.strike_limit, 2);
+        assert_eq!(allowance.immediate_builder_attempts, 1);
+        assert_eq!(allowance.same_lineage_repair_attempts, 0);
+        assert_eq!(allowance.automatic_replacement_lineages, 0);
+        assert_eq!(allowance.replacement_builder_attempts, 0);
+        assert_eq!(allowance.maximum_builder_attempts, 1);
+        assert!(allowance.one_shot);
+        assert!(allowance.summary.contains("next strike escalates"));
+        let recovery = request(&actor.handle, run, source).await;
+        common::configure_fakes(world.repo_root(), "fail_then_pass", &[]);
+        actor.handle.recover_run(recovery, human()).await.unwrap();
+        wait_for_status(
+            &actor.handle,
+            StatusQuery::default(),
+            "one-shot recovery returns to escalation",
+            |s| {
+                s.runs
+                    .iter()
+                    .any(|candidate| candidate.run_id == run && candidate.status == RunStatus::Blocked)
+                    && world.reopen().run(&run).unwrap().blocked_reason.as_deref().is_some_and(
+                        |reason| reason.contains("human-confirmed recovery round exhausted"),
+                    )
+            },
+        )
+        .await;
+        actor.stop().await;
+    });
+}
+
+#[test]
 fn missing_draft_blocks_without_starting_or_deleting_history() {
     common::with_shared_env(|| async {
         let world = LoopWorld::new("auth_fail", &[]);
@@ -415,11 +724,15 @@ fn terminal_tasks_pending_decisions_budget_and_modes_refuse_without_mutation() {
                 },
             )
             .unwrap();
-        let mut low_budget = (*embedded_roles()).clone();
-        low_budget.defaults.run_budget_usd = 0.0;
+        world.reopen().append(&run, EventPayload::RunBudgetChanged {
+            run_budget_usd: Some(0.0),
+            previous_run_budget_usd: None,
+            actor: "test".into(),
+            continuation: None,
+        }).unwrap();
         let actor = start_actor(
             &world,
-            std::sync::Arc::new(low_budget),
+            embedded_roles(),
             ActorOpts::default(),
         );
         assert!(actor
@@ -493,6 +806,7 @@ fn terminal_tasks_pending_decisions_budget_and_modes_refuse_without_mutation() {
         reg.append(
             &new_run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: Some(execution),
                 repo_root: world.repo_root().into(),
                 state_dir: world.state_dir().into(),

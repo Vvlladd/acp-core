@@ -16,6 +16,8 @@
 
 mod common;
 
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use agent_control_plane::core::handoff::ADVISORY_OPEN;
@@ -27,8 +29,21 @@ use agent_control_plane::core::{Actor, GateResolution, StatusQuery};
 
 use common::{
     delegate_builder, embedded_roles, head_sha, loop_task, pick, quiesce, rendered_prompt,
-    start_actor, wait_for_log, ActorOpts, LoopWorld,
+    start_actor, wait_for_log, ActorOpts, LoopWorld, FAKE_RESET_STATE,
 };
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 /// Long enough that the worker's second transcript line cannot arrive while the test is comparing
 /// two snapshots, short enough that nothing waits on it: the worker is ended by a cancellation, not
@@ -181,6 +196,129 @@ fn a_core_rebuilt_from_the_log_reports_the_same_status_as_the_one_that_died() {
             "the second core signalled a worker it never started"
         );
         second.stop().await;
+    });
+}
+
+/// Restart reconciliation reissues 17d from durable state. Even if the original named base and
+/// the configured default both move before that reissue, the replacement uses `run.created`'s
+/// resolved commit and its content.
+#[test]
+fn restart_reissued_replacement_keeps_the_original_resolved_base() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("fail_then_pass", &[(FAKE_RESET_STATE, "1")]);
+        std::fs::write(world.repo_root().join("original-base.marker"), "original\n")
+            .expect("write original base marker");
+        git(world.repo_root(), &["add", "original-base.marker"]);
+        git(world.repo_root(), &["commit", "-m", "original base"]);
+        let original_base = head_sha(world.repo_root());
+        git(
+            world.repo_root(),
+            &["branch", "moving-base", &original_base],
+        );
+        std::fs::write(world.repo_root().join("current-head.marker"), "newer\n")
+            .expect("write current HEAD marker");
+        git(world.repo_root(), &["add", "current-head.marker"]);
+        git(world.repo_root(), &["commit", "-m", "newer head"]);
+        let newer_head = head_sha(world.repo_root());
+
+        let mut first_roles = (*embedded_roles()).clone();
+        first_roles.defaults.base_ref = "moving-base".to_string();
+        let first = start_actor(&world, Arc::new(first_roles), ActorOpts::default());
+        let out = first
+            .handle
+            .delegate(delegate_builder(loop_task("T38-replacement-restart")))
+            .await
+            .expect("the delegation is accepted");
+        let run = out.run_id;
+        let events = wait_for_log(&world, &run, "the first replacement worktree", |events| {
+            pick(events, |payload| match payload {
+                EventPayload::WorktreeCreated { path, branch, .. } => {
+                    Some((path.clone(), branch.clone()))
+                }
+                _ => None,
+            })
+            .len()
+                >= 2
+        })
+        .await;
+        let created = pick(&events, |payload| match payload {
+            EventPayload::WorktreeCreated { path, branch, .. } => {
+                Some((path.clone(), branch.clone()))
+            }
+            _ => None,
+        });
+        let abandoned_replacement = created[1].clone();
+        let replacement_seq = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::WorktreeCreated { path, .. }
+                        if path == &abandoned_replacement.0
+                )
+            })
+            .expect("replacement worktree event")
+            .base
+            .seq;
+
+        quiesce(&first.handle).await;
+        first.stop().await;
+
+        // Recreate the durable crash boundary: 17d's closed lineage and replacing marker made it
+        // to disk, but its helper completion did not. Remove only that unrecorded helper's Git
+        // artifacts before replaying the retained prefix.
+        let worktree_arg = abandoned_replacement.0.to_string_lossy().into_owned();
+        git(
+            world.repo_root(),
+            &["worktree", "remove", "--force", &worktree_arg],
+        );
+        git(
+            world.repo_root(),
+            &["branch", "-D", &abandoned_replacement.1],
+        );
+        let event_path = world
+            .state_dir()
+            .join("runs")
+            .join(run.to_string())
+            .join("events.jsonl");
+        let retained = std::fs::read_to_string(&event_path)
+            .expect("read event log")
+            .lines()
+            .filter(|line| {
+                let event: Event = serde_json::from_str(line).expect("event line");
+                event.base.seq < replacement_seq
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&event_path, format!("{retained}\n")).expect("restore crash-boundary log");
+
+        git(
+            world.repo_root(),
+            &["branch", "-f", "moving-base", &newer_head],
+        );
+        let mut restarted_roles = (*embedded_roles()).clone();
+        restarted_roles.defaults.base_ref = "HEAD".to_string();
+        let restarted = start_actor(&world, Arc::new(restarted_roles), ActorOpts::default());
+        let events = wait_for_log(&world, &run, "the restart-reissued replacement", |events| {
+            pick(events, |payload| match payload {
+                EventPayload::WorktreeCreated { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .len()
+                >= 2
+        })
+        .await;
+        let worktrees = pick(&events, |payload| match payload {
+            EventPayload::WorktreeCreated { path, .. } => Some(path.clone()),
+            _ => None,
+        });
+        let replacement = &worktrees[1];
+        assert_eq!(head_sha(replacement), original_base);
+        assert!(replacement.join("original-base.marker").is_file());
+        assert!(!replacement.join("current-head.marker").exists());
+
+        quiesce(&restarted.handle).await;
+        restarted.stop().await;
     });
 }
 

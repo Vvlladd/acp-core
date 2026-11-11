@@ -105,7 +105,7 @@ fn the_embedded_config_loads_and_describes_every_role() {
     assert!(!cfg.gates.allow_agent_approve, "S2: agents cannot approve");
     assert_eq!(cfg.limits.max_concurrent_attempts, 2);
     assert_eq!(cfg.defaults.max_depth, 2);
-    assert_eq!(cfg.defaults.run_budget_usd, 15.0);
+    assert_eq!(cfg.defaults.run_budget_usd, None);
     assert_eq!(cfg.defaults.spawn_budget_usd, 2.0);
     assert_eq!(cfg.defaults.attempt_timeout_sec, 1800);
     assert_eq!(cfg.defaults.await_result_max_sec, 300);

@@ -39,7 +39,7 @@ use agent_control_plane::core::types::{
 };
 use agent_control_plane::core::{
     channel, human_action, AwaitOut, Command, CoreHandle, DelegateOut, GateOut, GateResolution,
-    LeadStartOut, PlanStartOut, Reply, StatusOut, StatusQuery, STATUS_SCHEMA_VERSION,
+    LeadStartOut, PlanStartOut, Reply, RunBudgetOut, StatusOut, StatusQuery, STATUS_SCHEMA_VERSION,
 };
 use agent_control_plane::ipc::socket::{
     serve_socket, IpcError, ServerIdentity, MAX_LINE_BYTES, MAX_SOCKET_PATH_BYTES, PROTOCOL_VERSION,
@@ -413,6 +413,24 @@ impl FakeCore {
                             let answer = lock(&status).clone();
                             let _ = reply.send(Ok(answer));
                         }
+                        Command::RunBudget { request, reply, .. } => {
+                            let mut snapshot = lock(&status);
+                            let updated = snapshot.runs.iter_mut().find(|run| run.run_id == request.run_id).map(|run| {
+                                run.run_budget_usd = request.run_budget_usd;
+                                run.last_seq += 1;
+                                (run.spend_usd, run.last_seq)
+                            });
+                            if let Some((spend_usd, last_seq)) = updated {
+                                snapshot.run_budget_usd = request.run_budget_usd;
+                                let _ = reply.send(Ok(RunBudgetOut {
+                                    run_id: request.run_id,
+                                    run_budget_usd: request.run_budget_usd,
+                                    spend_usd,
+                                    last_seq,
+                                    continued: request.continue_blocked,
+                                }));
+                            }
+                        }
                         Command::ResolveGate {
                             gate,
                             approve,
@@ -586,6 +604,8 @@ fn canned_status(run: RunId, seqs: &[u64]) -> StatusOut {
             loop_state: LoopState::Building,
             created_at: "2026-08-24T00:00:00Z".to_string(),
             spend_usd: 0.0,
+            run_budget_usd: Some(15.0),
+            budget_recorded: true,
             agent_ids: Vec::new(),
             gate_ids: Vec::new(),
             integrated_sha: None,
@@ -597,7 +617,7 @@ fn canned_status(run: RunId, seqs: &[u64]) -> StatusOut {
         attempts: Vec::new(),
         gates: Vec::new(),
         spend_usd: 0.0,
-        run_budget_usd: 15.0,
+        run_budget_usd: Some(15.0),
         blocked_reason: None,
         events: seqs.iter().map(|seq| event(run, *seq)).collect(),
     }
@@ -610,6 +630,52 @@ fn plus_run(mut status: StatusOut, run: RunId, seqs: &[u64]) -> StatusOut {
     status.runs.append(&mut second.runs);
     status.events.append(&mut second.events);
     status
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_budget_socket_get_set_remove_and_malformed_input() {
+    let run = RunId::new_v4();
+    let fake = FakeCore::start(canned_status(run, &[]));
+    let door = Door::start(fake.handle.clone(), fixture_identity());
+    let mut client = Client::connect(&door.path()).await;
+    client.call("hello", json!({})).await.expect("hello");
+
+    let current = client
+        .call("run.budget.get", json!({ "runId": run }))
+        .await
+        .expect("get");
+    assert_eq!(current["runBudgetUsd"], json!(15.0));
+    assert_eq!(current["lastSeq"], json!(0));
+
+    let raised = client
+        .call("run.budget.set", json!({
+            "runId": run, "expectedSeq": 0, "runBudgetUsd": 25.0,
+            "continueBlocked": false
+        }))
+        .await
+        .expect("set");
+    assert_eq!(raised["runBudgetUsd"], json!(25.0));
+    assert_eq!(raised["continued"], json!(false));
+
+    let removed = client
+        .call("run.budget.remove", json!({
+            "runId": run, "expectedSeq": 1, "continueBlocked": true
+        }))
+        .await
+        .expect("remove");
+    assert_eq!(removed["runBudgetUsd"], Value::Null);
+    assert_eq!(removed["continued"], json!(true));
+
+    let error = client
+        .call("run.budget.set", json!({
+            "runId": run, "expectedSeq": 2, "runBudgetUsd": -1.0
+        }))
+        .await
+        .expect_err("negative rejected");
+    assert_eq!(error["code"], json!(-32602));
+
+    door.stop().await.expect("door stopped");
+    fake.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,8 +1308,18 @@ async fn a_stalled_subscriber_is_lagged_and_keeps_its_connection() {
         .await
         .expect("subscribe");
 
+    // Synchronize the cursor before deliberately stalling. Without this barrier the broadcast
+    // can overrun before the first delivery, in which case fromSeq = 0 is correct.
+    fake.append(run, 1);
+    client
+        .read_until("the initial delivered event", |frame| {
+            frame["params"]["event"]["runId"] == json!(run.to_string())
+                && frame["params"]["event"]["seq"] == json!(1)
+        })
+        .await;
+
     let flood = u64::try_from(EVENT_CHANNEL_CAPACITY).expect("capacity fits") * 2;
-    for seq in 1..=flood {
+    for seq in 2..=flood {
         fake.append(run, seq);
     }
 

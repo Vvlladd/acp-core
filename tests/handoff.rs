@@ -60,6 +60,8 @@ fn run() -> Run {
         loop_state: LoopState::Building,
         created_at: "2026-08-23T00:00:00.000Z".into(),
         spend_usd: 0.75,
+        run_budget_usd: Some(15.0),
+        budget_recorded: false,
         agent_ids: Vec::new(),
         gate_ids: Vec::new(),
         integrated_sha: None,
@@ -297,7 +299,9 @@ fn every_envelope_is_untrusted_whatever_the_attempt_did() {
         Some(result),
     );
     // A failed attempt never wrote a result file at all: no `resultPath`, nothing to read.
-    let mut failed = attempt(&run, &reviewer, dir.path(), AttemptStatus::Failed, None);
+    let failed_dir = dir.path().join("failed-attempt");
+    fs::create_dir(&failed_dir).expect("failed attempt dir");
+    let mut failed = attempt(&run, &reviewer, &failed_dir, AttemptStatus::Failed, None);
     failed.error = Some(AttemptError {
         code: ErrorCode::ProviderError,
         message: "codex exited 1".into(),
@@ -318,7 +322,7 @@ fn every_envelope_is_untrusted_whatever_the_attempt_did() {
         assert_eq!(envelope.provider, agent.provider);
         assert_eq!(envelope.run_spend_usd, run.spend_usd);
         assert_eq!(envelope.cost_usd, a.cost_usd);
-        assert_eq!(envelope.stderr_path, dir.path().join("stderr.log"));
+        assert_eq!(envelope.stderr_path, a.dir.join("stderr.log"));
         assert_eq!(envelope.worktree, agent.worktree);
         assert_eq!(envelope.session_id, agent.session_id);
     }
@@ -336,7 +340,12 @@ fn every_envelope_is_untrusted_whatever_the_attempt_did() {
     assert_eq!(envelope.head, "");
     assert!(!envelope.head_truncated);
     assert!(!envelope.structured_valid);
-    assert_eq!(envelope.result_path, dir.path().join("result.txt"));
+    assert!(envelope.result_path.as_os_str().is_empty());
+    assert_eq!(
+        serde_json::to_value(&envelope).expect("serialize envelope")["resultPath"],
+        ""
+    );
+    assert!(!failed_dir.join("result.txt").exists());
 }
 
 fn json_kind(a: &Attempt, agent: &AgentHandle, run: &Run) -> String {
@@ -377,7 +386,8 @@ fn replacement_prompt_quotes_findings_and_the_prior_files() {
         "tests/policy.rs".to_owned(),
     ];
 
-    let prompt = build_replacement_prompt(&task(), &findings, &prior);
+    let preserved = Path::new("/tmp/acp-retired/draft");
+    let prompt = build_replacement_prompt(&task(), &findings, &prior, Some(preserved));
 
     let body = advisory_body(&prompt);
     for file in &prior {
@@ -386,6 +396,8 @@ fn replacement_prompt_quotes_findings_and_the_prior_files() {
     for finding in &findings {
         assert!(body.contains(&finding.problem));
     }
+    assert!(body.contains("/tmp/acp-retired/draft"));
+    assert!(prompt.contains("schema_invalid"));
 }
 
 #[test]
@@ -430,10 +442,29 @@ fn failure_repair_prompt_quotes_the_worker_error_text() {
     };
 
     let prompt = build_failure_repair_prompt(&err, &task());
+    assert!(prompt.contains("raw final output, when present"));
 
     let body = advisory_body(&prompt);
     assert!(body.contains("max_turns"));
     assert!(body.contains("hit the turn limit"));
+}
+
+#[test]
+fn absent_output_repair_does_not_claim_a_result_artifact_exists() {
+    let err = AttemptError {
+        code: ErrorCode::SchemaInvalid,
+        message: "the worker produced no final output".into(),
+    };
+    let repair = build_failure_repair_prompt(&err, &task());
+    let retry = build_retry_prompt(&task(), " M src/lib.rs\n", Some(&err));
+
+    for prompt in [&repair, &retry] {
+        assert!(prompt.contains("final output, when present"));
+        assert!(!prompt.contains("final output remains"));
+        assert!(prompt.contains("produced no final output"));
+    }
+    assert!(repair.contains("implementation draft is still in this worktree"));
+    assert!(retry.contains("worktree is exactly as that session left it"));
 }
 
 #[test]
@@ -635,7 +666,12 @@ fn injected_advisory_delimiters_are_stripped_from_findings() {
 
     for prompt in [
         build_repair_prompt(&findings, &task()),
-        build_replacement_prompt(&task(), &findings, &["src/a.rs".to_owned()]),
+        build_replacement_prompt(
+            &task(),
+            &findings,
+            &["src/a.rs".to_owned()],
+            Some(Path::new("/tmp/retired")),
+        ),
     ] {
         // Exactly two delimiter occurrences in the whole prompt: the real open and the real close.
         // Anything the worker smuggled in would show up as a third.

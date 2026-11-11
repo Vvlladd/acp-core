@@ -953,7 +953,7 @@ fn a_core_policy_rejection_is_structured_content_with_is_error() {
         // A run budget of zero: `policy::check_delegate` refuses before a worktree exists, so this
         // is a real policy rejection with no process behind it.
         let mut broke = (*embedded_roles()).clone();
-        broke.defaults.run_budget_usd = 0.0;
+        broke.defaults.run_budget_usd = Some(0.0);
         let actor = start_actor(&world, Arc::new(broke), ActorOpts::default());
         let mut peer = Peer::connect(actor.handle.clone()).await;
 

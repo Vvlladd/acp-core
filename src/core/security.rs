@@ -236,10 +236,7 @@ impl Core {
             };
             if let Err(error) = self.start_review_role(&f.run, builder, frozen, RoleName::Security)
             {
-                self.block_run(
-                    &f.run,
-                    &format!("Security review could not start: {}", error.reason),
-                );
+                self.block_policy(&f.run, f.attempt, "Security review could not start", &error);
             }
         }
         false

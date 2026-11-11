@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_control_plane::core::r#loop::reattach_running;
-use agent_control_plane::core::registry::{now_rfc3339, Registry};
+use agent_control_plane::core::registry::{now_rfc3339, CompatibilitySummary, Registry};
 use agent_control_plane::core::supervisor::{ProcessProbe as _, PsProbe, Supervisor};
 use agent_control_plane::core::team::{self, validate_team};
 use agent_control_plane::core::types::{
@@ -180,6 +180,9 @@ pub enum Cmd {
     /// Read or update the daemon's team, or show the role/provider catalog.
     #[command(subcommand)]
     Team(TeamCmd),
+    /// Inspect or change one run's cumulative spending cap through the human socket.
+    #[command(subcommand)]
+    Budget(BudgetCmd),
     /// Report — and with `--closed`, remove — the worktrees of closed lineages.
     Gc {
         /// Actually remove them.
@@ -310,6 +313,25 @@ pub enum TeamCmd {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum BudgetCmd {
+    /// Show the authoritative cap, cumulative usage, status and current sequence.
+    Get { run_id: String },
+    /// Set a finite cap. Changing a cap starts no work unless continuation is explicitly requested.
+    Set {
+        run_id: String,
+        usd: f64,
+        #[arg(long)]
+        continue_blocked: bool,
+    },
+    /// Remove the cap (explicit unlimited).
+    Remove {
+        run_id: String,
+        #[arg(long)]
+        continue_blocked: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum SessionCmd {
     Status,
     Acquire {
@@ -364,6 +386,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Cmd::Gate(gate) => resolve_gate(repo, gate).await,
         Cmd::Team(team) => manage_team(repo, team).await,
+        Cmd::Budget(budget) => manage_budget(repo, budget).await,
         Cmd::Gc { closed } => gc(repo, closed).await,
         Cmd::Doctor => doctor(repo).await,
         Cmd::Delegate {
@@ -980,6 +1003,11 @@ async fn serve(repo: Option<&Path>, no_mcp: bool, managed: bool) -> anyhow::Resu
     let socket_path = state_dir.join(SOCKET_FILE);
     check_socket_path(&socket_path)?;
     create_dir_0700(&state_dir)?;
+
+    // This early compatibility check avoids taking ownership for an unreadable history. The
+    // authoritative replay remains below, after the lock, so it cannot race the previous owner.
+    Registry::open(&state_dir)
+        .with_context(|| format!("checking the event log in {}", state_dir.display()))?;
 
     let lock_path = state_dir.join(LOCK_FILE);
     let guard = match take_lock(&lock_path, &socket_path, &repo_root)? {
@@ -1598,6 +1626,10 @@ fn holder_is_alive(holder: &LockRecord) -> bool {
 #[serde(rename_all = "camelCase")]
 struct Snapshot<'a> {
     state_dir: &'a Path,
+    history_incomplete: bool,
+    skipped_event_lines: usize,
+    incompatible_event_lines: usize,
+    compatibility: &'a CompatibilitySummary,
     runs: Vec<&'a Run>,
     agents: Vec<&'a AgentHandle>,
     attempts: Vec<&'a Attempt>,
@@ -1633,6 +1665,10 @@ impl<'a> Snapshot<'a> {
 
         Self {
             state_dir: registry.state_dir(),
+            history_incomplete: registry.skipped_event_lines() > 0,
+            skipped_event_lines: registry.skipped_event_lines(),
+            incompatible_event_lines: registry.incompatible_event_lines(),
+            compatibility: registry.compatibility_summary(),
             runs,
             agents,
             attempts,
@@ -1644,8 +1680,29 @@ impl<'a> Snapshot<'a> {
     /// one — which is the only line here a human has to act on.
     fn render(&self, out: &mut impl io::Write) -> io::Result<()> {
         writeln!(out, "state {}", self.state_dir.display())?;
+        if self.history_incomplete {
+            writeln!(out, "warning: incomplete history: {} skipped event line(s), including {} incompatible record(s)", self.skipped_event_lines, self.incompatible_event_lines)?;
+        }
+        if self.incompatible_event_lines > 0 {
+            writeln!(out, "use a matching ACP build before continuing; compatibility metadata below is read-only and not executable")?;
+            writeln!(out, "observed {} unreadable run.created, {} unreadable attempt.started, {} other incompatible record(s)", self.compatibility.run_created_records, self.compatibility.attempt_started_records, self.compatibility.other_records)?;
+            for run in &self.compatibility.run_examples {
+                writeln!(out, "  unreadable run {}", run.run_id)?;
+            }
+            if self.compatibility.run_examples_truncated {
+                writeln!(out, "  additional unreadable run examples omitted")?;
+            }
+            for attempt in &self.compatibility.attempt_examples {
+                writeln!(out, "  unreadable attempt {} agent={} run={}", attempt.attempt_id, attempt.agent_id, attempt.run_id)?;
+            }
+            if self.compatibility.attempt_examples_truncated {
+                writeln!(out, "  additional unreadable attempt examples omitted")?;
+            }
+        }
         if self.runs.is_empty() {
-            return writeln!(out, "no runs recorded");
+            return writeln!(out, "{}", if self.history_incomplete {
+                "no fully readable runs in this projection"
+            } else { "no runs recorded" });
         }
         for run in &self.runs {
             writeln!(
@@ -1701,7 +1758,7 @@ fn word<T: Serialize>(value: &T) -> String {
 
 /// `acp status` — read-only, no socket, no lock (design, § Process model).
 fn print_status(state_dir: &Path, run: Option<RunId>, as_json: bool) -> anyhow::Result<i32> {
-    let registry = Registry::open(state_dir)
+    let registry = Registry::open_for_inspection(state_dir)
         .with_context(|| format!("reading the event log in {}", state_dir.display()))?;
     let snapshot = Snapshot::of(&registry, run);
     let mut out = io::stdout().lock();
@@ -1839,6 +1896,48 @@ async fn manage_team(repo: Option<&Path>, cmd: TeamCmd) -> anyhow::Result<i32> {
         },
         TeamCmd::Set { .. } | TeamCmd::Roles => print_json(&result)?,
     }
+    Ok(EXIT_OK)
+}
+
+async fn manage_budget(repo: Option<&Path>, cmd: BudgetCmd) -> anyhow::Result<i32> {
+    let places = Places::locate(repo).await?;
+    let run_text = match &cmd {
+        BudgetCmd::Get { run_id }
+        | BudgetCmd::Set { run_id, .. }
+        | BudgetCmd::Remove { run_id, .. } => run_id,
+    };
+    let run_id = run_text
+        .parse::<RunId>()
+        .with_context(|| format!("{run_text:?} is not a run id"))?;
+    let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
+    let current = client
+        .call("run.budget.get", json!({ "runId": run_id }))
+        .await?;
+    if matches!(cmd, BudgetCmd::Get { .. }) {
+        print_json(&current)?;
+        return Ok(EXIT_OK);
+    }
+    let expected_seq = current["lastSeq"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("run.budget.get returned no `lastSeq`"))?;
+    let (method, params) = match cmd {
+        BudgetCmd::Set { usd, continue_blocked, .. } => {
+            if !usd.is_finite() || usd < 0.0 {
+                bail!("USD must be a finite non-negative number");
+            }
+            (
+                "run.budget.set",
+                json!({ "runId": run_id, "expectedSeq": expected_seq, "runBudgetUsd": usd, "continueBlocked": continue_blocked }),
+            )
+        }
+        BudgetCmd::Remove { continue_blocked, .. } => (
+            "run.budget.remove",
+            json!({ "runId": run_id, "expectedSeq": expected_seq, "continueBlocked": continue_blocked }),
+        ),
+        BudgetCmd::Get { .. } => unreachable!("handled above"),
+    };
+    let result = client.call(method, params).await?;
+    print_json(&result)?;
     Ok(EXIT_OK)
 }
 

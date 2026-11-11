@@ -314,7 +314,7 @@ pub struct ResolvedSpawn<'a> {
     pub writes: bool,
     pub spawn_budget_usd: f64,
     /// What is left of the run budget once this spawn's cap is reserved.
-    pub headroom_usd: f64,
+    pub headroom_usd: Option<f64>,
     pub attempt_timeout_sec: u64,
 }
 
@@ -495,7 +495,14 @@ pub fn check_delegate<'a>(
     }
     let spawn_budget_usd = role.spawn_budget_usd;
     // A run the registry has never seen is one the actor is about to mint: nothing spent yet.
-    let headroom_usd = budget_headroom(run.map_or(0.0, |r| r.spend_usd), spawn_budget_usd, cfg)?;
+    let headroom_usd = budget_headroom(
+        run.map_or(0.0, |r| r.spend_usd),
+        spawn_budget_usd,
+        run.map_or(cfg.defaults.run_budget_usd, |r| {
+            r.effective_budget_usd(cfg.defaults.run_budget_usd)
+        }),
+        cfg,
+    )?;
 
     if let Some(run) = run {
         let cap = usize::try_from(cfg.limits.max_concurrent_attempts).unwrap_or(usize::MAX);
@@ -624,6 +631,15 @@ pub fn check_send_message<'a>(
         .get(&handle.role)
         .map_or(ctx.cfg.defaults.spawn_budget_usd, |r| r.spawn_budget_usd);
     if let Some(run) = ctx.registry.run(&handle.run_id) {
+        // A resumed process is adopted only while its parent run accepts workers. Admission
+        // must not promise a turn that on_spawn_ready would immediately cancel. Recovery is
+        // the explicit human operation which returns interrupted work to Running.
+        if matches!(run.status, RunStatus::Blocked | RunStatus::Failed) {
+            return Err(PolicyError::new(
+                PolicyCode::RunBlocked,
+                "this task is blocked or failed; resolve its blocker and confirm recovery before resuming the preserved draft",
+            ));
+        }
         check_budget(run, spawn_cap, ctx.cfg)?;
     }
 
@@ -666,8 +682,13 @@ pub fn check_gate_resolve(
 ///
 /// # Errors
 /// `BudgetRunExceeded` or `BudgetSpawnExceeded`.
-pub fn check_budget(run: &Run, spawn_cap_usd: f64, cfg: &RolesConfig) -> Result<f64, PolicyError> {
-    budget_headroom(run.spend_usd, spawn_cap_usd, cfg)
+pub fn check_budget(
+    run: &Run,
+    spawn_cap_usd: f64,
+    cfg: &RolesConfig,
+) -> Result<Option<f64>, PolicyError> {
+    let limit = run.effective_budget_usd(cfg.defaults.run_budget_usd);
+    budget_headroom(run.spend_usd, spawn_cap_usd, limit, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,10 +700,22 @@ pub fn check_budget(run: &Run, spawn_cap_usd: f64, cfg: &RolesConfig) -> Result<
 fn budget_headroom(
     spend_usd: f64,
     spawn_cap_usd: f64,
+    run_budget: Option<f64>,
     cfg: &RolesConfig,
-) -> Result<f64, PolicyError> {
-    let run_budget = cfg.defaults.run_budget_usd;
-    if spend_usd + spawn_cap_usd > run_budget {
+) -> Result<Option<f64>, PolicyError> {
+    if !spend_usd.is_finite() || spend_usd < 0.0 || !spawn_cap_usd.is_finite() || spawn_cap_usd < 0.0 {
+        return Err(PolicyError::new(
+            PolicyCode::BudgetRunExceeded,
+            "budget values must be finite and non-negative",
+        ));
+    }
+    if run_budget.is_some_and(|limit| !limit.is_finite() || limit < 0.0) {
+        return Err(PolicyError::new(
+            PolicyCode::BudgetRunExceeded,
+            "runBudgetUsd must be null or a finite non-negative number",
+        ));
+    }
+    if let Some(run_budget) = run_budget.filter(|limit| spend_usd + spawn_cap_usd > *limit) {
         return Err(PolicyError::new(
             PolicyCode::BudgetRunExceeded,
             format!(
@@ -706,7 +739,7 @@ fn budget_headroom(
             "spawnBudgetUsd": spawn_budget,
         })));
     }
-    Ok(run_budget - spend_usd - spawn_cap_usd)
+    Ok(run_budget.map(|limit| limit - spend_usd - spawn_cap_usd))
 }
 
 /// How many of `run`'s attempts are still running (S9).

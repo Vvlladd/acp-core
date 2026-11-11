@@ -160,7 +160,7 @@ fn roles_cfg(allow_agent_approve: bool) -> RolesConfig {
         defaults: Defaults {
             base_ref: "HEAD".into(),
             max_depth: 2,
-            run_budget_usd: 15.0,
+            run_budget_usd: Some(15.0),
             spawn_budget_usd: 2.0,
             attempt_timeout_sec: 1800,
             await_result_max_sec: 300,
@@ -198,6 +198,7 @@ impl World {
             .append(
                 &run,
                 EventPayload::RunCreated {
+                    run_budget_usd: None,
                     execution: None,
                     repo_root: repo.path().to_path_buf(),
                     state_dir: state.path().to_path_buf(),
@@ -1207,7 +1208,9 @@ async fn an_interrupted_approval_unstages_what_it_staged() {
     );
 
     let repo = w.repo.path().to_path_buf();
-    let committing = tokio::spawn(async move { gates::run_commit(&plan, lock()).await });
+    let worktree_lock = lock();
+    let commit_lock = Arc::clone(&worktree_lock);
+    let committing = tokio::spawn(async move { gates::run_commit(&plan, commit_lock).await });
 
     // Interrupt the approval while a `git add` is **provably** mid-index-write: the lock file is
     // git's own statement that one is. Nothing else in this helper writes the index, so this is the
@@ -1224,23 +1227,19 @@ async fn an_interrupted_approval_unstages_what_it_staged() {
     committing.abort();
     let _ = committing.await;
 
-    // The guard hands its cleanup to the runtime — and the cleanup waits for the staging it is
-    // cleaning up after — so this is the one place a wait is honest.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if run_git(&repo, &["diff", "--cached", "--name-only"])
-            .trim()
-            .is_empty()
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the interrupted approval left {} staged",
-            run_git(&repo, &["diff", "--cached", "--name-only"])
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // Drop cleanup retains this same lock until the in-flight staging and unstaging finish.
+    // An empty index alone is not a completion signal: it can still be empty before the first
+    // staging write finishes. Reacquiring the shared lock waits for actual cleanup ownership.
+    let _cleanup_complete = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        worktree_lock.lock(),
+    )
+    .await
+    .expect("the interrupted approval's cleanup did not release its worktree lock");
+    assert!(
+        run_git(&repo, &["diff", "--cached", "--name-only"]).trim().is_empty(),
+        "the interrupted approval left staged changes after cleanup"
+    );
 
     // No orphaned lock: the `git add` that was in flight finished on its own rather than being
     // SIGKILLed halfway through writing the new index.

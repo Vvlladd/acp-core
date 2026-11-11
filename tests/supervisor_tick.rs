@@ -30,16 +30,18 @@ use agent_control_plane::core::supervisor::{
     SignalOutcome, SpawnedProc, Supervisor, SupervisorSignal,
 };
 use agent_control_plane::core::types::{
-    AgentId, Attempt, AttemptId, AttemptKind, AttemptStatus, CancelBy, ErrorCode, Event,
-    EventPayload, MessageRole, ProviderName, RoleName, RoleSpec, RunId, SandboxMode, SchemaName,
-    Task, ViolationKind,
+    AgentId, Attempt, AttemptError, AttemptId, AttemptKind, AttemptStatus, CancelBy, ErrorCode,
+    Event, EventPayload, MessageRole, ProviderName, RoleName, RoleSpec, RunId, SandboxMode,
+    SchemaName, Task, ViolationKind,
 };
 use agent_control_plane::core::{
     channel, run_actor, spawn_signal_forwarder, spawn_tick_task, Command, Core, StatusOut,
     StatusQuery,
 };
 use agent_control_plane::providers::claude::ClaudeAdapter;
-use agent_control_plane::providers::{ProviderAdapter, SandboxSpec, SpawnPlan, SpawnRequest};
+use agent_control_plane::providers::{
+    NormalizedEvent, ProviderAdapter, RawResult, ResultCtx, SandboxSpec, SpawnPlan, SpawnRequest,
+};
 use agent_control_plane::roles::loader::load_roles;
 use agent_control_plane::workspace::git;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -82,6 +84,41 @@ struct Fixture {
     role: RoleSpec,
     schema: Arc<Value>,
     denylist: Arc<GlobSet>,
+}
+
+/// Uses the real fake-provider process and parser, but forces the final extracted artifact. This
+/// keeps finalize, result persistence and event folding end to end while covering output shapes
+/// that no checked-in provider transcript happens to contain.
+struct ForcedResultAdapter(RawResult);
+
+impl ProviderAdapter for ForcedResultAdapter {
+    fn name(&self) -> ProviderName {
+        ClaudeAdapter.name()
+    }
+
+    fn build_fresh(&self, req: &SpawnRequest<'_>) -> SpawnPlan {
+        ClaudeAdapter.build_fresh(req)
+    }
+
+    fn build_resume(&self, req: &SpawnRequest<'_>) -> SpawnPlan {
+        ClaudeAdapter.build_resume(req)
+    }
+
+    fn prompt_index(&self, plan: &SpawnPlan) -> Option<usize> {
+        ClaudeAdapter.prompt_index(plan)
+    }
+
+    fn preflight(&self, req: &SpawnRequest<'_>) -> Option<AttemptError> {
+        ClaudeAdapter.preflight(req)
+    }
+
+    fn parse_line(&self, line: &str) -> Vec<NormalizedEvent> {
+        ClaudeAdapter.parse_line(line)
+    }
+
+    fn extract_result(&self, _ctx: &ResultCtx<'_>) -> RawResult {
+        self.0.clone()
+    }
 }
 
 impl Fixture {
@@ -972,6 +1009,114 @@ async fn a_builder_that_changed_nothing_is_invalid_output_not_success() {
     assert_eq!(finished, vec![AttemptStatus::InvalidOutput]);
 }
 
+#[tokio::test]
+async fn fake_provider_results_get_distinct_sanitized_schema_diagnostics() {
+    let secret = "sensitive-worker-output";
+    let cases = [
+        (
+            "summary overflow",
+            RawResult {
+                ok: true,
+                text: Some(secret.into()),
+                structured: Some(serde_json::json!({
+                    "status": "succeeded",
+                    "filesChanged": ["src/adder.ts"],
+                    "summary": format!("{secret}{}", "x".repeat(4_001))
+                })),
+                session_id: Some("forced-session".into()),
+                ..RawResult::default()
+            },
+            Some("$/summary: violated maxLength 4000"),
+            true,
+        ),
+        (
+            "required field absent",
+            RawResult {
+                ok: true,
+                text: Some(secret.into()),
+                structured: Some(serde_json::json!({
+                    "status": "succeeded",
+                    "filesChanged": ["src/adder.ts"]
+                })),
+                session_id: Some("forced-session".into()),
+                ..RawResult::default()
+            },
+            Some("required field `summary` is absent"),
+            true,
+        ),
+        (
+            "malformed JSON",
+            RawResult {
+                ok: true,
+                text: Some(format!("{{{secret}")),
+                session_id: Some("forced-session".into()),
+                ..RawResult::default()
+            },
+            Some("not valid JSON"),
+            true,
+        ),
+        (
+            "absent output",
+            RawResult {
+                ok: true,
+                session_id: Some("forced-session".into()),
+                ..RawResult::default()
+            },
+            Some("produced no final output"),
+            false,
+        ),
+        (
+            "valid output",
+            RawResult {
+                ok: true,
+                text: Some("valid result".into()),
+                structured: Some(serde_json::json!({
+                    "status": "succeeded",
+                    "filesChanged": ["src/adder.ts"],
+                    "summary": "implemented and checked"
+                })),
+                session_id: Some("forced-session".into()),
+                ..RawResult::default()
+            },
+            None,
+            true,
+        ),
+    ];
+
+    for (label, raw, expected, result_exists) in cases {
+        let fx = Fixture::new();
+        let mut reg = fx.registry();
+        let (mut sup, mut sig) = supervisor();
+        let pre_sha = head_sha(fx.worktree()).await;
+        let spawned = fx.spawn("pass", &[]).await;
+        let mut ctx = fx.ctx(Duration::from_secs(60), &pre_sha);
+        ctx.adapter = Arc::new(ForcedResultAdapter(raw));
+        sup.adopt(spawned, ctx, &mut reg);
+        let attempt = tick_until_finished(&mut sup, &mut sig, &mut reg, &fx.attempt).await;
+
+        assert_eq!(attempt.result_path.is_some(), result_exists, "{label}: {attempt:?}");
+        match expected {
+            Some(expected) => {
+                assert_eq!(attempt.status, AttemptStatus::InvalidOutput, "{label}");
+                let error = attempt.error.expect("schema error");
+                assert_eq!(error.code, ErrorCode::SchemaInvalid, "{label}");
+                assert!(error.message.contains(expected), "{label}: {}", error.message);
+                assert!(error.message.len() <= 1_024, "{label}: {}", error.message);
+                assert!(!error.message.contains(secret), "{label}: raw value leaked");
+            }
+            None => {
+                assert_eq!(attempt.status, AttemptStatus::Succeeded, "{label}: {attempt:?}");
+                assert_eq!(attempt.structured_valid, Some(true), "{label}");
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(fx.worktree().join("src/adder.ts")).expect("preserved draft"),
+            "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+            "{label}: finalization must not mutate the implementation draft"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Liveness and re-attach
 // ---------------------------------------------------------------------------
@@ -1667,6 +1812,7 @@ async fn a_status_turn_answers_while_a_finalize_helper_is_stuck_in_git() {
         .append(
             &fx.run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: fx.repo.path().to_path_buf(),
                 state_dir: fx.state_dir.path().to_path_buf(),
@@ -1834,6 +1980,7 @@ async fn a_worker_that_ignores_sigterm_does_not_outlive_a_fatal_stop() {
         .append(
             &fx.run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: fx.repo.path().to_path_buf(),
                 state_dir: fx.state_dir.path().to_path_buf(),

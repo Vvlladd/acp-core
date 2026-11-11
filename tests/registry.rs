@@ -52,6 +52,7 @@ fn tokens() -> TokenUsage {
 
 fn run_created(repo_root: &Path, state: &Path) -> NewEvent {
     EventPayload::RunCreated {
+        run_budget_usd: None,
         execution: None,
         repo_root: repo_root.to_path_buf(),
         state_dir: state.to_path_buf(),
@@ -233,6 +234,8 @@ fn appended_events_project_the_hand_computed_run() {
         loop_state: LoopState::Building,
         created_at: created.base.ts.clone(),
         spend_usd: 0.25,
+        run_budget_usd: Some(15.0),
+        budget_recorded: false,
         agent_ids: vec![agent],
         gate_ids: Vec::new(),
         integrated_sha: None,
@@ -694,12 +697,291 @@ fn a_malformed_trailing_line_is_skipped_and_the_events_before_it_survive() {
 
     let body = fs::read_to_string(&path).expect("read log");
     assert!(body.contains(&fragment), "log bytes are never deleted");
-    let registry = Registry::open(state.path()).expect("reopen");
+    let registry = Registry::open(state.path()).expect("reopen after the known fragment was handled");
+    assert_eq!(registry.incompatible_event_lines(), 0);
+    assert_eq!(registry.skipped_event_lines(), 1);
     assert_eq!(registry.events(&run, None, 100).len(), 3);
     assert_eq!(
         registry.agent(&agent).expect("agent").status,
         AgentStatus::Running
     );
+}
+
+#[test]
+fn interrupted_tail_recovery_survives_every_annotation_prefix_and_repeated_restart() {
+    let state = state_dir();
+    let repo = state_dir();
+    let run = RunId::new_v4();
+    let agent = AgentId::new_v4();
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&run, run_created(repo.path(), state.path())).unwrap();
+    drop(registry);
+    let path = events_path(state.path(), run);
+    let mut original = fs::read(&path).unwrap();
+    let fragment = b"{\"seq\":2,\"kind\":\"agent.st";
+    original.extend_from_slice(fragment);
+    fs::write(&path, &original).unwrap();
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&run, agent_status(agent, AgentStatus::Running)).unwrap();
+    drop(registry);
+    let repaired = fs::read(&path).unwrap();
+    assert!(repaired.starts_with(&original), "original bytes must survive");
+    let annotation_end = repaired[original.len()..].iter().position(|byte| *byte == b'\n').unwrap() + original.len();
+    let annotation = &repaired[original.len()..annotation_end];
+    assert!(!annotation.is_empty());
+    for prefix in 0..=annotation.len() {
+        let mut interrupted = original.clone();
+        interrupted.extend_from_slice(&annotation[..prefix]);
+        fs::write(&path, &interrupted).unwrap();
+        let mut registry = Registry::open(state.path()).expect("every interrupted annotation prefix is recoverable");
+        registry.append(&run, agent_status(agent, AgentStatus::Running)).unwrap();
+        drop(registry);
+        assert!(fs::read(&path).unwrap().starts_with(&interrupted));
+        let mut registry = Registry::open(state.path()).expect("first operational restart");
+        assert_eq!(registry.events(&run, None, 100).len(), 2);
+        registry.append(&run, agent_status(agent, AgentStatus::Idle)).unwrap();
+        drop(registry);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"seq\":4,\"kind\":\"agent.st");
+        fs::write(&path, &bytes).unwrap();
+        let mut registry = Registry::open(state.path()).expect("a second interrupted event");
+        registry.append(&run, agent_status(agent, AgentStatus::Running)).unwrap();
+        drop(registry);
+        let registry = Registry::open(state.path()).expect("second operational restart");
+        assert_eq!(registry.events(&run, None, 100).len(), 4);
+        assert_eq!(registry.skipped_event_lines(), 2);
+    }
+    for offset in [original.len() - 1, annotation_end - 1] {
+        let mut altered = repaired.clone();
+        altered[offset] ^= 1;
+        fs::write(&path, &altered).unwrap();
+        assert!(Registry::open(state.path()).is_err(), "changed fragment or annotation must fail closed");
+        assert!(Registry::open_for_inspection(state.path()).unwrap().incompatible_event_lines() > 0);
+    }
+}
+
+#[test]
+fn complete_event_and_whitespace_tails_need_no_recovery_annotation() {
+    for whitespace in [false, true] {
+        let state = state_dir();
+        let repo = state_dir();
+        let run = RunId::new_v4();
+        let mut registry = Registry::open(state.path()).unwrap();
+        registry.append(&run, run_created(repo.path(), state.path())).unwrap();
+        drop(registry);
+        let path = events_path(state.path(), run);
+        let mut original = fs::read(&path).unwrap();
+        if whitespace {
+            original.extend_from_slice(b" \t");
+        } else {
+            assert_eq!(original.pop(), Some(b'\n'));
+        }
+        fs::write(&path, &original).unwrap();
+        let mut registry = Registry::open(state.path()).unwrap();
+        assert_eq!(registry.skipped_event_lines(), 0);
+        registry.append(&run, agent_status(AgentId::new_v4(), AgentStatus::Idle)).unwrap();
+        drop(registry);
+        let registry = Registry::open(state.path()).unwrap();
+        assert_eq!(registry.events(&run, None, 100).len(), 2);
+        assert_eq!(registry.skipped_event_lines(), 0);
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&original));
+        assert!(!bytes.contains(&0x1e));
+    }
+}
+
+#[test]
+fn compatibility_examples_report_omitted_missing_or_invalid_identifiers() {
+    let state = state_dir();
+    let run = RunId::new_v4();
+    let attempt = AttemptId::new_v4();
+    let agent = AgentId::new_v4();
+    write_log(state.path(), run, &[
+        json!({"kind":"run.created"}),
+        json!({"kind":"run.created","runId":"not-a-uuid"}),
+        json!({"kind":"attempt.started","runId":run,"agentId":agent}),
+        json!({"kind":"attempt.started","runId":run,"agentId":"bad","attemptId":attempt}),
+        json!({"kind":"attempt.started","runId":"bad","agentId":agent,"attemptId":attempt}),
+        json!({"kind":"attempt.started","runId":run,"agentId":agent,"attemptId":"bad"}),
+    ]);
+    let registry = Registry::open_for_inspection(state.path()).unwrap();
+    let summary = registry.compatibility_summary();
+    assert_eq!(summary.run_created_records, 2);
+    assert_eq!(summary.attempt_started_records, 4);
+    assert!(summary.run_examples.is_empty() && summary.run_examples_truncated);
+    assert!(summary.attempt_examples.is_empty() && summary.attempt_examples_truncated);
+    assert!(Registry::open(state.path()).is_err());
+}
+
+#[test]
+fn operational_replay_refuses_complete_syntax_damage_and_invalid_utf8() {
+    use std::io::Write as _;
+
+    let state = state_dir();
+    let repo = state_dir();
+    let run = RunId::new_v4();
+    let path = events_path(state.path(), run);
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&run, run_created(repo.path(), state.path())).unwrap();
+    drop(registry);
+
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"{\"seq\":2,\"kind\":\"run.created\"} trailing garbage\n").unwrap();
+    file.write_all(b"{\"seq\":3,\"kind\":\"").unwrap();
+    file.write_all(&[0xff, b'\n']).unwrap();
+    file.write_all(b"{\"seq\":4,\"kind\":\"attempt.started\"").unwrap();
+    drop(file);
+    let before = fs::read(&path).unwrap();
+
+    assert!(matches!(
+        Registry::open(state.path()),
+        Err(agent_control_plane::core::registry::RegistryError::IncompatibleHistory { count: 2 })
+    ));
+    let inspection = Registry::open_for_inspection(state.path()).unwrap();
+    assert_eq!(inspection.skipped_event_lines(), 3);
+    assert_eq!(inspection.incompatible_event_lines(), 2);
+    assert_eq!(inspection.compatibility_summary().incompatible_records, 2);
+    assert_eq!(inspection.compatibility_summary().other_records, 2);
+    assert!(inspection.run(&run).is_some());
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn operational_replay_refuses_unknown_event_and_nested_payload_fields() {
+    let state = state_dir();
+    let repo = state_dir();
+    let envelope_run = RunId::new_v4();
+    let nested_run = RunId::new_v4();
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&envelope_run, run_created(repo.path(), state.path())).unwrap();
+    registry.append(&nested_run, run_created(repo.path(), state.path())).unwrap();
+    drop(registry);
+
+    let envelope_path = events_path(state.path(), envelope_run);
+    let mut envelope: Value = serde_json::from_str(fs::read_to_string(&envelope_path).unwrap().trim()).unwrap();
+    envelope["futureAuthorization"] = json!(true);
+    fs::write(&envelope_path, format!("{envelope}\n")).unwrap();
+
+    let nested_path = events_path(state.path(), nested_run);
+    let mut nested: Value = serde_json::from_str(fs::read_to_string(&nested_path).unwrap().trim()).unwrap();
+    nested["task"]["futureAuthorization"] = json!(true);
+    fs::write(&nested_path, format!("{nested}\n")).unwrap();
+
+    assert!(matches!(
+        Registry::open(state.path()),
+        Err(agent_control_plane::core::registry::RegistryError::IncompatibleHistory { count: 2 })
+    ));
+    let inspection = Registry::open_for_inspection(state.path()).unwrap();
+    assert_eq!(inspection.incompatible_event_lines(), 2);
+    assert_eq!(inspection.compatibility_summary().incompatible_records, 2);
+    assert_eq!(inspection.compatibility_summary().run_created_records, 2);
+    assert!(inspection.run(&envelope_run).is_none());
+    assert!(inspection.run(&nested_run).is_none());
+}
+
+#[test]
+fn operational_replay_refuses_duplicate_recognized_fields_without_projecting_them() {
+    use std::io::Write as _;
+
+    let state = state_dir();
+    let repo = state_dir();
+    let run = RunId::new_v4();
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&run, run_created(repo.path(), state.path())).unwrap();
+    drop(registry);
+
+    let path = events_path(state.path(), run);
+    let duplicate = format!(
+        "{{\"seq\":2,\"ts\":\"2026-11-11T00:00:00.000Z\",\"runId\":\"{run}\",\"kind\":\"run.status\",\"status\":\"failed\",\"status\":\"cancelled\",\"reason\":null}}\n"
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(duplicate.as_bytes())
+        .unwrap();
+
+    assert!(matches!(
+        Registry::open(state.path()),
+        Err(agent_control_plane::core::registry::RegistryError::IncompatibleHistory { count: 1 })
+    ));
+    let inspection = Registry::open_for_inspection(state.path()).unwrap();
+    assert_eq!(inspection.incompatible_event_lines(), 1);
+    assert_eq!(inspection.compatibility_summary().incompatible_records, 1);
+    assert_eq!(inspection.compatibility_summary().other_records, 1);
+    assert_eq!(inspection.run(&run).unwrap().status, RunStatus::Running);
+    assert_eq!(inspection.events(&run, None, 100).len(), 1);
+}
+
+#[test]
+fn operational_replay_accepts_known_optional_null_fields() {
+    let state = state_dir();
+    let repo = state_dir();
+    let run = RunId::new_v4();
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&run, run_created(repo.path(), state.path())).unwrap();
+    drop(registry);
+
+    let path = events_path(state.path(), run);
+    let mut event: Value = serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+    event["execution"] = Value::Null;
+    event["steps"] = Value::Null;
+    fs::write(&path, format!("{event}\n")).unwrap();
+
+    let registry = Registry::open(state.path()).expect("known legacy optional fields remain valid");
+    assert_eq!(registry.incompatible_event_lines(), 0);
+    assert!(registry.run(&run).is_some());
+}
+
+#[test]
+fn inspection_summarizes_mixed_incompatible_records_with_bounded_examples() {
+    let state = state_dir();
+    let repo = state_dir();
+    let compatible_run = RunId::new_v4();
+    let compatible_agent = AgentId::new_v4();
+    let compatible_attempt = AttemptId::new_v4();
+    let mut registry = Registry::open(state.path()).unwrap();
+    registry.append(&compatible_run, run_created(repo.path(), state.path())).unwrap();
+    registry.append(&compatible_run, agent_created(compatible_agent, LineageId::new_v4(), RoleName::Builder, true, repo.path())).unwrap();
+    registry.append(&compatible_run, attempt_started(compatible_attempt, compatible_agent, repo.path())).unwrap();
+    let mut paths = Vec::new();
+    let mut expected = Vec::new();
+    for _ in 0..10 {
+        let run = RunId::new_v4();
+        let agent = AgentId::new_v4();
+        let attempt = AttemptId::new_v4();
+        registry.append(&run, run_created(repo.path(), state.path())).unwrap();
+        registry.append(&run, agent_created(agent, LineageId::new_v4(), RoleName::Reviewer, false, repo.path())).unwrap();
+        registry.append(&run, attempt_started(attempt, agent, repo.path())).unwrap();
+        paths.push(events_path(state.path(), run));
+        expected.push((run, attempt, agent));
+    }
+    drop(registry);
+    for path in &paths {
+        let mut lines: Vec<Value> = fs::read_to_string(path).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let created = lines.iter_mut().find(|line| line["kind"] == "run.created").unwrap();
+        created["execution"] = json!({"version":1,"mode":"build","steps":{},"assignments":{},"limits":{"runBudgetUsd":"unlimited"}});
+        let started = lines.iter_mut().find(|line| line["kind"] == "attempt.started").unwrap();
+        started["timeoutSec"] = json!("unlimited");
+        started["spawnBudgetUsd"] = json!("unlimited");
+        fs::write(path, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+    }
+    let before: Vec<String> = paths.iter().map(|path| fs::read_to_string(path).unwrap()).collect();
+    let mut inspection = Registry::open_for_inspection(state.path()).unwrap();
+    assert!(inspection.run(&compatible_run).is_some());
+    assert!(inspection.attempt(&compatible_attempt).is_some());
+    let summary = inspection.compatibility_summary();
+    assert_eq!((summary.incompatible_records, summary.run_created_records, summary.attempt_started_records, summary.other_records), (20, 10, 10, 0));
+    assert_eq!(summary.run_examples.len(), 8);
+    assert!(summary.run_examples_truncated);
+    assert_eq!(summary.attempt_examples.len(), 8);
+    assert!(summary.attempt_examples_truncated);
+    assert!(summary.attempt_examples.iter().all(|item| expected.contains(&(item.run_id, item.attempt_id, item.agent_id))));
+    inspection.audit(AuditEntry::new("test", "test", "test", "sha256:test"));
+    assert!(!state.path().join("audit.jsonl").exists());
+    assert!(inspection.append(&compatible_run, agent_status(compatible_agent, AgentStatus::Running)).is_err());
+    assert!(matches!(Registry::open(state.path()), Err(agent_control_plane::core::registry::RegistryError::IncompatibleHistory { count: 20 })));
+    assert_eq!(paths.iter().map(|path| fs::read_to_string(path).unwrap()).collect::<Vec<_>>(), before);
 }
 
 // ---------------------------------------------------------------------------
@@ -877,4 +1159,35 @@ fn mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+
+#[test]
+fn creation_record_alone_preserves_explicit_caps_across_restart_and_config_changes() {
+    for captured in [None, Some(None), Some(Some(0.0)), Some(Some(7.0))] {
+        let state = state_dir();
+        let repo = state_dir();
+        let run = RunId::new_v4();
+        let mut registry = Registry::open(state.path()).unwrap();
+        let mut created = run_created(repo.path(), state.path());
+        let EventPayload::RunCreated { run_budget_usd, .. } = &mut created else {
+            unreachable!()
+        };
+        *run_budget_usd = captured;
+        registry.append(&run, created).unwrap();
+        // Simulate a crash immediately after the single creation append: no later capture event.
+        drop(registry);
+        let path = state.path().join("runs").join(run.to_string()).join("events.jsonl");
+        let before = fs::read(&path).unwrap();
+        let wire: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(wire.get("runBudgetUsd"), captured.map(|v| json!(v)).as_ref());
+        let reopened = Registry::open(state.path()).unwrap();
+        let projected = reopened.run(&run).unwrap();
+        assert_eq!(projected.budget_recorded, captured.is_some());
+        for loaded_default in [None, Some(3.0), Some(100.0)] {
+            let expected = captured.unwrap_or(loaded_default.or(Some(15.0)));
+            assert_eq!(projected.effective_budget_usd(loaded_default), expected);
+        }
+        assert_eq!(fs::read(&path).unwrap(), before, "replay must not rewrite history");
+    }
 }

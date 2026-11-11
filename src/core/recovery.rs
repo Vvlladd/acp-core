@@ -41,6 +41,28 @@ pub struct Outcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Allowance {
+    /// Historical strikes stay attached to the selected lineage.
+    pub retained_strikes: u8,
+    pub strike_limit: u8,
+    /// Every accepted confirmation starts exactly one builder attempt.
+    pub immediate_builder_attempts: u8,
+    /// Further attempts in the selected worktree before its next strike closes the lineage.
+    pub same_lineage_repair_attempts: u8,
+    /// Replacement lineages current policy can still create automatically.
+    pub automatic_replacement_lineages: u8,
+    /// Builder attempts available in those replacement lineages, including their first attempts.
+    pub replacement_builder_attempts: u16,
+    /// The maximum builder attempts in this recovery round, including the immediate attempt.
+    pub maximum_builder_attempts: u16,
+    /// True when any next strike returns directly to human escalation.
+    pub one_shot: bool,
+    /// Bounded human-readable form for clients that do not render the individual counters.
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Candidate {
     pub agent_id: AgentId,
     pub worktree: PathBuf,
@@ -49,6 +71,7 @@ pub struct Candidate {
     pub recorded_files: Vec<String>,
     pub recorded_file_count: Option<usize>,
     pub last_error: Option<String>,
+    pub allowance: Allowance,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +87,55 @@ pub struct Preview {
 
 fn refuse(reason: impl Into<String>) -> CoreError {
     PolicyError::new(PolicyCode::RecoveryUnavailable, reason).into()
+}
+
+fn recovery_allowance(run: &Run, lineage: &LineageState, cfg: &RolesConfig) -> Allowance {
+    let strike_limit = cfg.defaults.strikes_before_replacement;
+    // The immediate attempt may consume the next strike. Only attempts reached after that strike
+    // are repairs, so a lineage at limit - 1 is already a one-shot recovery.
+    let same_lineage_repair_attempts =
+        strike_limit.saturating_sub(lineage.strikes.saturating_add(1));
+
+    // Recovery reopens only the chosen lineage and retains every other lineage as closed. When
+    // the chosen lineage next closes, branch_replace sees all recorded lineages as burnt. Its
+    // existing policy permits a replacement only before the second burnt lineage and maxLineages.
+    let replacement_allowed = run.lineages.len() < 2
+        && run.lineages.len() < usize::from(cfg.defaults.max_lineages);
+    let automatic_replacement_lineages = u8::from(replacement_allowed);
+    let attempts_per_replacement = u16::from(strike_limit.max(1));
+    let replacement_builder_attempts =
+        u16::from(automatic_replacement_lineages) * attempts_per_replacement;
+    let maximum_builder_attempts = 1u16
+        .saturating_add(u16::from(same_lineage_repair_attempts))
+        .saturating_add(replacement_builder_attempts);
+    let one_shot = same_lineage_repair_attempts == 0 && replacement_builder_attempts == 0;
+    let summary = if one_shot {
+        format!(
+            "Retains {} of {} strikes. Confirmation starts 1 builder attempt; no automatic repair or replacement attempt remains, so the next strike escalates this recovery round.",
+            lineage.strikes, strike_limit
+        )
+    } else {
+        format!(
+            "Retains {} of {} strikes. Confirmation starts 1 builder attempt and permits {} same-lineage repair attempt(s) plus {} builder attempt(s) in {} automatic replacement lineage(s), for at most {} builder attempt(s) this recovery round.",
+            lineage.strikes,
+            strike_limit,
+            same_lineage_repair_attempts,
+            replacement_builder_attempts,
+            automatic_replacement_lineages,
+            maximum_builder_attempts
+        )
+    };
+    Allowance {
+        retained_strikes: lineage.strikes,
+        strike_limit,
+        immediate_builder_attempts: 1,
+        same_lineage_repair_attempts,
+        automatic_replacement_lineages,
+        replacement_builder_attempts,
+        maximum_builder_attempts,
+        one_shot,
+        summary,
+    }
 }
 
 impl Core {
@@ -128,6 +200,7 @@ impl Core {
                         .and_then(|id| self.registry.attempt(id))
                         .and_then(|a| a.error.as_ref())
                         .map(|e| e.message.chars().take(1000).collect()),
+                    allowance: recovery_allowance(run, lineage, &self.roles),
                 })
             })
             // Inherited sessions share a draft: keep its newest handle before applying the cap.
@@ -184,30 +257,50 @@ impl Core {
                 "Recovery is available for recorded build tasks only.",
             ));
         }
-        if !self.pending_spawn.is_empty()
-            || !self.pending_worktree.is_empty()
-            || !self.pending_retry.is_empty()
-            || !self.pending_audit.is_empty()
-            || !self.in_flight.is_empty()
-            || !self.settled.is_empty()
-            || !self.gate_waiters.is_empty()
-            || self.supervisor.pending_finalize_count() > 0
-            || !self.supervisor.active_attempts().is_empty()
-        {
-            return Err(refuse("Preparation, finalization or a decision is still in progress. Refresh when it finishes."));
+        let pending = [
+            (!self.pending_spawn.is_empty(), "A worker spawn is still being prepared."),
+            (!self.pending_worktree.is_empty(), "A worktree is still being prepared."),
+            (!self.pending_retry.is_empty(), "A retry worktree check is still in progress."),
+            (!self.pending_audit.is_empty(), "An audit snapshot is still being prepared."),
+            (!self.in_flight.is_empty(), "A finished result is still being processed."),
+            (!self.settled.is_empty(), "A finished result is waiting for its loop decision."),
+            (!self.gate_waiters.is_empty(), "A gate decision is still being finalized."),
+            (
+                self.supervisor.pending_finalize_count() > 0,
+                "Attempt finalization is still in progress.",
+            ),
+            (
+                !self.supervisor.active_attempts().is_empty(),
+                "A worker attempt is still active.",
+            ),
+        ];
+        if let Some((_, reason)) = pending.into_iter().find(|(present, _)| *present) {
+            return Err(refuse(format!("{reason} Refresh when it finishes.")));
         }
         for agent in run
             .agent_ids
             .iter()
             .filter_map(|id| self.registry.agent(id))
         {
-            if agent
+            if let Some(attempt) = agent
                 .attempt_ids
                 .iter()
                 .filter_map(|id| self.registry.attempt(id))
-                .any(|a| !is_terminal(a.status) || !self.dispatched.contains(&a.attempt_id))
+                .find(|a| {
+                    !is_terminal(a.status)
+                        || (!matches!(a.status, AttemptStatus::Cancelled | AttemptStatus::Lost)
+                            && !self.dispatched.contains(&a.attempt_id))
+                })
             {
-                return Err(refuse("Work is still running or its result is being processed. Refresh when it finishes."));
+                let state = if is_terminal(attempt.status) {
+                    "finished but its loop decision is not durable"
+                } else {
+                    "still running"
+                };
+                return Err(refuse(format!(
+                    "Attempt {} is {state}. Refresh when it finishes.",
+                    attempt.attempt_id
+                )));
             }
         }
         let gates: Vec<_> = run

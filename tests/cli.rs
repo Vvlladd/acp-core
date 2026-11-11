@@ -444,6 +444,7 @@ fn fixture_run(state: &Path, repo: &Path, task_id: &str) -> RunId {
         .append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: repo.to_path_buf(),
                 state_dir: state.to_path_buf(),
@@ -488,6 +489,129 @@ fn fixture_run(state: &Path, repo: &Path, task_id: &str) -> RunId {
         )
         .expect("append worktree.created");
     run
+}
+
+#[test]
+fn status_keeps_213_compatible_attempts_visible() {
+    use agent_control_plane::core::types::{AttemptId, AttemptKind, AttemptStatus};
+    let state = short_dir();
+    let repo = temp_git_repo();
+    let run = fixture_run(state.path(), repo.path(), "large-status");
+    let mut registry = Registry::open(state.path()).unwrap();
+    for _ in 0..213 {
+        let agent = AgentId::new_v4();
+        let attempt = AttemptId::new_v4();
+        registry.append(&run, EventPayload::AgentCreated {
+            agent_id: agent, role: RoleName::Reviewer, provider: ProviderName::Codex,
+            model: "gpt-5.6-sol".into(), lineage_id: None, depth: 1,
+            parent_agent_id: None, origin: Origin::ControlPlane, writes: false,
+            cwd: repo.path().into(), worktree: None,
+        }).unwrap();
+        registry.append(&run, EventPayload::AttemptStarted {
+            attempt_id: attempt, agent_id: agent, attempt_kind: AttemptKind::Fresh,
+            dir: state.path().join(attempt.to_string()), argv: vec!["fake-only".into()],
+            cwd: repo.path().into(), pid: 0, pgid: 0, start_time: "fixture".into(),
+            pre_sha: "a".repeat(40), timeout_sec: 60, spawn_budget_usd: 2.0,
+        }).unwrap();
+        registry.append(&run, EventPayload::AttemptFinished {
+            attempt_id: attempt, status: AttemptStatus::Failed, exit_code: Some(1),
+            signal: None, post_sha: None, duration_ms: 1, error: None,
+        }).unwrap();
+    }
+    drop(registry);
+    let output = acp(state.path(), repo.path(), &["status", "--json", &run.to_string()]);
+    output.ok("large compatible status");
+    let value: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(value["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(value["agents"].as_array().unwrap().len(), 214);
+    assert_eq!(value["attempts"].as_array().unwrap().len(), 213);
+    assert_eq!(value["historyIncomplete"], false);
+}
+
+#[test]
+fn status_discloses_incompatible_history_and_execution_replay_refuses_it() {
+    use agent_control_plane::core::types::{AttemptId, AttemptKind};
+    let state = short_dir();
+    let repo = temp_git_repo();
+    let run = fixture_run(state.path(), repo.path(), "unsupported-status");
+    let attempt = AttemptId::new_v4();
+    let mut registry = Registry::open(state.path()).unwrap();
+    let agent = registry.run(&run).unwrap().agent_ids[0];
+    registry.append(&run, EventPayload::AttemptStarted {
+        attempt_id: attempt, agent_id: agent, attempt_kind: AttemptKind::Fresh,
+        dir: state.path().join(attempt.to_string()), argv: vec!["fake-only".into()],
+        cwd: repo.path().into(), pid: 0, pgid: 0, start_time: "fixture".into(),
+        pre_sha: "a".repeat(40), timeout_sec: 60, spawn_budget_usd: 2.0,
+    }).unwrap();
+    drop(registry);
+    let path = state.path().join("runs").join(run.to_string()).join("events.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    lines[0]["execution"] = json!({
+        "version":1, "mode":"build", "steps":{"verify":false,"review":true,"security":false},
+        "assignments":{"builder":{"provider":"codex","model":"gpt-5.6-sol"}},
+        "limits":{"runBudgetUsd":"unlimited"}
+    });
+    let attempt_line = lines.iter_mut().find(|line| line["kind"] == "attempt.started").unwrap();
+    attempt_line["timeoutSec"] = json!("unlimited");
+    attempt_line["spawnBudgetUsd"] = json!("unlimited");
+    let changed = lines.iter().map(|v| format!("{v}\n")).collect::<String>();
+    fs::write(&path, &changed).unwrap();
+    let output = acp(state.path(), repo.path(), &["status", "--json"]);
+    output.ok("inspection remains available");
+    let value: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(value["historyIncomplete"], true);
+    assert_eq!(value["incompatibleEventLines"], 2);
+    assert_eq!(value["compatibility"]["runCreatedRecords"], 1);
+    assert_eq!(value["compatibility"]["attemptStartedRecords"], 1);
+    assert_eq!(value["compatibility"]["runExamples"][0]["runId"], run.to_string());
+    assert_eq!(value["compatibility"]["attemptExamples"][0]["attemptId"], attempt.to_string());
+    let human = acp(state.path(), repo.path(), &["status"]);
+    assert!(human.stdout.contains("incomplete history"));
+    assert!(!human.stdout.contains("no runs recorded"));
+    assert!(matches!(Registry::open(state.path()), Err(
+        agent_control_plane::core::registry::RegistryError::IncompatibleHistory { count: 2 }
+    )));
+    let mut inspected = Registry::open_for_inspection(state.path()).unwrap();
+    assert!(inspected.append(&run, EventPayload::RunStatus_ {
+        status: agent_control_plane::core::types::RunStatus::Running, reason: None,
+    }).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+}
+
+#[test]
+fn serve_refuses_incompatible_history_without_changing_it_or_starting_a_daemon() {
+    let state = short_dir();
+    let repo = repo_with_exclude();
+    let run = fixture_run(state.path(), repo.path(), "unsupported-daemon");
+    let path = state.path().join("runs").join(run.to_string()).join("events.jsonl");
+    let original = fs::read_to_string(&path).unwrap();
+    let incompatible = format!(
+        "{original}{{\"seq\":99,\"runId\":\"{run}\",\"kind\":\"run.created\"}} trailing garbage\n"
+    );
+    fs::write(&path, &incompatible).unwrap();
+
+    let refused = acp(state.path(), repo.path(), &["serve", "--no-mcp"]);
+    assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+    assert!(refused.stderr.contains("matching ACP build"), "{}", refused.stderr);
+    assert!(!state.path().join("serve.lock").exists());
+    assert!(!state.path().join("acp.sock").exists());
+    assert!(!state.path().join("acp.log").exists());
+    assert_eq!(fs::read_to_string(&path).unwrap(), incompatible);
+}
+
+#[test]
+fn serve_accepts_a_compatible_history_with_a_truncated_tail() {
+    let state = short_dir();
+    let repo = repo_with_exclude();
+    let run = fixture_run(state.path(), repo.path(), "truncated-daemon");
+    let path = state.path().join("runs").join(run.to_string()).join("events.jsonl");
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    write!(file, "{{\"seq\":999,\"kind\":\"attempt.started\"").unwrap();
+    drop(file);
+    let mut daemon = Daemon::start_no_mcp(state.path(), repo.path());
+    daemon.signal(nix::sys::signal::Signal::SIGTERM);
+    assert_eq!(daemon.wait("stop truncated-tail daemon"), Some(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +1096,7 @@ fn fixture_lineages(state: &Path, repo: &Path) -> (RunId, PathBuf, PathBuf) {
         .append(
             &run,
             EventPayload::RunCreated {
+                run_budget_usd: None,
                 execution: None,
                 repo_root: repo.to_path_buf(),
                 state_dir: state.to_path_buf(),

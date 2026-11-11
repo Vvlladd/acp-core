@@ -317,6 +317,7 @@ mod tests {
             description: "a description".to_string(),
             files: vec![],
             acceptance: vec!["done".to_string()],
+            evidence: None,
         }
     }
 

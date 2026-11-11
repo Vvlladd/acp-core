@@ -254,6 +254,7 @@ fn task(title: &str, description: &str) -> Task {
         description: description.to_string(),
         files: vec!["tests/actor.rs".to_string()],
         acceptance: vec!["cargo test --test actor exits 0".to_string()],
+        evidence: None,
     }
 }
 
@@ -468,6 +469,7 @@ async fn spawn_hanging_worker(
             worktree,
             provider: ProviderName::Claude,
             sandboxed: true,
+            evidence: false,
             state_dir,
             prompt_index,
         },
@@ -1936,6 +1938,116 @@ async fn end_attempt(core: &mut Core, agent: AgentId) {
     let _ = reply.await;
 }
 
+/// A delegate resume must deliver the caller's new instructions, not replay the original task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegate_resume_delivers_the_new_task_to_the_worker() {
+    install_fake_clis();
+    let state = common::temp_state_dir();
+    let state_path = state.path().join("state");
+    std::fs::create_dir(&state_path).unwrap();
+    let repo = common::temp_git_repo();
+    let Wiring {
+        mut core,
+        rx: _,
+        signals: _,
+    } = wire(&state_path, repo.path());
+    let run = seed_run(&mut core, repo.path(), "ORIGINAL task title");
+    let agent = seed_agent(&mut core, &run, repo.path());
+    seed_lineage(&mut core, &run, agent, repo.path());
+    let previous = finish_attempt(&mut core, &run, agent);
+    // The previous turn was already dispatched before this human follow-up.
+    core.registry.append(&run, EventPayload::LoopDispatched {
+        attempt_id: previous,
+        branch: LoopBranch::Gate,
+    }).expect("previous builder turn is settled");
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentSession {
+                agent_id: agent,
+                attempt_id: previous,
+                session_id: "followup-session".into(),
+                src_line: 1,
+            },
+        )
+        .unwrap();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentStatusChanged {
+                agent_id: agent,
+                status: AgentStatus::Idle,
+                reason: None,
+            },
+        )
+        .unwrap();
+    // Reopen the seeded log so the actor loads the previous dispatch into its in-memory set,
+    // just as it would after completing that turn or restarting the daemon.
+    drop(core);
+    let Wiring { mut core, mut rx, signals: _signals } = wire(&state_path, repo.path());
+    let (evidence, _evidence_owner) =
+        import_actor_evidence(&core.repo_root, core.registry.state_dir());
+    let mut followup = task("NEW task title", "Implement the NEW follow-up instructions");
+    followup.files = vec!["new-followup.rs".into()];
+    followup.acceptance = vec!["Check the NEW acceptance criterion".into()];
+    followup.evidence = Some(evidence.clone());
+    let out = core
+        .delegate(DelegateRequest {
+            run_id: Some(run),
+            role: RoleName::Builder,
+            task: followup,
+            model: None,
+            session: SessionSpec::Resume(agent),
+            base_ref: None,
+            worktree: None,
+            steps: None,
+            caller_run_id: None,
+        })
+        .unwrap();
+    let validated = tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .expect("evidence validation completed")
+        .expect("mailbox is open");
+    assert!(matches!(
+        &validated,
+        Command::EvidenceValidated { attempt, result: Ok(()), .. } if *attempt == out.attempt_id
+    ));
+    core.handle_command(validated).await;
+    let cmd = tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .expect("resume spawn completed")
+        .expect("mailbox is open");
+    let command_debug = format!("{cmd:?}");
+    let spawn_ok = matches!(&cmd, Command::SpawnReady { attempt, result }
+        if *attempt == out.attempt_id && result.is_ok());
+    core.handle_command(cmd).await;
+    // Stop the fake child before any filesystem read or content assertion can fail.
+    end_attempt(&mut core, agent).await;
+    assert!(spawn_ok, "{command_debug}");
+    let prompt = std::fs::read_to_string(
+        state_path
+            .join("runs")
+            .join(run.as_uuid().simple().to_string())
+            .join("attempts")
+            .join(out.attempt_id.as_uuid().simple().to_string())
+            .join("prompt.txt"),
+    )
+    .unwrap();
+    for expected in [
+        "NEW task title",
+        "NEW follow-up instructions",
+        "new-followup.rs",
+        "NEW acceptance criterion",
+    ] {
+        assert!(
+            prompt.contains(expected),
+            "worker prompt lost {expected}: {prompt}"
+        );
+    }
+    assert!(!prompt.contains("ORIGINAL task title"));
+    assert!(prompt.contains(&evidence.bundle_id));
+}
+
 /// One attempt of `agent` that started, learned a session, and then failed — the log a 17b strike
 /// is written over.
 fn fail_attempt_with_session(
@@ -2186,4 +2298,238 @@ async fn a_worktree_status_that_arrives_after_the_run_was_blocked_starts_nothing
     // reconciler is free to decide about it once the run is running again.
     core.reconcile_intents();
     assert_quiet(&mut rx, "and a reconciler leaves a blocked run alone too").await;
+}
+
+struct ActorEvidenceOwner {
+    _owner: TempDir,
+    root: PathBuf,
+}
+
+impl Drop for ActorEvidenceOwner {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&self.root, &self.root.join("files")] {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
+fn import_actor_evidence(
+    repo: &Path,
+    state: &Path,
+) -> (
+    Box<agent_control_plane::workspace::evidence::EvidenceReference>,
+    ActorEvidenceOwner,
+) {
+    use sha2::{Digest, Sha256};
+    let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let input = owner.path().join("source-input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("source.txt"), b"original source").unwrap();
+    let path = input.join("bundle.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+        "version":1,"title":"admission evidence","sources":[{
+            "file":"source.txt","url":"https://example.test/source","retrievedAt":"2026-11-10T12:30:00Z",
+            "provenance":"installed_version","sha256":format!("{:x}",Sha256::digest(b"original source"))
+        }]
+    })).unwrap()).unwrap();
+    let installed = agent_control_plane::workspace::evidence::import(repo, state, &path).unwrap();
+    let reference = installed.reference(repo, state).unwrap();
+    let guard = ActorEvidenceOwner {
+        _owner: owner,
+        root: reference.root.clone(),
+    };
+    (Box::new(reference), guard)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn altered_durable_evidence_blocks_resume_and_restart_before_a_worker_starts() {
+    use std::os::unix::fs::PermissionsExt;
+    install_fake_clis();
+    for restart in [false, true] {
+        for remove in [false, true] {
+            let state = common::temp_state_dir();
+            let state_path = state.path().join("state");
+            std::fs::create_dir(&state_path).unwrap();
+            let repo = common::temp_git_repo();
+            let Wiring {
+                mut core,
+                mut rx,
+                signals: _signals,
+            } = wire(&state_path, repo.path());
+            let run = seed_run(&mut core, repo.path(), "durable evidence admission");
+            let (evidence, _evidence_owner) =
+                import_actor_evidence(&core.repo_root, core.registry.state_dir());
+            core.registry
+                .append(
+                    &run,
+                    EventPayload::TaskEvidenceUpdated {
+                        evidence: evidence.clone(),
+                    },
+                )
+                .unwrap();
+            let agent = seed_agent(&mut core, &run, repo.path());
+            seed_lineage(&mut core, &run, agent, repo.path());
+            if !restart {
+                // Seed the durable idle session without an unrelated unfinished loop decision.
+                let previous = AttemptId::new_v4();
+                core.registry
+                    .append(
+                        &run,
+                        EventPayload::AgentSession {
+                            agent_id: agent,
+                            attempt_id: previous,
+                            session_id: "evidence-session".into(),
+                            src_line: 1,
+                        },
+                    )
+                    .unwrap();
+                core.registry
+                    .append(
+                        &run,
+                        EventPayload::AgentStatusChanged {
+                            agent_id: agent,
+                            status: AgentStatus::Idle,
+                            reason: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            let source = evidence.root.join("files/source.txt");
+            if remove {
+                std::fs::set_permissions(
+                    evidence.root.join("files"),
+                    std::fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+                std::fs::remove_file(&source).unwrap();
+            } else {
+                std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(&source, "changed after attachment").unwrap();
+            }
+            let _restart_signals;
+            if restart {
+                drop(core);
+                let wired = wire(&state_path, repo.path());
+                core = wired.core;
+                rx = wired.rx;
+                _restart_signals = Some(wired.signals);
+            } else {
+                _restart_signals = None;
+                core.delegate(DelegateRequest {
+                    run_id: Some(run),
+                    role: RoleName::Builder,
+                    task: task("new instruction", "Resume using the durable evidence"),
+                    model: None,
+                    session: SessionSpec::Resume(agent),
+                    base_ref: None,
+                    worktree: None,
+                    steps: None,
+                    caller_run_id: None,
+                })
+                .unwrap();
+            }
+            let cmd = tokio::time::timeout(LIMIT, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            core.handle_command(cmd).await;
+            let attempt = core
+                .registry
+                .agent(&agent)
+                .unwrap()
+                .attempt_ids
+                .last()
+                .copied()
+                .unwrap();
+            let (pid, status) = {
+                let a = core.registry.attempt(&attempt).unwrap();
+                (a.pid, a.status)
+            };
+            if pid.is_some_and(|pid| pid != 0) {
+                end_attempt(&mut core, agent).await;
+            }
+            assert_eq!(
+                pid,
+                Some(0),
+                "invalid durable evidence launched a real worker"
+            );
+            assert_eq!(status, AttemptStatus::Escalate);
+            assert_eq!(core.registry.run(&run).unwrap().status, RunStatus::Blocked);
+            let strikes: Vec<_> = core
+                .registry
+                .events(&run, None, usize::MAX)
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    EventPayload::LineageStrike { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                strikes.is_empty(),
+                "restart={restart} remove={remove}: {strikes:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_run_during_evidence_validation_prevents_process_launch() {
+    install_fake_clis();
+    let state = common::temp_state_dir();
+    let state_path = state.path().join("state");
+    std::fs::create_dir(&state_path).unwrap();
+    let repo = common::temp_git_repo();
+    let Wiring {
+        mut core,
+        mut rx,
+        signals: _signals,
+    } = wire(&state_path, repo.path());
+    let run = seed_run(&mut core, repo.path(), "evidence admission cancellation");
+    let (evidence, _evidence_owner) =
+        import_actor_evidence(&core.repo_root, core.registry.state_dir());
+    core.registry
+        .append(&run, EventPayload::TaskEvidenceUpdated { evidence })
+        .unwrap();
+    let agent = seed_agent(&mut core, &run, repo.path());
+    seed_lineage(&mut core, &run, agent, repo.path());
+    core.reconcile_intents();
+    let ready = tokio::time::timeout(LIMIT, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &ready,
+        Command::EvidenceValidated { result: Ok(()), .. }
+    ));
+    core.registry
+        .append(
+            &run,
+            EventPayload::RunStatus_ {
+                status: RunStatus::Cancelled,
+                reason: Some("human cancelled before provider admission".into()),
+            },
+        )
+        .unwrap();
+    core.handle_command(ready).await;
+    let attempt = core
+        .registry
+        .agent(&agent)
+        .unwrap()
+        .attempt_ids
+        .last()
+        .unwrap();
+    let record = core.registry.attempt(attempt).unwrap();
+    assert_eq!(record.pid, Some(0));
+    assert_eq!(record.status, AttemptStatus::Cancelled);
+    assert_eq!(
+        core.registry.run(&run).unwrap().status,
+        RunStatus::Cancelled
+    );
+    core.reconcile_intents();
+    assert_quiet(
+        &mut rx,
+        "cancelled evidence validation must never launch a provider",
+    )
+    .await;
 }

@@ -51,6 +51,7 @@ fn task() -> Task {
         description: "one test per reachable PolicyCode".into(),
         files: vec!["tests/policy.rs".into()],
         acceptance: vec!["cargo test --test policy exits 0".into()],
+        evidence: None,
     }
 }
 

@@ -221,7 +221,13 @@ pub enum Cmd {
         /// Base ref for a new run's worktree.
         #[arg(long)]
         base_ref: Option<String>,
+        /// Immutable host-imported evidence bundle to attach.
+        #[arg(long, value_name = "SHA256")]
+        evidence: Option<String>,
     },
+    /// Import or inspect immutable host-supplied offline evidence.
+    #[command(subcommand)]
+    Evidence(EvidenceCmd),
     /// Start the daemon detached, or report the one already running. Idempotent: a live daemon
     /// answers exit 0, and the lock decides every race.
     Up {
@@ -356,6 +362,14 @@ pub enum SessionCmd {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+pub enum EvidenceCmd {
+    /// Import a local bounded manifest and its relative source files through the host socket.
+    Import { manifest: PathBuf },
+    /// Revalidate and show an installed bundle.
+    Show { bundle_id: String },
+}
+
 /// Runs one subcommand and answers with the process's exit code.
 ///
 /// # Errors
@@ -399,6 +413,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             run_id,
             session,
             base_ref,
+            evidence,
         } => {
             let params = delegate_params(
                 role,
@@ -410,8 +425,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
                 run_id,
                 session,
                 base_ref,
+                evidence,
             );
             call_socket(repo, "delegate", params).await
+        }
+        Cmd::Evidence(EvidenceCmd::Import { manifest }) => {
+            // Make the path unambiguous to the daemon without following any component: the
+            // evidence importer must still be able to see and reject symlinks.
+            let manifest = absolute_without_resolving(manifest)?;
+            call_socket(repo, "evidence.import", json!({"manifest": manifest})).await
+        }
+        Cmd::Evidence(EvidenceCmd::Show { bundle_id }) => {
+            call_socket(repo, "evidence.show", json!({"bundleId": bundle_id})).await
         }
         Cmd::Start => start(repo).await,
         Cmd::App { run_id, print } => open_task_app(repo, run_id, print).await,
@@ -467,6 +492,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             call_socket(repo, "cancel", json!({ "agentId": agent_id })).await
         }
     }
+}
+
+fn absolute_without_resolving(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() { return Ok(path); }
+    Ok(std::env::current_dir()
+        .context("resolving the current directory for evidence import")?
+        .join(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +674,7 @@ fn delegate_params(
     run_id: Option<String>,
     session: Option<String>,
     base_ref: Option<String>,
+    evidence: Option<String>,
 ) -> Value {
     let task_id = task_id.unwrap_or_else(|| {
         let epoch = std::time::SystemTime::now()
@@ -669,6 +702,9 @@ fn delegate_params(
     }
     if let Some(base_ref) = base_ref {
         params["baseRef"] = json!(base_ref);
+    }
+    if let Some(evidence) = evidence {
+        params["evidenceBundleId"] = json!(evidence);
     }
     params
 }
@@ -2898,6 +2934,19 @@ mod tests {
         let err = check_socket_path(&long).expect_err("over the limit");
         assert!(format!("{err}").contains("ACP_STATE_DIR"), "{err}");
         assert!(check_socket_path(Path::new("/tmp/acp/acp.sock")).is_ok());
+    }
+
+    #[test]
+    fn evidence_import_path_becomes_absolute_without_following_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("manifest.json");
+        let link = dir.path().join("manifest-link.json");
+        fs::write(&target, b"{}").unwrap();
+        symlink(&target, &link).unwrap();
+        let prepared = absolute_without_resolving(link.clone()).unwrap();
+        assert_eq!(prepared, link);
+        assert!(fs::symlink_metadata(prepared).unwrap().file_type().is_symlink());
     }
 
     #[test]

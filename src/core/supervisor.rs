@@ -146,6 +146,9 @@ pub struct ArgvCtx<'a> {
     ///
     /// [`RoleSpec::requires_sandbox`]: crate::core::types::RoleSpec::requires_sandbox
     pub sandboxed: bool,
+    /// The task prompt names a host-owned immutable evidence bundle. Such a path may only be
+    /// disclosed when this exact process plan has an enforced write boundary around it.
+    pub evidence: bool,
     pub state_dir: &'a Path,
     /// The adapter-declared prompt token in [`SpawnPlan::argv`]. Only this position is exempt from
     /// denied-substring scanning, and it is still refused when it begins with `-` so the provider
@@ -167,6 +170,9 @@ pub struct ArgvCtx<'a> {
 ///    pinned by `cwd == worktree` (`check_codex_sandbox_shape`). Otherwise
 ///    [`PolicyCode::SandboxMissing`]: a builder or verifier never runs unsandboxed, and never
 ///    with a wider writable set than the worktree it works in.
+///    An evidence-bearing non-writing process is also provider-shaped: Codex must positively carry
+///    its `read-only` mode, while Claude is refused because its ordinary non-writing profile has
+///    no verified filesystem write boundary.
 /// 3. **Paths stay home** — every argv token that *is* a filesystem path, and every
 ///    [`SpawnPlan::write_files`] destination `spawn_detached` will create, resolves inside
 ///    `ctx.state_dir` or `ctx.worktree` ([`PolicyCode::UnsafeArgv`]).
@@ -202,6 +208,22 @@ pub fn assert_safe_argv(
     check_env(&mut plan, ctx)?;
     plan.file = resolve_program(&plan, ctx)?;
     Ok(CheckedPlan(plan))
+}
+
+/// Admission guard used before provider preflight: an attachment must not be disclosed to a
+/// non-writing provider profile unless that provider has a checked read-only route. The argv
+/// chokepoint separately verifies the concrete Codex read-only flags.
+pub(crate) fn check_evidence_route(
+    provider: ProviderName,
+    sandboxed: bool,
+) -> Result<(), PolicyError> {
+    if provider == ProviderName::Claude && !sandboxed {
+        return Err(PolicyError::new(
+            PolicyCode::SandboxMissing,
+            "offline evidence cannot be attached to this Claude read-only role: its current provider profile has no verified read-only filesystem route; use a supported confined Codex worker or remove the attachment",
+        ));
+    }
+    Ok(())
 }
 
 /// Check 1: the deny-list.
@@ -248,6 +270,19 @@ fn check_sandbox(plan: &SpawnPlan, ctx: &ArgvCtx<'_>) -> Result<(), PolicyError>
         crate::providers::codex::lead::check_plan(plan, ctx.worktree, ctx.state_dir, ctx.lead_run_id)?;
     }
     if !ctx.sandboxed {
+        if ctx.evidence {
+            return match ctx.provider {
+                // Codex's read-only seatbelt is the supported evidence-consumer route. Assert the
+                // positive shape, rather than merely checking that workspace-write is absent.
+                ProviderName::Codex => check_codex_read_only_shape(plan, ctx),
+                // Claude's ordinary non-writing profile is a tool allowlist, not an independently
+                // verified filesystem write boundary. Do not disclose the attachment to it.
+                ProviderName::Claude => Err(PolicyError::new(
+                    PolicyCode::SandboxMissing,
+                    "offline evidence cannot be attached to this Claude read-only role: its current provider profile has no verified read-only filesystem route; use a supported confined Codex worker or remove the attachment",
+                )),
+            };
+        }
         // Defence-in-depth: a read-only codex plan carrying the workspace-write MODE is a
         // confused plan — refuse it rather than let a mislabeled context widen a seatbelt.
         // Flag-position-aware on purpose, never a substring scan: worker-authored free text
@@ -293,6 +328,60 @@ fn check_sandbox(plan: &SpawnPlan, ctx: &ArgvCtx<'_>) -> Result<(), PolicyError>
         }
         ProviderName::Codex => check_codex_sandbox_shape(plan, ctx),
     }
+}
+
+/// Evidence-bearing non-writing Codex processes must positively select the provider's read-only
+/// seatbelt. This applies to fresh and resume argv (resume omits `-s`, but retains the `-c` pair)
+/// and to the specialized lead adapter.
+fn check_codex_read_only_shape(plan: &SpawnPlan, ctx: &ArgvCtx<'_>) -> Result<(), PolicyError> {
+    let has_config = |required: &str| {
+        plan.argv.iter().zip(plan.argv.iter().skip(1)).any(|(flag, value)| {
+            (flag == "-c" || flag == "--config") && value == required
+        })
+    };
+    for (required, label) in [
+        (r#"sandbox_mode="read-only""#, "read-only sandbox mode"),
+        (r#"approval_policy="never""#, "never approval policy"),
+    ] {
+        if !has_config(required) {
+            return Err(PolicyError::new(
+                PolicyCode::SandboxMissing,
+                format!("an evidence-consuming Codex role must carry its {label}"),
+            ));
+        }
+    }
+    if ctx.role != RoleName::Lead && !has_config("mcp_servers={}") {
+        return Err(PolicyError::new(
+            PolicyCode::SandboxMissing,
+            "an evidence-consuming Codex worker must carry an empty MCP catalog",
+        ));
+    }
+    if !plan.argv.iter().any(|token| token == "--ignore-user-config") {
+        return Err(PolicyError::new(
+            PolicyCode::SandboxMissing,
+            "an evidence-consuming Codex role must ignore user configuration",
+        ));
+    }
+    if let Some(at) = plan.argv.iter().position(|token| token == "-s" || token == "--sandbox") {
+        if plan.argv.get(at + 1).map(String::as_str) != Some("read-only") {
+            return Err(PolicyError::new(
+                PolicyCode::SandboxMissing,
+                "an evidence-consuming Codex sandbox flag must name read-only",
+            ));
+        }
+    }
+    let cwd = plan.cwd.canonicalize().unwrap_or_else(|_| plan.cwd.clone());
+    let worktree = ctx
+        .worktree
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.worktree.to_path_buf());
+    if cwd != worktree {
+        return Err(PolicyError::new(
+            PolicyCode::SandboxMissing,
+            "an evidence-consuming Codex role must run from its recorded working directory",
+        ));
+    }
+    Ok(())
 }
 
 /// The measured codex confinement set, asserted item by item so a refusal names what is missing.
@@ -3580,6 +3669,7 @@ mod tests {
                     description: "apply a report".into(),
                     files: vec![],
                     acceptance: vec![],
+                    evidence: None,
                 },
                 version: 1,
                 lead: None,

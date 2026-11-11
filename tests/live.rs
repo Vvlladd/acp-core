@@ -119,6 +119,7 @@ async fn run_checked(
             worktree,
             provider: adapter.name(),
             sandboxed,
+            evidence: false,
             state_dir,
             prompt_index,
         },
@@ -1785,6 +1786,7 @@ async fn exercise_live_plan_sequence(world: Arc<LoopWorld>, handle: CoreHandle) 
                         .into(),
                     files: vec!["src/one.ts".into()],
                     acceptance: vec!["add(1, 2) === 3".into()],
+                    evidence: None,
                 },
             ),
             item(
@@ -1797,6 +1799,7 @@ async fn exercise_live_plan_sequence(world: Arc<LoopWorld>, handle: CoreHandle) 
                         .into(),
                     files: vec!["src/two.ts".into()],
                     acceptance: vec!["twice(4) === 8".into()],
+                    evidence: None,
                 },
             ),
         ],

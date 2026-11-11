@@ -36,7 +36,8 @@ use crate::core::policy::{self, DelegateRequest, PolicyCode, PolicyCtx, PolicyEr
 use crate::core::registry::PlanProjection;
 use crate::core::registry::{AuditEntry, Registry};
 use crate::core::supervisor::{
-    assert_safe_argv, ArgvCtx, AttemptContext, SpawnError, SpawnedProc, Supervisor,
+    assert_safe_argv, check_evidence_route, ArgvCtx, AttemptContext, SpawnError, SpawnedProc,
+    Supervisor,
 };
 use crate::core::team::{self, Effort, ValidTeam};
 use crate::core::types::{
@@ -377,7 +378,10 @@ impl Core {
     }
 
     pub fn spawn_lead_with_setup(
-        &mut self, task: Task, message: String, setup: super::LeadSetup,
+        &mut self,
+        task: Task,
+        message: String,
+        setup: super::LeadSetup,
     ) -> Result<(RunId, AgentId), CoreError> {
         if let Some(agent) = self.live_lead_agent() {
             return Err(CoreError::Policy(
@@ -389,12 +393,20 @@ impl Core {
             ));
         }
         let role = loader::role_spec(&self.roles, RoleName::Lead)
-            .map_err(|err| PolicyError::new(PolicyCode::UnknownRole, err.to_string()))?.clone();
+            .map_err(|err| PolicyError::new(PolicyCode::UnknownRole, err.to_string()))?
+            .clone();
         let spawn_budget_usd = role.spawn_budget_usd;
         let team = self.valid_team()?;
-        if setup.expected_team.as_ref().is_some_and(|expected| team.as_ref().map(|t| t.team()) != Some(expected)) {
-            return Err(PolicyError::new(PolicyCode::TeamInvalid,
-                "the saved team changed during setup; review the choices and start again").into());
+        if setup
+            .expected_team
+            .as_ref()
+            .is_some_and(|expected| team.as_ref().map(|t| t.team()) != Some(expected))
+        {
+            return Err(PolicyError::new(
+                PolicyCode::TeamInvalid,
+                "the saved team changed during setup; review the choices and start again",
+            )
+            .into());
         }
         // v1/v2 lead was informational. Only explicit v3 setup chooses a spawned provider.
         let selected = team.as_ref().filter(|t| t.team().version >= 3);
@@ -402,22 +414,39 @@ impl Core {
         let provider = assignment.provider;
         let model = assignment.model.clone();
         if !role.models.contains(&model)
-            || !self.roles.providers.get(&provider).is_some_and(|p| p.models.contains(&model)) {
+            || !self
+                .roles
+                .providers
+                .get(&provider)
+                .is_some_and(|p| p.models.contains(&model))
+        {
             return Err(CoreError::Policy(PolicyError::new(
-                PolicyCode::UnknownModel, "the selected lead model is outside the role catalog")));
+                PolicyCode::UnknownModel,
+                "the selected lead model is outside the role catalog",
+            )));
         }
         let mut execution = team::capture_execution(&self.roles, team.as_ref());
-        execution.assignments.insert("lead".into(), assignment.clone());
+        execution
+            .assignments
+            .insert("lead".into(), assignment.clone());
         if execution.mode == RunMode::Audit {
-            let selection = setup.audit_selection.ok_or_else(|| PolicyError::new(
-                PolicyCode::InvalidBaseRef, "choose an explicit audit base and target before starting"))?;
+            let selection = setup.audit_selection.ok_or_else(|| {
+                PolicyError::new(
+                    PolicyCode::InvalidBaseRef,
+                    "choose an explicit audit base and target before starting",
+                )
+            })?;
             audit::validate_selection(&selection)?;
             execution.authorized_audit_selection = Some(selection);
         } else if setup.audit_selection.is_some() {
-            return Err(PolicyError::new(PolicyCode::TeamInvalid,
-                "audit input applies only to a task with checks and no builder").into());
+            return Err(PolicyError::new(
+                PolicyCode::TeamInvalid,
+                "audit input applies only to a task with checks and no builder",
+            )
+            .into());
         }
-        let message = lead_setup_prompt(&message, Some(&execution));
+        let message =
+            handoff::build_lead_prompt(&lead_setup_prompt(&message, Some(&execution)), &task);
         let run = RunId::new_v4();
         let agent = AgentId::new_v4();
         let attempt = AttemptId::new_v4();
@@ -647,37 +676,102 @@ impl Core {
     /// for a fresh `reviewer` delegation, which only the control plane may start.
     pub fn delegate(&mut self, req: DelegateRequest) -> Result<DelegateOut, CoreError> {
         if self.caller_without_builder(req.caller_run_id) {
-            return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
-                "this lead's recorded task has no builder").into());
+            return Err(PolicyError::new(
+                PolicyCode::DelegationNotAllowed,
+                "this lead's recorded task has no builder",
+            )
+            .into());
         }
-        let inherited = req.caller_run_id
-            .and_then(|id| self.registry.run(&id)).and_then(|r| r.execution.clone());
+        let inherited = req
+            .caller_run_id
+            .and_then(|id| self.registry.run(&id))
+            .and_then(|r| r.execution.clone());
         if inherited.as_ref().is_some_and(|e| e.mode != RunMode::Build) {
-            return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
-                "this lead's task has no writing workers; start a separately configured task").into());
+            return Err(PolicyError::new(
+                PolicyCode::DelegationNotAllowed,
+                "this lead's task has no writing workers; start a separately configured task",
+            )
+            .into());
         }
         self.delegate_with_execution(req, inherited)
     }
 
-    fn delegate_with_execution(&mut self, req: DelegateRequest, inherited: Option<RunExecution>) -> Result<DelegateOut, CoreError> {
+    fn delegate_with_execution(
+        &mut self,
+        req: DelegateRequest,
+        inherited: Option<RunExecution>,
+    ) -> Result<DelegateOut, CoreError> {
         let cfg = Arc::clone(&self.roles);
         let captured = self.request_execution(&req).cloned().or(inherited);
         let team = match captured.as_ref() {
-            Some(execution) => Some(team::from_execution(&cfg, execution).map_err(|issues|
-                PolicyError::new(PolicyCode::TeamInvalid, format!("recorded team is unsupported: {issues:?}")))?),
+            Some(execution) => Some(team::from_execution(&cfg, execution).map_err(|issues| {
+                PolicyError::new(
+                    PolicyCode::TeamInvalid,
+                    format!("recorded team is unsupported: {issues:?}"),
+                )
+            })?),
             None => self.valid_team()?,
         };
-        if team.as_ref().is_some_and(|team| team.mode() != RunMode::Build) {
+        if team
+            .as_ref()
+            .is_some_and(|team| team.mode() != RunMode::Build)
+        {
             return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
                 "planning and audit cannot use build delegation or resume; audit checks use the snapshot dispatcher").into());
         }
-        if let Some(assignment) = captured.as_ref().and_then(|e| e.assignments.get(role_key(req.role))) {
+        if let Some(assignment) = captured
+            .as_ref()
+            .and_then(|e| e.assignments.get(role_key(req.role)))
+        {
             if req.model.as_ref().is_some_and(|m| m != &assignment.model) {
-                return Err(PolicyError::new(PolicyCode::UnknownModel,
-                    "a task keeps its recorded model assignment").into());
+                return Err(PolicyError::new(
+                    PolicyCode::UnknownModel,
+                    "a task keeps its recorded model assignment",
+                )
+                .into());
             }
         }
         let digest = format!("{}:{}", role_key(req.role), req.task.id);
+
+        // Evidence updates are an actor-atomic admission decision. Resolve a resume's real run
+        // from the agent rather than trusting an optional runId, and include work that is still
+        // preparing so a bundle cannot race a pending attempt.
+        let effective_run = match req.session {
+            SessionSpec::Resume(agent) => self.registry.agent(&agent).map(|handle| handle.run_id),
+            SessionSpec::Fresh => req.run_id,
+        };
+        if let (SessionSpec::Resume(_), Some(claimed), Some(actual)) =
+            (req.session, req.run_id, effective_run)
+        {
+            if claimed != actual {
+                let err = PolicyError::new(
+                    PolicyCode::InvalidTask,
+                    "runId does not match the resumed agent's run",
+                );
+                return Err(self.reject("delegate", &digest, err));
+            }
+        }
+        if req.task.evidence.is_some()
+            && effective_run.is_some_and(|run| {
+                self.registry
+                    .run(&run)
+                    .is_some_and(|record| self.run_is_busy(record))
+                    || self
+                        .pending_worktree
+                        .values()
+                        .any(|pending| pending.run == run)
+                    || self
+                        .pending_spawn
+                        .values()
+                        .any(|pending| pending.ctx.run == run)
+            })
+        {
+            let err = PolicyError::new(
+                PolicyCode::WorktreeBusy,
+                "a new evidence version requires an idle continuation and is never sent concurrently",
+            );
+            return Err(self.reject("delegate", &digest, err));
+        }
 
         let decided = {
             let ctx = PolicyCtx {
@@ -723,19 +817,44 @@ impl Core {
             return Err(self.reject("delegate", &digest, err));
         }
 
-        let mut execution = captured.unwrap_or_else(|| team::capture_execution(&cfg, team.as_ref()));
+        let mut execution =
+            captured.unwrap_or_else(|| team::capture_execution(&cfg, team.as_ref()));
         execution.steps = req.steps.unwrap_or(execution.steps);
-        execution.assignments.insert(role_key(req.role).into(), team::Assignment {
-            provider: resolved.provider, model: resolved.model.clone(), effort: resolved.effort,
-        });
+        execution.assignments.insert(
+            role_key(req.role).into(),
+            team::Assignment {
+                provider: resolved.provider,
+                model: resolved.model.clone(),
+                effort: resolved.effort,
+            },
+        );
         let run = req.run_id.unwrap_or_else(RunId::new_v4);
         let new_run = self.registry.run(&run).is_none();
+        let (task, evidence_update) = if new_run {
+            (req.task.clone(), None)
+        } else {
+            self.task_for_existing_run(run, &req.task, &digest)?
+        };
+        // Resolve and validate the final frozen task before making an evidence update durable.
+        // Existing-run continuations use this exact provider/writes profile when the worktree
+        // helper returns, so a route refusal must leave both the task and attempt history alone.
+        if task.evidence.is_some() {
+            check_evidence_route(
+                resolved.provider,
+                crate::core::types::requires_sandbox(req.role, resolved.writes),
+            )
+            .map_err(|err| self.reject("delegate", &digest, err))?;
+        }
+        if let Some(evidence) = evidence_update {
+            self.registry
+                .append(&run, EventPayload::TaskEvidenceUpdated { evidence })?;
+        }
         let agent = AgentId::new_v4();
         let attempt = AttemptId::new_v4();
         let lineage = LineageId::new_v4();
         let worktree = worktree_path(&self.repo_root, &run, &agent);
         let branch = branch_name(&run, &agent);
-        let prompt = handoff::build_builder_prompt(&req.task, &schema_hint(req.role));
+        let prompt = handoff::build_builder_prompt(&task, &schema_hint(req.role));
 
         self.pending_worktree.insert(
             lineage,
@@ -757,7 +876,7 @@ impl Core {
                 worktree: worktree.clone(),
                 base_ref: resolved.base_ref.clone(),
                 run_budget_usd: cfg.defaults.run_budget_usd,
-                task: req.task.clone(),
+                task,
                 prompt,
                 lead: team.as_ref().and_then(lead_label),
                 team_name: team.as_ref().map(|t| t.name().to_string()),
@@ -773,7 +892,12 @@ impl Core {
             },
         );
         if !new_run {
-            self.record_delegation(validated_caller, run, Some(req.role), DelegatedTarget::Worker);
+            self.record_delegation(
+                validated_caller,
+                run,
+                Some(req.role),
+                DelegatedTarget::Worker,
+            );
         }
         self.spawn_worktree_from_ref(
             lineage,
@@ -790,6 +914,42 @@ impl Core {
             status: RunStatus::Running,
             worktree,
         })
+    }
+
+    // Preserve the caller's continuation instructions. Only evidence is inherited from the
+    // authoritative run. This only proposes an update: the caller validates the final provider
+    // route before appending it, so a denied continuation cannot mutate durable task identity.
+    fn task_for_existing_run(
+        &mut self,
+        run: RunId,
+        requested: &Task,
+        digest: &str,
+    ) -> Result<(Task, Option<Box<crate::workspace::evidence::EvidenceReference>>), CoreError> {
+        let current = self
+            .registry
+            .run(&run)
+            .ok_or(CoreError::UnknownRun(run))?
+            .task
+            .evidence
+            .clone();
+        let update = if let Some(evidence) = requested.evidence.as_ref() {
+            if current
+                .as_ref()
+                .is_some_and(|old| old.bundle_id == evidence.bundle_id && old != evidence)
+            {
+                let err = PolicyError::new(
+                    PolicyCode::InvalidTask,
+                    "the supplied evidence metadata conflicts with the durable bundle identity",
+                );
+                return Err(self.reject("delegate", digest, err));
+            }
+            (current.as_ref() != Some(evidence)).then(|| evidence.clone())
+        } else {
+            None
+        };
+        let mut task = requested.clone();
+        task.evidence = update.clone().or(current);
+        Ok((task, update))
     }
 
     /// `delegate{session:"resume:<uuid>"}`: the task goes to a session that already exists, in the
@@ -814,18 +974,66 @@ impl Core {
             );
             return Err(self.reject("delegate", digest, err));
         };
-        let (run, worktree) = (
+        let resumed_role = handle.role;
+        let (run, worktree, recorded_provider, recorded_writes) = (
             handle.run_id,
             handle
                 .worktree
                 .clone()
                 .unwrap_or_else(|| handle.cwd.clone()),
+            handle.provider,
+            handle.writes,
         );
+        // Fully validate resumability before accepting a durable update. The actor owns this
+        // check+append+spawn sequence, so another attempt cannot become active between them.
+        let cfg = Arc::clone(&self.roles);
+        let resumable = policy::check_send_message(
+            &agent,
+            &PolicyCtx {
+                registry: &self.registry,
+                cfg: &cfg,
+                caller_role: RoleName::Lead,
+                caller_depth: 0,
+                now: epoch_secs,
+            },
+        );
+        if let Err(err) = resumable {
+            return Err(self.reject("delegate", digest, err));
+        }
+        if resumed_role != req.role {
+            let err = PolicyError::new(
+                PolicyCode::InvalidTask,
+                "the resumed agent role does not match the requested role",
+            );
+            return Err(self.reject("delegate", digest, err));
+        }
+
+        let (continuation_task, evidence_update) =
+            self.task_for_existing_run(run, &req.task, digest)?;
+        // The recorded agent, rather than today's team or the request, is the authority for a
+        // resumed route. Validate it before appending the proposed evidence version. This same
+        // guard is repeated in start_attempt for replay/retry/automatic paths.
+        if continuation_task.evidence.is_some() {
+            check_evidence_route(
+                recorded_provider,
+                crate::core::types::requires_sandbox(resumed_role, recorded_writes),
+            )
+            .map_err(|err| self.reject("delegate", digest, err))?;
+        }
         let attempt = AttemptId::new_v4();
-        let prompt = handoff::build_builder_prompt(&req.task, &schema_hint(req.role));
+        let prompt = handoff::build_builder_prompt(&continuation_task, &schema_hint(req.role));
+        if let Some(evidence) = evidence_update {
+            self.registry
+                .append(&run, EventPayload::TaskEvidenceUpdated { evidence })?;
+        }
         match self.resume_attempt(agent, attempt, prompt, resolved.spawn_budget_usd) {
             Ok(()) => {
-                self.record_delegation(validated_caller, run, Some(req.role), DelegatedTarget::Worker);
+                self.record_delegation(
+                    validated_caller,
+                    run,
+                    Some(req.role),
+                    DelegatedTarget::Worker,
+                );
                 Ok(DelegateOut {
                     agent_id: agent,
                     run_id: run,
@@ -860,7 +1068,10 @@ impl Core {
             return;
         };
         let cancelled = self.cancellation.worktrees.remove(lineage)
-            || self.registry.run(&p.run).is_some_and(|r| r.status == RunStatus::Cancelled);
+            || self
+                .registry
+                .run(&p.run)
+                .is_some_and(|r| r.status == RunStatus::Cancelled);
         let info = match result {
             Ok(info) => info,
             Err(err) => {
@@ -879,7 +1090,12 @@ impl Core {
                     // T84: `run.created` just landed, even though the run is about to be
                     // blocked — the linkage is honest either way (the delegation *did* cause
                     // this run to exist), and the invariant does not condition on outcome.
-                    self.record_delegation(p.caller_run_id, p.run, Some(p.role), DelegatedTarget::Worker);
+                    self.record_delegation(
+                        p.caller_run_id,
+                        p.run,
+                        Some(p.role),
+                        DelegatedTarget::Worker,
+                    );
                 }
                 self.registry.audit(AuditEntry::new(
                     "delegate",
@@ -907,7 +1123,12 @@ impl Core {
             // T84: only now — this run's own `run.created` is durable — may the caller's run say
             // this delegation caused it. `None` (no attested lead, or one that failed strict
             // validation) writes nothing.
-            self.record_delegation(p.caller_run_id, p.run, Some(p.role), DelegatedTarget::Worker);
+            self.record_delegation(
+                p.caller_run_id,
+                p.run,
+                Some(p.role),
+                DelegatedTarget::Worker,
+            );
             if !cancelled {
                 self.emit(
                     &p.run,
@@ -930,7 +1151,8 @@ impl Core {
         // Make cancellation durable before an agent exists for restart reconciliation.
         if cancelled {
             if let Err(error) = self.record_run_cancellation(&p.run) {
-                self.lifecycle.fail_stop(format!("Could not record cancelled worktree: {error}"));
+                self.lifecycle
+                    .fail_stop(format!("Could not record cancelled worktree: {error}"));
                 return;
             }
         }
@@ -964,7 +1186,9 @@ impl Core {
         // `add_worktree` may have taken the whole `GIT_OP_TIMEOUT`. The worktree and the agent are
         // recorded either way — they exist, and the log should say so — but nothing is started into
         // a run that has stopped accepting workers.
-        if cancelled { return; }
+        if cancelled {
+            return;
+        }
         if !self.run_accepts_workers(&p.run) {
             tracing::info!(run = %p.run, agent = %p.agent, "the run no longer accepts workers; no builder was started");
             return;
@@ -1008,6 +1232,55 @@ impl Core {
     /// `spawn_detached` finished: hand the child to the supervisor, or record the failure as the
     /// attempt it would have been.
     ///
+    /// Rechecks actor-owned admission after the off-actor evidence read. A bad bundle is a
+    /// control-plane evidence failure, never a paid worker attempt or a repair strike.
+    pub(crate) fn on_evidence_validated(
+        &mut self,
+        attempt: AttemptId,
+        plan: super::CheckedPlan,
+        dir: std::path::PathBuf,
+        result: Result<(), String>,
+    ) {
+        let Some(pending) = self.pending_spawn.get(&attempt) else {
+            return;
+        };
+        let run = pending.ctx.run;
+        let cancelled = self.cancelled_spawn.contains(&attempt) || !self.run_accepts_workers(&run);
+        if result.is_ok() && !cancelled {
+            self.spawn_process_helper(attempt, plan, dir);
+            return;
+        }
+        let pending = self
+            .pending_spawn
+            .remove(&attempt)
+            .expect("pending evidence attempt");
+        self.cancelled_spawn.remove(&attempt);
+        let reason = if cancelled {
+            "run stopped before evidence-validated process admission".into()
+        } else {
+            format!(
+                "offline evidence integrity validation failed: {}",
+                result.unwrap_err()
+            )
+        };
+        let reason = clamp_untrusted(&reason, MAX_SUMMARY_CHARS);
+        self.fail_attempt(
+            &pending,
+            if cancelled {
+                AttemptStatus::Cancelled
+            } else {
+                AttemptStatus::Escalate
+            },
+            AttemptError {
+                code: ErrorCode::WorkspaceError,
+                message: reason.clone(),
+            },
+        );
+        if !cancelled {
+            self.block_run(&run, &reason);
+        }
+    }
+
     /// A spawn failure is recorded as `attempt.started` + `attempt.finished{spawn_failed}` rather
     /// than as a bare terminal event, because the reducer only knows an attempt it has seen start:
     /// without the pair the failure would project to nothing at all, `await_result` would never
@@ -1122,8 +1395,12 @@ impl Core {
                 reason: "security checks are single-use inspections; change the input and start a new check through the workflow".into() };
         }
         if role != RoleName::Lead && self.registry.run(&run).is_some_and(|r| r.audit.is_some()) {
-            return SendResult::Rejected { code: PolicyCode::DelegationNotAllowed,
-                reason: "audit checks cannot be resumed or repaired; start a new audit for new input".into() };
+            return SendResult::Rejected {
+                code: PolicyCode::DelegationNotAllowed,
+                reason:
+                    "audit checks cannot be resumed or repaired; start a new audit for new input"
+                        .into(),
+            };
         }
         let spawn_cap = self
             .roles
@@ -1419,9 +1696,20 @@ impl Core {
     /// `run.status{blocked, reason}` or a warning, because there is no caller to hand an error to.
     /// The `Command::Tick` that swept the attempt is long gone by the time a branch runs.
     pub async fn on_attempt_finished(&mut self, attempt: AttemptId) {
-        if self.registry.attempt(&attempt).and_then(|a| self.registry.run(&a.run_id))
-            .is_some_and(|r| r.status == RunStatus::Cancelled) { return; }
-        if self.registry.attempt(&attempt).and_then(|a| self.registry.run(&a.run_id)).is_some_and(|r| r.audit.is_some()) {
+        if self
+            .registry
+            .attempt(&attempt)
+            .and_then(|a| self.registry.run(&a.run_id))
+            .is_some_and(|r| r.status == RunStatus::Cancelled)
+        {
+            return;
+        }
+        if self
+            .registry
+            .attempt(&attempt)
+            .and_then(|a| self.registry.run(&a.run_id))
+            .is_some_and(|r| r.audit.is_some())
+        {
             self.mark_idle(&attempt);
             self.audit_attempt_finished(attempt);
             return;
@@ -1624,7 +1912,9 @@ impl Core {
             self.mark(f, LoopBranch::Review);
             return;
         };
-        if self.run_steps(&f.run).security && !security::current_builder_diff(&self.registry, &f.run, frozen.attempt) {
+        if self.run_steps(&f.run).security
+            && !security::current_builder_diff(&self.registry, &f.run, frozen.attempt)
+        {
             self.mark(f, LoopBranch::Review);
             return;
         }
@@ -1643,7 +1933,12 @@ impl Core {
             return;
         };
 
-        if security && verdict.findings.iter().any(|f| f.severity == Severity::Blocking) {
+        if security
+            && verdict
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Blocking)
+        {
             verdict.verdict = Verdict::Fail;
         }
         if !security && !self.verdict_since(&f.run, f.finish_seq) {
@@ -1685,14 +1980,18 @@ impl Core {
         }
 
         if verdict.verdict == Verdict::Pass {
-            if security && !self.persist_security_verdict(f, &frozen, &verdict) { return; }
+            if security && !self.persist_security_verdict(f, &frozen, &verdict) {
+                return;
+            }
             self.open_integrate_gate(f, &frozen, !security || self.run_steps(&f.run).review);
             self.mark(f, LoopBranch::Gate);
             return;
         }
 
         // FAIL: the builder is struck and repaired, in the builder's own lineage.
-        if security && !self.persist_security_verdict(f, &frozen, &verdict) { return; }
+        if security && !self.persist_security_verdict(f, &frozen, &verdict) {
+            return;
+        }
         let Some(builder) = f.parent.and_then(|agent| self.target_of(&agent)) else {
             self.block_run(
                 &f.run,
@@ -1883,7 +2182,13 @@ impl Core {
             tracing::warn!(%gate, "resolution for a gate this state dir does not know");
             return;
         };
-        if self.registry.run(&run).is_some_and(|r| r.status == RunStatus::Cancelled) { return; }
+        if self
+            .registry
+            .run(&run)
+            .is_some_and(|r| r.status == RunStatus::Cancelled)
+        {
+            return;
+        }
         let kind = self.registry.gate(&gate).map(|g| g.kind);
         match r {
             GateResolution::Approved { .. } => {
@@ -2178,8 +2483,13 @@ impl Core {
                     );
                     return;
                 };
-                if self.run_steps(&run).security && !security::current_builder_diff(&self.registry, &run, frozen.attempt) {
-                    self.block_run(&run, "A recovered inspection's builder input was superseded; start a new task");
+                if self.run_steps(&run).security
+                    && !security::current_builder_diff(&self.registry, &run, frozen.attempt)
+                {
+                    self.block_run(
+                        &run,
+                        "A recovered inspection's builder input was superseded; start a new task",
+                    );
                     return;
                 }
                 let build = self
@@ -2212,8 +2522,13 @@ impl Core {
                     );
                     return;
                 };
-                if self.run_steps(&run).security && !security::current_builder_diff(&self.registry, &run, frozen.attempt) {
-                    self.block_run(&run, "A recovered inspection's builder input was superseded; start a new task");
+                if self.run_steps(&run).security
+                    && !security::current_builder_diff(&self.registry, &run, frozen.attempt)
+                {
+                    self.block_run(
+                        &run,
+                        "A recovered inspection's builder input was superseded; start a new task",
+                    );
                     return;
                 }
                 let build = self
@@ -2225,7 +2540,13 @@ impl Core {
             }
             // A builder whose parent belongs to a **closed** lineage is 17d's replacement; one with
             // no parent at all is a lead's first builder.
-            RoleName::Lead => lead_setup_prompt(&task.description, self.registry.run(&run).and_then(|r| r.execution.as_ref())),
+            RoleName::Lead => handoff::build_lead_prompt(
+                &lead_setup_prompt(
+                    &task.description,
+                    self.registry.run(&run).and_then(|r| r.execution.as_ref()),
+                ),
+                &task,
+            ),
             RoleName::Builder => match parent {
                 Some(parent) if self.lineage_of(&parent) != lineage => {
                     let (findings, files) = self.abandoned_context(&run, &parent);
@@ -2392,9 +2713,16 @@ impl Core {
                 .iter()
                 .rev()
                 .find_map(|e| match &e.payload {
-                    EventPayload::ReviewVerdict { attempt_id, findings, .. }
-                    | EventPayload::SecurityVerdict { attempt_id, findings, .. }
-                    if *attempt_id == owed.marked => Some(findings.clone()),
+                    EventPayload::ReviewVerdict {
+                        attempt_id,
+                        findings,
+                        ..
+                    }
+                    | EventPayload::SecurityVerdict {
+                        attempt_id,
+                        findings,
+                        ..
+                    } if *attempt_id == owed.marked => Some(findings.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -2729,6 +3057,13 @@ impl Core {
         // writer of its sandbox. A verifier is sandboxed into the builder's worktree without
         // owning it; `s.writes` keeps driving worktree/finalize semantics unchanged.
         let sandboxed = crate::core::types::requires_sandbox(s.role, s.writes);
+        let carries_evidence = self
+            .registry
+            .run(&s.run)
+            .is_some_and(|run| run.task.evidence.is_some());
+        if carries_evidence {
+            check_evidence_route(s.provider, sandboxed)?;
+        }
         let req = SpawnRequest {
             role,
             model: &s.model,
@@ -2800,6 +3135,7 @@ impl Core {
                 worktree: &s.worktree,
                 provider: s.provider,
                 sandboxed,
+                evidence: carries_evidence,
                 state_dir: &self.state_dir,
                 prompt_index,
             },
@@ -2814,7 +3150,12 @@ impl Core {
                 cwd: s.cwd,
             },
         );
-        self.spawn_process_helper(s.attempt, checked, dir);
+        let evidence = self.registry.run(&s.run).and_then(|run| run.task.evidence.clone());
+        if let Some(evidence) = evidence {
+            self.validate_evidence_helper(s.attempt, evidence, checked, dir);
+        } else {
+            self.spawn_process_helper(s.attempt, checked, dir);
+        }
         Ok(())
     }
 
@@ -2841,15 +3182,26 @@ impl Core {
             .worktree
             .clone()
             .unwrap_or_else(|| handle.cwd.clone());
-        let effort = if let Some(execution) = self.registry.run(&handle.run_id).and_then(|r| r.execution.as_ref()) {
-            execution.assignments.get(role_key(handle.role))
+        let effort = if let Some(execution) = self
+            .registry
+            .run(&handle.run_id)
+            .and_then(|r| r.execution.as_ref())
+        {
+            execution
+                .assignments
+                .get(role_key(handle.role))
                 .filter(|a| a.provider == handle.provider && a.model == handle.model)
                 .and_then(|a| a.effort)
         } else {
-            team::load_team(&self.state_dir).ok().flatten()
+            team::load_team(&self.state_dir)
+                .ok()
+                .flatten()
                 .and_then(|team| team::validate_team(&self.roles, &team).ok())
-                .and_then(|team| team.assignment(handle.role)
-                    .filter(|a| a.provider == handle.provider).and_then(|a| a.effort))
+                .and_then(|team| {
+                    team.assignment(handle.role)
+                        .filter(|a| a.provider == handle.provider)
+                        .and_then(|a| a.effort)
+                })
         };
         Some(StartSpawn {
             run: handle.run_id,
@@ -3003,7 +3355,12 @@ impl Core {
     /// attempts — then found none and blocked the run with the wrong cause. The builder's own
     /// report is read from the frozen attempt for the same reason: `f.structured` is the reviewer's
     /// verdict on that path, not a `BuildResult`.
-    fn start_reviewer(&mut self, run: &RunId, builder: AgentId, frozen: &Frozen) -> Result<(), PolicyError> {
+    fn start_reviewer(
+        &mut self,
+        run: &RunId,
+        builder: AgentId,
+        frozen: &Frozen,
+    ) -> Result<(), PolicyError> {
         self.start_review_role(run, builder, frozen, RoleName::Reviewer)
     }
 
@@ -3248,7 +3605,9 @@ impl Core {
             self.mark(f, LoopBranch::Verify);
             return;
         };
-        if self.run_steps(&f.run).security && !security::current_builder_diff(&self.registry, &f.run, frozen.attempt) {
+        if self.run_steps(&f.run).security
+            && !security::current_builder_diff(&self.registry, &f.run, frozen.attempt)
+        {
             self.mark(f, LoopBranch::Verify);
             return;
         }
@@ -3365,7 +3724,11 @@ impl Core {
         }
         let tries = self.workers_for(&f.run, frozen.attempt, role);
         if tries >= MAX_REVIEWERS_PER_DIFF {
-            let label = if role == RoleName::Security { "security reviewers" } else { "reviewers" };
+            let label = if role == RoleName::Security {
+                "security reviewers"
+            } else {
+                "reviewers"
+            };
             self.block_run(
                 &f.run,
                 &format!("{reason}; {tries} {label} have now failed on this diff"),
@@ -3528,7 +3891,9 @@ impl Core {
     /// Step 16: the gate a `PASS` opens. Its summary names **every** policy violation of the
     /// lineage, because the human approving it is the last reader before the work is committed.
     fn open_integrate_gate(&mut self, f: &Finished, frozen: &Frozen, reviewed: bool) {
-        if !self.security_ready_for_gate(f, frozen) { return; }
+        if !self.security_ready_for_gate(f, frozen) {
+            return;
+        }
         if self.gate_since(&f.run, f.finish_seq) {
             self.set_awaiting_gate(&f.run);
             return;
@@ -3594,8 +3959,11 @@ impl Core {
             .map(|t| format!("{}: {}", t.id, t.title));
         let summary = format!(
             "{lead_line}\n\n{}\n\n{verify_line}{}\n\n{} file(s) changed.\n\n{}",
-            if self.run_steps(&f.run).security { "Security review passed for this frozen diff." }
-            else { "Security review was not run." },
+            if self.run_steps(&f.run).security {
+                "Security review passed for this frozen diff."
+            } else {
+                "Security review was not run."
+            },
             task_line.clone().unwrap_or_default(),
             frozen.files.len(),
             self.violation_summary(&violations_agent)
@@ -3658,20 +4026,32 @@ impl Core {
             )));
         }
         if self.caller_without_builder(caller_run_id) {
-            return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
-                "this lead's recorded task has no builder").into());
+            return Err(PolicyError::new(
+                PolicyCode::DelegationNotAllowed,
+                "this lead's recorded task has no builder",
+            )
+            .into());
         }
         let inherited = caller_run_id
-            .and_then(|id| self.registry.run(&id)).and_then(|r| r.execution.clone());
+            .and_then(|id| self.registry.run(&id))
+            .and_then(|r| r.execution.clone());
         let team = match inherited.as_ref() {
-            Some(e) => Some(team::from_execution(&self.roles, e).map_err(|issues|
-                PolicyError::new(PolicyCode::TeamInvalid, format!("recorded team is unsupported: {issues:?}")))?),
+            Some(e) => Some(team::from_execution(&self.roles, e).map_err(|issues| {
+                PolicyError::new(
+                    PolicyCode::TeamInvalid,
+                    format!("recorded team is unsupported: {issues:?}"),
+                )
+            })?),
             None => self.valid_team()?,
         };
-        let execution = inherited.unwrap_or_else(|| team::capture_execution(&self.roles, team.as_ref()));
+        let execution =
+            inherited.unwrap_or_else(|| team::capture_execution(&self.roles, team.as_ref()));
         if execution.mode != RunMode::Build {
-            return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
-                "a work plan requires build mode; planning and audit never create builders").into());
+            return Err(PolicyError::new(
+                PolicyCode::DelegationNotAllowed,
+                "a work plan requires build mode; planning and audit never create builders",
+            )
+            .into());
         }
         // Validated *before* the container run is minted, against whatever lead is live right now
         // (T84) — the same daemon-owned fact `delegate` checks, so a caller cannot widen its own
@@ -3695,6 +4075,7 @@ impl Core {
                     description: clamp_untrusted(&plan.name, MAX_SUMMARY_CHARS),
                     files: vec![],
                     acceptance: vec![],
+                    evidence: None,
                 },
                 version: RUN_VERSION,
                 lead: team.as_ref().and_then(lead_label),
@@ -3729,7 +4110,13 @@ impl Core {
     /// conclude the container when everything is done. Every transition is emitted before it is
     /// acted on, so a restart replays to exactly this state (`plan.item` is the marker).
     fn drive_plan(&mut self, container: &RunId) {
-        if self.registry.run(container).is_some_and(|r| r.status == RunStatus::Cancelled) { return; }
+        if self
+            .registry
+            .run(container)
+            .is_some_and(|r| r.status == RunStatus::Cancelled)
+        {
+            return;
+        }
         let Some(proj) = self.registry.state().plans.get(container).cloned() else {
             return;
         };
@@ -3927,14 +4314,20 @@ impl Core {
             // Joined branches stay unmerged — landing them together is the human's, like main.
             None
         };
-        let inherited = self.registry.run(container).and_then(|r| r.execution.clone());
+        let inherited = self
+            .registry
+            .run(container)
+            .and_then(|r| r.execution.clone());
         let mut execution = match inherited {
             Some(e) => e,
             None => match self.valid_team() {
                 Ok(team) => team::capture_execution(&self.roles, team.as_ref()),
                 Err(err) => {
                     self.plan_item(container, &item.id, PlanItemStatus::Blocked, None, None);
-                    self.block_run(container, &format!("plan item `{}` could not read the team: {err}", item.id));
+                    self.block_run(
+                        container,
+                        &format!("plan item `{}` could not read the team: {err}", item.id),
+                    );
                     return;
                 }
             },
@@ -4092,8 +4485,15 @@ impl Core {
             SessionSpec::Resume(agent) => self.registry.agent(&agent).map(|a| a.run_id),
             SessionSpec::Fresh => req.run_id,
         }?;
-        self.registry.run(&run).and_then(|r| r.execution.as_ref()).or_else(||
-            self.pending_worktree.values().find(|p| p.run == run).and_then(|p| p.execution.as_ref()))
+        self.registry
+            .run(&run)
+            .and_then(|r| r.execution.as_ref())
+            .or_else(|| {
+                self.pending_worktree
+                    .values()
+                    .find(|p| p.run == run)
+                    .and_then(|p| p.execution.as_ref())
+            })
     }
 
     /// `check_delegate` for a spawn the **control plane** asks for (a reviewer, a retry, a
@@ -4101,7 +4501,11 @@ impl Core {
     /// one-writer rule and the team's provider/model for the role.
     fn resolve_internal(&mut self, req: &DelegateRequest) -> Result<Resolved, PolicyError> {
         let cfg = Arc::clone(&self.roles);
-        let team = match if self.request_execution(req).is_some() { Ok(None) } else { self.valid_team() } {
+        let team = match if self.request_execution(req).is_some() {
+            Ok(None)
+        } else {
+            self.valid_team()
+        } {
             Ok(team) => team,
             Err(CoreError::Policy(err)) => return Err(err),
             Err(err) => {
@@ -5544,6 +5948,7 @@ mod tests {
                 description: "observe the value on run.created".to_string(),
                 files: vec![],
                 acceptance: vec![],
+                evidence: None,
             },
             prompt: String::new(),
             lead: None,

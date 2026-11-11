@@ -42,6 +42,7 @@ fn task() -> Task {
         description: "Cover prompt rendering and the untrusted envelope.".into(),
         files: vec!["tests/handoff.rs".into()],
         acceptance: vec!["cargo test --test handoff exits 0".into()],
+        evidence: None,
     }
 }
 

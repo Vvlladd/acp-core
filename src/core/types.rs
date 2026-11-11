@@ -580,6 +580,9 @@ pub struct Task {
     pub description: String,
     pub files: Vec<String>,
     pub acceptance: Vec<String>,
+    /// Host-imported snapshots, validated and copied outside the worker worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Box<crate::workspace::evidence::EvidenceReference>>,
 }
 
 /// The optional-step switches a run was created with (B3 role subsets).
@@ -1268,6 +1271,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "security.verdict",
     "run.budget_changed",
     "run.budget_blocked",
+    "task.evidence_updated",
     "run.recovered",
 ];
 
@@ -1370,6 +1374,11 @@ pub enum EventPayload {
         /// v1 teams' runs, which means everything runs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         steps: Option<RunSteps>,
+    },
+    /// An actor-atomic, host-resolved evidence update accepted before an idle continuation.
+    #[serde(rename = "task.evidence_updated")]
+    TaskEvidenceUpdated {
+        evidence: Box<crate::workspace::evidence::EvidenceReference>,
     },
     #[serde(rename = "run.status")]
     RunStatus_ {
@@ -1656,6 +1665,7 @@ mod tests {
             description: "data model, typed ids, Event union".into(),
             files: vec!["src/core/types.rs".into()],
             acceptance: vec!["cargo build exits 0".into()],
+            evidence: None,
         }
     }
 
@@ -1677,6 +1687,7 @@ mod tests {
             EventPayload::AuditChecked { .. } => "audit.checked",
             EventPayload::SecurityVerdict { .. } => "security.verdict",
             EventPayload::RunCreated { .. } => "run.created",
+            EventPayload::TaskEvidenceUpdated { .. } => "task.evidence_updated",
             EventPayload::RunStatus_ { .. } => "run.status",
             EventPayload::RunBudgetChanged { .. } => "run.budget_changed",
             EventPayload::RunBudgetBlocked { .. } => "run.budget_blocked",
@@ -1954,6 +1965,12 @@ mod tests {
                 previous_run_budget_usd: Some(15.0), actor: "cli".into(), continuation: None },
             EventPayload::RunBudgetBlocked { action: BudgetContinuationAction::LoopDecision { attempt_id: attempt }, spend_usd: 14.0,
                 spawn_cap_usd: 2.0, run_budget_usd: 15.0 },
+            EventPayload::TaskEvidenceUpdated {
+                evidence: Box::new(crate::workspace::evidence::EvidenceReference {
+                    bundle_id: "f".repeat(64), root: "/state/evidence/f".into(), title: "updated".into(),
+                    sources: vec![], network_capability: "unverified_provider_controlled".into(),
+                }),
+            },
             EventPayload::RunRecovered { recovery: crate::core::recovery::Record {
                 request: crate::core::recovery::Request { run_id: RunId::new_v4(), source_agent_id: agent,
                     expected_seq: 10, request_id: uuid::Uuid::new_v4(),
@@ -2014,7 +2031,7 @@ mod tests {
         assert_eq!(EVENT_KINDS[24], "agent.message");
         assert_eq!(EVENT_KINDS[28], "run.delegated");
         assert_eq!(EVENT_KINDS.last(), Some(&"run.recovered"));
-        assert_eq!(EVENT_KINDS.len(), 35);
+        assert_eq!(EVENT_KINDS.len(), 36);
     }
 
     #[test]

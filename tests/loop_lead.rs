@@ -317,6 +317,7 @@ fn lead_task(message: &str) -> Task {
         description: message.to_string(),
         files: Vec::new(),
         acceptance: Vec::new(),
+        evidence: None,
     }
 }
 
@@ -549,6 +550,7 @@ async fn a_spawned_lead_runs_at_the_repo_root_without_a_worktree_lineage_or_sche
         description: message.to_string(),
         files: Vec::new(),
         acceptance: vec!["Coordinate the request through ACP.".to_string()],
+        evidence: None,
     };
 
     let started = actor

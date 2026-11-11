@@ -227,13 +227,20 @@ pub fn reduce(s: &mut State, e: &Event) {
             if let Some(run) = s.runs.get_mut(&run_id) {
                 if run.audit.is_none() {
                     run.base_sha = snapshot.base_sha.clone();
-                    run.audit = Some(crate::core::types::AuditRecord { snapshot: snapshot.clone(), checks: vec![] });
+                    run.audit = Some(crate::core::types::AuditRecord {
+                        snapshot: snapshot.clone(),
+                        checks: vec![],
+                    });
                 }
             }
         }
         EventPayload::AuditChecked { check } => {
             if let Some(audit) = s.runs.get_mut(&run_id).and_then(|run| run.audit.as_mut()) {
-                if !audit.checks.iter().any(|old| old.attempt_id == check.attempt_id) {
+                if !audit
+                    .checks
+                    .iter()
+                    .any(|old| old.attempt_id == check.attempt_id)
+                {
                     audit.checks.push(check.clone());
                 }
             }
@@ -272,6 +279,12 @@ pub fn reduce(s: &mut State, e: &Event) {
                 steps: *steps,
                 execution: execution.clone(),
             });
+        }
+
+        EventPayload::TaskEvidenceUpdated { evidence } => {
+            if let Some(run) = s.runs.get_mut(&run_id) {
+                run.task.evidence = Some(evidence.clone());
+            }
         }
 
         EventPayload::RunStatus_ { status, reason } => {
@@ -1439,6 +1452,7 @@ mod tests {
                 description: "verify durable budget replay".into(),
                 files: vec![],
                 acceptance: vec!["reopens".into()],
+                evidence: None,
             },
             version: 1,
             lead: None,

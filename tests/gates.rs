@@ -142,6 +142,7 @@ fn task() -> Task {
         description: "gate lifecycle against a real git repository".into(),
         files: vec!["tests/gates.rs".into()],
         acceptance: vec!["cargo test --test gates exits 0".into()],
+        evidence: None,
     }
 }
 

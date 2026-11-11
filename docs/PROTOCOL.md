@@ -163,6 +163,76 @@ build never converts those values into current numeric limits or authorizes exec
 
 ## Lifecycle and host routes
 
+## Offline source evidence
+
+The socket-only host workflow `acp evidence import <manifest.json>` copies a bounded local source
+snapshot into an ACP-owned store outside daemon state and repositories; `acp evidence show
+<bundle-id>` revalidates and displays it.
+Core performs no network fetch. A version-1 import manifest has this shape:
+
+```json
+{
+  "version": 1,
+  "title": "Product 4.2 API references",
+  "sources": [{
+    "url": "https://docs.example.test/product/4.2/api",
+    "retrievedAt": "2026-11-10T12:30:00Z",
+    "sourceDate": "2026-11-09",
+    "provenance": "installed_version",
+    "sha256": "<64 lowercase hex characters>",
+    "file": "api/index.md"
+  }]
+}
+```
+
+`provenance` is exactly `installed_version` or `current_documentation`; this distinction is part
+of bundle identity. Files are relative to the manifest, copied under a separate `files/` directory,
+and re-hashed whenever referenced. Limits are 64 KiB for both input and the exact installed
+manifest, 64 files, 8 MiB per file and 32 MiB total. Safe relative paths, unique URLs/names, regular
+non-symlink files and hashes are mandatory. A SHA-256 over ACP's compact canonical metadata is the
+immutable bundle ID. Updating metadata or content means importing a new bundle, never modifying an
+old one. The installed store is `.acp-evidence/<opaque namespace>/<bundle ID>` outside the
+state directory (beside `~/.acp` in the default layout). For a custom state beneath a repository
+or `.acp/worktrees`, ACP resolves the store beyond the outermost enclosing checkout, or refuses
+when no disjoint external location exists. The opaque namespace binds the daemon's canonical
+repository and state roots, so another repository/state pair cannot attach it. Evidence navigation
+does not reveal the daemon state path or its human socket.
+Store directories must be owner-only; source files and bundle directories are read-only. Legacy
+unpublished references beneath the state directory fail closed and require explicit reimport.
+Those modes are tamper detection and defense in depth, not isolation from a same-user provider.
+
+Attach an installed ID to a new CLI delegation with `--evidence <bundle-id>`, or pass
+`evidenceBundleId` to socket `delegate`/`lead.start`. The daemon resolves the ID into an ACP-owned
+reference before writing `run.created`; callers cannot supply a path. Replay therefore preserves
+the same identity. Prompts list concise URLs, dates, provenance, hashes and read-only paths without
+inlining source text. Evidence navigation has its own 8 KiB prompt allowance: bundle identity,
+network capability and the complete manifest location survive ordinary prompt truncation. Large
+bundles show a bounded prefix of entries and an explicit omission count. They label imported text
+untrusted and network capability
+`unverified_provider_controlled`: a host-supplied bundle is not evidence that a worker can browse.
+
+Before the prompt path reaches a process, admission requires an enforced provider write boundary.
+Sandboxed writers and verifiers retain their checked worktree-only write profile. A non-writing
+Codex role must positively carry the checked `read-only` sandbox mode on fresh and resume argv.
+ACP does not currently have a verified read-only filesystem route for a non-writing Claude role;
+attaching evidence to that configuration is blocked before provider preflight/launch with a remedy
+to choose a supported confined Codex worker or remove the attachment. This applies to leads,
+review/security roles, automatic checks and restart replay from their recorded provider settings;
+catalog overrides do not bypass it. Tasks without evidence keep their ordinary provider behavior.
+
+Evidence updates are admitted only as new task input using a new ID. An idle continuation first
+records `task.evidence_updated`, so restart, retry and replacement prompts use the same accepted
+reference. Updates do not expand sandbox permissions or inject data into an active attempt; use an
+idle supported continuation/new delegation and preserve the existing checks, history and gate rules. Optional private-client
+acceptance for these additive socket fields is pending.
+
+Offline evidence is revalidated before every provider process starts, including resumed, automatic
+retry/replacement/check and restart-reissued attempts. Full file hashing runs in a bounded helper;
+the actor rechecks run state and cancellation before admitting the provider. Changed, missing or
+unreadable content blocks the run with a zero-PID diagnostic attempt, no provider usage and no
+builder strike. Prompt rendering validates only bounded metadata and never substitutes a warning
+for this admission check. A cancelled or stopped run cannot launch after the helper completes.
+
 `acp stop` waits for safe idle. `acp stop --cancel-work` cancels and drains when explicitly requested.
 `acp down` stops the daemon but may leave workers alive for recovery. Never delete resumable
 worktrees merely because supervision stopped. See CLI help for human commands.

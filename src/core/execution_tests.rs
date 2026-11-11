@@ -9,6 +9,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 fn core(dir: &TempDir) -> (Core, mpsc::Receiver<Command>) {
+    std::fs::create_dir_all(dir.path().join("repo")).unwrap();
     let (tx, rx) = channel();
     let (signals, _) = mpsc::channel(8);
     (
@@ -30,6 +31,7 @@ fn task() -> Task {
         description: "Implement this task with the selected providers.".into(),
         files: vec![],
         acceptance: vec!["The selected provider runs".into()],
+        evidence: None,
     }
 }
 fn request(run_id: Option<RunId>) -> DelegateRequest {
@@ -82,6 +84,488 @@ fn seed_run(core: &mut Core, execution: RunExecution) -> RunId {
         )
         .unwrap();
     run
+}
+
+struct EvidenceOwner {
+    _owner: TempDir,
+    root: PathBuf,
+}
+
+impl Drop for EvidenceOwner {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&self.root, &self.root.join("files")] {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
+fn evidence_reference(
+    repo: &Path,
+    state: &Path,
+) -> (
+    Box<crate::workspace::evidence::EvidenceReference>,
+    EvidenceOwner,
+) {
+    evidence_reference_named(repo, state, "updated sources", b"source snapshot")
+}
+
+fn evidence_reference_named(
+    repo: &Path,
+    state: &Path,
+    title: &str,
+    contents: &[u8],
+) -> (
+    Box<crate::workspace::evidence::EvidenceReference>,
+    EvidenceOwner,
+) {
+    use sha2::{Digest, Sha256};
+    let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let input = owner.path().join("evidence-input");
+    std::fs::create_dir_all(&input).unwrap();
+    std::fs::write(input.join("source.txt"), contents).unwrap();
+    let manifest = input.join("bundle.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec(&json!({
+            "version":1, "title":title, "sources":[{
+                "file":"source.txt", "url":"https://example.test/source",
+                "retrievedAt":"2026-11-10T12:30:00Z", "provenance":"installed_version",
+                "sha256":format!("{:x}", Sha256::digest(contents))
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let installed = crate::workspace::evidence::import(repo, state, &manifest).unwrap();
+    let evidence = installed.reference(repo, state).unwrap();
+    let guard = EvidenceOwner {
+        _owner: owner,
+        root: evidence.root.clone(),
+    };
+    (Box::new(evidence), guard)
+}
+
+fn synthetic_evidence_reference(
+    state: &Path,
+    title: &str,
+    contents: &[u8],
+) -> Box<crate::workspace::evidence::EvidenceReference> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Manifest<'a> {
+        version: u32,
+        title: &'a str,
+        sources: &'a [crate::workspace::evidence::SourceEntry],
+    }
+    use crate::workspace::evidence::{EvidenceReference, Provenance, SourceEntry};
+    use sha2::{Digest, Sha256};
+    let sources = vec![SourceEntry {
+        url: "https://example.test/source".into(),
+        retrieved_at: "2026-11-10T12:30:00Z".into(),
+        source_date: Some("2026-11-09".into()),
+        provenance: Provenance::InstalledVersion,
+        sha256: format!("{:x}", Sha256::digest(contents)),
+        file: "source.txt".into(),
+    }];
+    let bundle_id = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&Manifest {
+                version: 1,
+                title,
+                sources: &sources,
+            })
+            .unwrap()
+        )
+    );
+    let reference = EvidenceReference {
+        root: state
+            .join(".acp-evidence")
+            .join("c".repeat(64))
+            .join(&bundle_id),
+        bundle_id,
+        title: title.into(),
+        sources,
+        network_capability: "unverified_provider_controlled".into(),
+    };
+    reference.validate_metadata().unwrap();
+    Box::new(reference)
+}
+
+#[test]
+fn claude_read_only_lead_refuses_only_the_evidence_attachment_before_launch() {
+    let dir = TempDir::new().unwrap();
+    let (mut core, _rx) = core(&dir);
+    // Admission rejects this provider route before bundle I/O; a metadata-shaped reference keeps
+    // the regression independent of host paths that this worker sandbox cannot create.
+    let bundle_id = "a".repeat(64);
+    let evidence = Box::new(crate::workspace::evidence::EvidenceReference {
+        root: PathBuf::from("/tmp/.acp-evidence")
+            .join("b".repeat(64))
+            .join(&bundle_id),
+        bundle_id,
+        title: "host snapshot".into(),
+        sources: vec![],
+        network_capability: "unverified_provider_controlled".into(),
+    });
+    let mut attached = task();
+    attached.evidence = Some(evidence);
+
+    let error = core
+        .spawn_lead(attached, "Review the supplied sources".into())
+        .expect_err("Claude's non-writing profile cannot receive the evidence path");
+    assert!(matches!(error, CoreError::Policy(ref policy)
+        if policy.code == PolicyCode::SandboxMissing
+            && policy.reason.contains("supported confined Codex worker")));
+    assert!(
+        core.pending_spawn.is_empty(),
+        "no provider launch may be queued"
+    );
+    assert!(core
+        .registry
+        .runs()
+        .any(|run| run.status == RunStatus::Blocked
+            && run
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("remove the attachment"))));
+}
+
+#[test]
+fn evidence_update_event_replays_into_the_authoritative_task() {
+    let owner = TempDir::new().unwrap();
+    let dir = TempDir::new_in(owner.path()).unwrap();
+    let (mut core, _rx) = core(&dir);
+    let captured = execution(&core, &builder_team("haiku"));
+    let run = seed_run(&mut core, captured);
+    let (evidence, _evidence_owner) =
+        evidence_reference(&core.repo_root, core.registry.state_dir());
+    core.registry
+        .append(
+            &run,
+            EventPayload::TaskEvidenceUpdated {
+                evidence: evidence.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        core.registry.run(&run).unwrap().task.evidence.as_ref(),
+        Some(&evidence)
+    );
+    drop(core);
+
+    let replayed = Registry::open(dir.path()).unwrap();
+    assert_eq!(
+        replayed.run(&run).unwrap().task.evidence.as_ref(),
+        Some(&evidence)
+    );
+}
+
+#[tokio::test]
+async fn evidence_update_admission_is_atomic_and_resume_run_identity_cannot_be_spoofed() {
+    let owner = TempDir::new().unwrap();
+    let dir = TempDir::new_in(owner.path()).unwrap();
+    let (mut core, _rx) = core(&dir);
+    let captured = execution(&core, &builder_team("haiku"));
+    let run = seed_run(&mut core, captured);
+
+    // The first delegation is now preparing its worktree inside this actor. A second task with
+    // new evidence must observe that in-memory state and fail before another helper is launched.
+    core.delegate(request(Some(run))).unwrap();
+    let mut update = request(Some(run));
+    let (evidence, _evidence_owner) =
+        evidence_reference(&core.repo_root, core.registry.state_dir());
+    update.task.evidence = Some(evidence);
+    let err = core.delegate(update).unwrap_err();
+    assert!(matches!(err, CoreError::Policy(ref error) if error.code == PolicyCode::WorktreeBusy));
+
+    let other = RunId::new_v4();
+    let agent = AgentId::new_v4();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentCreated {
+                agent_id: agent,
+                role: RoleName::Builder,
+                provider: ProviderName::Claude,
+                model: "haiku".into(),
+                lineage_id: Some(LineageId::new_v4()),
+                depth: 1,
+                parent_agent_id: None,
+                origin: Origin::Lead,
+                writes: true,
+                cwd: core.repo_root.clone(),
+                worktree: Some(core.repo_root.clone()),
+            },
+        )
+        .unwrap();
+    let mut spoofed = request(Some(other));
+    spoofed.session = SessionSpec::Resume(agent);
+    let (evidence, _spoofed_evidence_owner) =
+        evidence_reference(&core.repo_root, core.registry.state_dir());
+    spoofed.task.evidence = Some(evidence);
+    let err = core.delegate(spoofed).unwrap_err();
+    assert!(matches!(err, CoreError::Policy(ref error) if error.code == PolicyCode::InvalidTask));
+}
+
+#[tokio::test]
+async fn refused_resume_keeps_the_durable_evidence_identity() {
+    let owner = TempDir::new().unwrap();
+    let dir = TempDir::new_in(owner.path()).unwrap();
+    let (mut core, _rx) = core(&dir);
+    let selected = team_value(
+        "build",
+        json!({
+            "builder":{"provider":"claude","model":"haiku"},
+            "reviewer":{"provider":"claude","model":"opus"}
+        }),
+    );
+    let captured = execution(&core, &selected);
+    let run = seed_run(&mut core, captured);
+    let original = synthetic_evidence_reference(
+        core.registry.state_dir(),
+        "original sources",
+        b"original source snapshot",
+    );
+    core.registry
+        .append(
+            &run,
+            EventPayload::TaskEvidenceUpdated {
+                evidence: original.clone(),
+            },
+        )
+        .unwrap();
+    let agent = AgentId::new_v4();
+    let attempt = AttemptId::new_v4();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentCreated {
+                agent_id: agent,
+                role: RoleName::Reviewer,
+                provider: ProviderName::Claude,
+                model: "opus".into(),
+                lineage_id: Some(LineageId::new_v4()),
+                depth: 1,
+                parent_agent_id: None,
+                origin: Origin::Lead,
+                writes: false,
+                cwd: core.repo_root.clone(),
+                worktree: Some(core.repo_root.clone()),
+            },
+        )
+        .unwrap();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentSession {
+                agent_id: agent,
+                attempt_id: attempt,
+                session_id: "session-1".into(),
+                src_line: 1,
+            },
+        )
+        .unwrap();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentStatusChanged {
+                agent_id: agent,
+                status: AgentStatus::Idle,
+                reason: None,
+            },
+        )
+        .unwrap();
+
+    let attempts_before = core.registry.agent(&agent).unwrap().attempt_ids.clone();
+    let evidence = synthetic_evidence_reference(
+        core.registry.state_dir(),
+        "replacement sources",
+        b"replacement source snapshot",
+    );
+    let mut update = request(Some(run));
+    update.role = RoleName::Reviewer;
+    update.session = SessionSpec::Resume(agent);
+    update.task.evidence = Some(evidence);
+    let error = core
+        .delegate(update)
+        .expect_err("this reviewer cannot consume an evidence attachment");
+    assert!(
+        matches!(error, CoreError::Policy(ref p) if p.code == PolicyCode::SandboxMissing),
+        "{error:?}"
+    );
+    let replay = Registry::open(dir.path()).unwrap();
+    assert_eq!(
+        replay.run(&run).unwrap().task.evidence.as_ref(),
+        Some(&original),
+        "refused resume changed durable evidence"
+    );
+    assert_eq!(
+        replay
+            .events(&run, None, usize::MAX)
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::TaskEvidenceUpdated { .. }))
+            .count(),
+        1,
+        "refused resume appended an evidence update"
+    );
+    assert_eq!(
+        replay.agent(&agent).unwrap().attempt_ids,
+        attempts_before,
+        "refused resume created an accepted attempt"
+    );
+    assert!(core.pending_spawn.is_empty(), "refused resume queued a worker");
+    assert!(
+        core.pending_worktree.is_empty(),
+        "refused resume queued a worktree"
+    );
+    drop(replay);
+
+    // A later supported continuation that omits evidence inherits the original identity and is
+    // still usable; the refused replacement must not become a hidden default.
+    let accepted = core.delegate(request(Some(run))).unwrap();
+    let pending = core
+        .pending_worktree
+        .values()
+        .find(|pending| pending.attempt == accepted.attempt_id)
+        .unwrap();
+    assert_eq!(pending.task.evidence.as_ref(), Some(&original));
+}
+
+#[tokio::test]
+async fn idle_resume_persists_evidence_before_the_continuation_prompt() {
+    let owner = TempDir::new().unwrap();
+    let dir = TempDir::new_in(owner.path()).unwrap();
+    let (mut core, mut rx) = core(&dir);
+    let captured = execution(&core, &builder_team("haiku"));
+    let run = seed_run(&mut core, captured);
+    let agent = AgentId::new_v4();
+    let attempt = AttemptId::new_v4();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentCreated {
+                agent_id: agent,
+                role: RoleName::Builder,
+                provider: ProviderName::Claude,
+                model: "haiku".into(),
+                lineage_id: Some(LineageId::new_v4()),
+                depth: 1,
+                parent_agent_id: None,
+                origin: Origin::Lead,
+                writes: true,
+                cwd: core.repo_root.clone(),
+                worktree: Some(core.repo_root.clone()),
+            },
+        )
+        .unwrap();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentSession {
+                agent_id: agent,
+                attempt_id: attempt,
+                session_id: "session-1".into(),
+                src_line: 1,
+            },
+        )
+        .unwrap();
+    core.registry
+        .append(
+            &run,
+            EventPayload::AgentStatusChanged {
+                agent_id: agent,
+                status: AgentStatus::Idle,
+                reason: None,
+            },
+        )
+        .unwrap();
+
+    let (evidence, _evidence_owner) =
+        evidence_reference(&core.repo_root, core.registry.state_dir());
+    let mut update = request(Some(run));
+    update.session = SessionSpec::Resume(agent);
+    update.task.title = "Follow-up title".into();
+    update.task.description = "Deliver the NEW continuation instructions".into();
+    update.task.files = vec!["new-continuation.rs".into()];
+    update.task.acceptance = vec!["Check the NEW continuation criterion".into()];
+    update.task.evidence = Some(evidence.clone());
+    let out = core.delegate(update).unwrap();
+    assert!(core.registry.events(&run, None, usize::MAX).iter()
+        .any(|event| matches!(event.payload, EventPayload::TaskEvidenceUpdated { .. })));
+    let message = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    assert!(matches!(message, Command::EvidenceValidated { attempt, result: Ok(()), .. }
+        if attempt == out.attempt_id), "resume must validate the newly recorded evidence before spawning");
+    assert_eq!(
+        core.registry.run(&run).unwrap().task.evidence.as_ref(),
+        Some(&evidence)
+    );
+    let durable_prompt = handoff::build_builder_prompt(
+        &core.registry.run(&run).unwrap().task,
+        &schema_hint(RoleName::Builder),
+    );
+    assert!(durable_prompt.contains(&evidence.bundle_id));
+}
+
+#[tokio::test]
+async fn fresh_existing_run_persists_and_inherits_evidence_before_worktree_preparation() {
+    for supply_update in [true, false] {
+        let owner = TempDir::new().unwrap();
+        let dir = TempDir::new_in(owner.path()).unwrap();
+        let (mut core, _rx) = core(&dir);
+        let captured = execution(&core, &builder_team("haiku"));
+        let run = seed_run(&mut core, captured);
+        let (evidence, _evidence_owner) =
+            evidence_reference(&core.repo_root, core.registry.state_dir());
+        if !supply_update {
+            core.registry
+                .append(
+                    &run,
+                    EventPayload::TaskEvidenceUpdated {
+                        evidence: evidence.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let mut followup = request(Some(run));
+        followup.task.title = "Fresh continuation title".into();
+        followup.task.description = "Fresh continuation instructions".into();
+        followup.task.files = vec!["fresh-continuation.rs".into()];
+        followup.task.acceptance = vec!["Check the fresh continuation criterion".into()];
+        if supply_update {
+            followup.task.evidence = Some(evidence.clone());
+        }
+        let mut expected_task = followup.task.clone();
+        expected_task.evidence = Some(evidence.clone());
+        core.delegate(followup).unwrap();
+        assert_eq!(
+            core.registry.run(&run).unwrap().task.evidence.as_ref(),
+            Some(&evidence)
+        );
+        let pending = core
+            .pending_worktree
+            .values()
+            .find(|pending| pending.run == run)
+            .unwrap();
+        assert!(pending.prompt.contains("Fresh continuation instructions"));
+        assert!(pending.prompt.contains(&evidence.bundle_id));
+        assert_eq!(pending.task, expected_task);
+        assert_eq!(
+            core.registry
+                .events(&run, None, usize::MAX)
+                .iter()
+                .filter(|event| matches!(event.payload, EventPayload::TaskEvidenceUpdated { .. }))
+                .count(),
+            1
+        );
+        drop(core);
+        let replayed = Registry::open(dir.path()).unwrap();
+        assert_eq!(
+            replayed.run(&run).unwrap().task.evidence.as_ref(),
+            Some(&evidence)
+        );
+    }
 }
 
 #[tokio::test]
@@ -306,7 +790,9 @@ async fn resume_keeps_the_recorded_claude_effort_after_a_team_change() {
     .unwrap();
     let mut captured = execution(&core, &selected);
     // As the lead-start path records it (`execution.assignments["lead"]`).
-    captured.assignments.insert("lead".into(), selected.lead.clone().unwrap());
+    captured
+        .assignments
+        .insert("lead".into(), selected.lead.clone().unwrap());
     let run = seed_run(&mut core, captured);
     team::save_team(&core.state_dir, &builder_team("sonnet")).unwrap();
     for role in [RoleName::Builder, RoleName::Lead] {
@@ -316,13 +802,25 @@ async fn resume_keeps_the_recorded_claude_effort_after_a_team_change() {
             "{role:?}"
         );
     }
-    assert_eq!(core.recorded_effort(&run, RoleName::Builder, ProviderName::Claude, "sonnet"), None);
-    assert_eq!(core.recorded_effort(&run, RoleName::Builder, ProviderName::Codex, "opus"), None);
-    assert_eq!(core.recorded_effort(&run, RoleName::Reviewer, ProviderName::Claude, "opus"), None);
+    assert_eq!(
+        core.recorded_effort(&run, RoleName::Builder, ProviderName::Claude, "sonnet"),
+        None
+    );
+    assert_eq!(
+        core.recorded_effort(&run, RoleName::Builder, ProviderName::Codex, "opus"),
+        None
+    );
+    assert_eq!(
+        core.recorded_effort(&run, RoleName::Reviewer, ProviderName::Claude, "opus"),
+        None
+    );
     // A team that omits effort records none, so the resume argv stays exactly as before.
     let captured = execution(&core, &builder_team("opus"));
     let plain = seed_run(&mut core, captured);
-    assert_eq!(core.recorded_effort(&plain, RoleName::Builder, ProviderName::Claude, "opus"), None);
+    assert_eq!(
+        core.recorded_effort(&plain, RoleName::Builder, ProviderName::Claude, "opus"),
+        None
+    );
 }
 
 #[tokio::test]

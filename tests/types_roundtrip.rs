@@ -403,6 +403,14 @@ const EVENT_FIXTURES: &str = r#"[
   },
   {
     "seq":35, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
+    "kind":"task.evidence_updated", "evidence": {
+      "bundleId":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "root":"/state/evidence/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "title":"updated", "sources":[], "networkCapability":"unverified_provider_controlled"
+    }
+  },
+  {
+    "seq":36, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
     "kind":"run.recovered", "recovery": {
       "request": { "runId":"11111111-1111-4111-8111-111111111111",
         "sourceAgentId":"22222222-2222-4222-8222-222222222222", "expectedSeq":32,
@@ -467,6 +475,7 @@ fn task() -> Task {
         description: "Event serde round-trip + forward-compat".into(),
         files: vec!["tests/types_roundtrip.rs".into()],
         acceptance: vec!["cargo test --test types_roundtrip exits 0".into()],
+        evidence: None,
     }
 }
 
@@ -749,6 +758,11 @@ fn payloads() -> Vec<EventPayload> {
             previous_run_budget_usd: Some(15.0), actor: "cli".into(), continuation: None },
         EventPayload::RunBudgetBlocked { action: agent_control_plane::core::types::BudgetContinuationAction::LoopDecision { attempt_id: attempt_id() }, spend_usd: 14.0,
             spawn_cap_usd: 2.0, run_budget_usd: 15.0 },
+        EventPayload::TaskEvidenceUpdated { evidence: Box::new(agent_control_plane::workspace::evidence::EvidenceReference {
+            bundle_id: "f".repeat(64),
+            root: "/state/evidence/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+            title: "updated".into(), sources: vec![], network_capability: "unverified_provider_controlled".into(),
+        }) },
         EventPayload::RunRecovered { recovery: agent_control_plane::core::recovery::Record {
             request: agent_control_plane::core::recovery::Request { run_id: run_id(), source_agent_id: agent_id(),
                 expected_seq: 32, request_id: uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap(),
@@ -783,8 +797,8 @@ fn event(seq: usize, payload: EventPayload) -> Event {
 fn every_design_event_kind_has_exactly_one_fixture() {
     assert_eq!(
         EVENT_KINDS.len(),
-        35,
-        "budget control appends mutation and exact blocked-decision records"
+        36,
+        "budget changes, blocked decisions and evidence updates extend the event history"
     );
     let fixtures = fixtures();
     let kinds: Vec<&str> = fixtures

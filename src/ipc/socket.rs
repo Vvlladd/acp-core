@@ -727,6 +727,8 @@ impl Connection {
             "subscribe" => self.subscribe(parse_params(params)?).await,
             // Human-only entry point: deliberately absent from the seven MCP/proxy tools.
             "lead.start" => self.lead_start(parse_params(params)?).await,
+            "evidence.import" => self.evidence_import(parse_params(params)?).await,
+            "evidence.show" => self.evidence_show(parse_params(params)?).await,
             "delegate" => self.delegate(parse_params(params)?).await,
             // B3: socket plan entry — same task bounds as `delegate`, applied per work item.
             "plan.start" => self.plan_start(parse_params(params)?).await,
@@ -848,7 +850,7 @@ impl Connection {
     }
 
     async fn delegate(&self, params: DelegateParams) -> Result<Value, RpcError> {
-        let request = params.into_request()?;
+        let request = params.into_request(&self.identity.repo_root, &self.identity.state_dir)?;
         let out = self
             .core
             .delegate(request)
@@ -868,6 +870,7 @@ impl Connection {
             description: params.message.clone(),
             files: Vec::new(),
             acceptance: Vec::new(),
+            evidence: load_reference(&self.identity.repo_root, &self.identity.state_dir, params.evidence_bundle_id.as_deref())?,
         };
         let out = self
             .core
@@ -877,6 +880,25 @@ impl Connection {
             .await
             .map_err(RpcError::from_core)?;
         to_value(&out)
+    }
+
+    async fn evidence_import(&self, params: EvidenceImportParams) -> Result<Value, RpcError> {
+        let state = self.identity.state_dir.clone();
+        let repo = self.identity.repo_root.clone();
+        let manifest = params.manifest;
+        let installed = tokio::task::spawn_blocking(move || crate::workspace::evidence::import(&repo, &state, &manifest))
+            .await.map_err(|e| RpcError::new(-32000, e.to_string()))?
+            .map_err(|e| RpcError::policy("invalid_evidence", e.to_string()))?;
+        to_value(&installed)
+    }
+
+    async fn evidence_show(&self, params: EvidenceShowParams) -> Result<Value, RpcError> {
+        let state = self.identity.state_dir.clone();
+        let repo = self.identity.repo_root.clone();
+        let installed = tokio::task::spawn_blocking(move || crate::workspace::evidence::load(&repo, &state, &params.bundle_id))
+            .await.map_err(|e| RpcError::new(-32000, e.to_string()))?
+            .map_err(|e| RpcError::policy("invalid_evidence", e.to_string()))?;
+        to_value(&installed)
     }
 
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, RpcError> {
@@ -1203,6 +1225,8 @@ struct DelegateParams {
     /// caller (app, CLI, terminal lead) simply omits it.
     #[serde(default)]
     caller_run_id: Option<RunId>,
+    #[serde(default)]
+    evidence_bundle_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1213,7 +1237,17 @@ struct LeadStartParams {
     audit_selection: Option<crate::workspace::git::audit::Selection>,
     #[serde(default)]
     expected_team: Option<crate::core::team::Team>,
+    #[serde(default)]
+    evidence_bundle_id: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvidenceImportParams { manifest: PathBuf }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvidenceShowParams { bundle_id: String }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1233,8 +1267,12 @@ impl DelegateParams {
     /// does not check (`policy.rs`: "`InvalidTask` is raised by the door — the shape of caller
     /// input is a parsing concern, not a state concern"). `baseRef` is checked by
     /// `policy::check_delegate`, so it is passed through untouched.
-    fn into_request(self) -> Result<DelegateRequest, RpcError> {
+    fn into_request(mut self, repo_root: &Path, state_dir: &Path) -> Result<DelegateRequest, RpcError> {
+        if self.task.evidence.is_some() {
+            return Err(RpcError::invalid_params("task.evidence is host-resolved; pass evidenceBundleId".to_string()));
+        }
         check_task(&self.task)?;
+        self.task.evidence = load_reference(repo_root, state_dir, self.evidence_bundle_id.as_deref())?;
         let session = match self.session.as_str() {
             "fresh" => SessionSpec::Fresh,
             other => match other.strip_prefix("resume:") {
@@ -1266,6 +1304,14 @@ impl DelegateParams {
             caller_run_id: self.caller_run_id,
         })
     }
+}
+
+fn load_reference(repo_root: &Path, state_dir: &Path, id: Option<&str>) -> Result<Option<Box<crate::workspace::evidence::EvidenceReference>>, RpcError> {
+    id.map(|id| crate::workspace::evidence::load(repo_root, state_dir, id)
+        .and_then(|manifest| manifest.reference(repo_root, state_dir))
+        .map(Box::new)
+        .map_err(|e| RpcError::policy("invalid_evidence", e.to_string())))
+        .transpose()
 }
 
 #[derive(Deserialize)]
@@ -1548,6 +1594,9 @@ pub(crate) fn task_shape_error(task: &Task) -> Option<String> {
 
 fn check_task_bounds(task: &Task) -> Result<(), String> {
     let invalid = |reason: String| reason;
+    if task.evidence.is_some() {
+        return Err(invalid("task.evidence is host-resolved; use evidenceBundleId on a supported host entry point".to_string()));
+    }
     if task.id.is_empty() || task.id.chars().count() > MAX_TASK_ID_CHARS {
         return Err(invalid(format!(
             "task.id must be 1-{MAX_TASK_ID_CHARS} characters"
@@ -2111,6 +2160,7 @@ mod tests {
             description: "implement the socket door".to_string(),
             files: vec!["src/ipc/socket.rs".to_string()],
             acceptance: vec!["it binds".to_string()],
+            evidence: None,
         };
         check_task(&ok).expect("a well-formed task");
 

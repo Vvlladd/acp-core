@@ -32,6 +32,7 @@ async fn start_live_lead(handle: &CoreHandle) -> (RunId, AgentId) {
         description: "Coordinate the next task.".to_string(),
         files: Vec::new(),
         acceptance: Vec::new(),
+        evidence: None,
     };
     let started = handle
         .start_lead(task, "Coordinate the next task.".to_string())

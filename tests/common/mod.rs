@@ -752,6 +752,7 @@ pub fn loop_task(id: &str) -> Task {
         description: "Add src/adder.ts exporting add(a, b).".to_string(),
         files: vec!["src/adder.ts".to_string()],
         acceptance: vec!["add(1, 2) === 3".to_string()],
+        evidence: None,
     }
 }
 

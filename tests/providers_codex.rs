@@ -861,9 +861,16 @@ fn lead_profile_is_closed_on_fresh_and_resume_and_binds_its_owner() {
         let mut plan = if session.is_some() { CodexAdapter.build_resume(&req) }
             else { CodexAdapter.build_fresh(&req) };
         plan.file = env!("CARGO_BIN_EXE_fake-codex").into();
-        let ctx = ArgvCtx { role: RoleName::Lead, lead_run_id: Some(run), worktree: req.cwd,
-            provider: ProviderName::Codex, sandboxed: false, state_dir: req.state_dir,
-            prompt_index: Some(plan.argv.len()-1) };
+        let ctx = ArgvCtx {
+            role: RoleName::Lead,
+            lead_run_id: Some(run),
+            worktree: req.cwd,
+            provider: ProviderName::Codex,
+            sandboxed: false,
+            evidence: true,
+            state_dir: req.state_dir,
+            prompt_index: Some(plan.argv.len() - 1),
+        };
         assert_safe_argv(plan.clone(), &ctx).expect("the complete restricted lead profile");
         assert_eq!(plan.required_version.as_deref(), Some("codex-cli 0.153.0"));
         assert!(!plan.argv.iter().any(|s| s == "--output-schema"));

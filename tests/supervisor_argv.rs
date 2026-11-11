@@ -119,6 +119,7 @@ impl Fixture {
             worktree: self.repo.path(),
             provider,
             sandboxed,
+            evidence: false,
             state_dir: self.state_dir.path(),
             prompt_index: None,
         }
@@ -1162,6 +1163,77 @@ impl Fixture {
             .insert("PATH".to_string(), common::prepend_path(self.bins.path()));
         plan
     }
+
+    fn claude_read_only_plan(&self) -> SpawnPlan {
+        let req = SpawnRequest {
+            role: &self.reviewer,
+            model: CLAUDE_MODEL,
+            prompt: &self.prompt,
+            role_prompt: &self.role_prompt,
+            cwd: self.repo.path(),
+            attempt_dir: &self.attempt_dir,
+            state_dir: self.state_dir.path(),
+            lead_run_id: None,
+            schema: ("review-verdict", &self.review_schema),
+            max_turns: 12,
+            spawn_budget_usd: 2.5,
+            sandbox: None,
+            session_id: None,
+            effort: None,
+        };
+        let mut plan = ClaudeAdapter.build_fresh(&req);
+        plan.env
+            .insert("PATH".to_string(), common::prepend_path(self.bins.path()));
+        plan
+    }
+}
+
+#[test]
+fn evidence_requires_a_provider_enforced_read_only_route() {
+    let fx = Fixture::new();
+
+    let claude_writer = fx.plan(Combo::BuilderFresh);
+    let mut writer_ctx = fx.ctx_for(ProviderName::Claude, true);
+    writer_ctx.evidence = true;
+    writer_ctx.prompt_index = ClaudeAdapter.prompt_index(&claude_writer);
+    assert_safe_argv(claude_writer, &writer_ctx)
+        .expect("the existing Claude worktree confinement protects external evidence");
+
+    for combo in [Combo::ReviewerFresh, Combo::ReviewerResume] {
+        let plan = fx.plan(combo);
+        let mut ctx = fx.ctx_for(ProviderName::Codex, false);
+        ctx.evidence = true;
+        ctx.prompt_index = CodexAdapter.prompt_index(&plan);
+        assert_safe_argv(plan, &ctx)
+            .unwrap_or_else(|error| panic!("Codex evidence route {combo:?}: {error:?}"));
+    }
+
+    let plan = fx.claude_read_only_plan();
+    let mut ctx = fx.ctx_for(ProviderName::Claude, false);
+    ctx.evidence = true;
+    ctx.prompt_index = ClaudeAdapter.prompt_index(&plan);
+    let error = assert_safe_argv(plan, &ctx)
+        .expect_err("a Claude non-writing profile has no verified evidence boundary");
+    assert_eq!(error.code, PolicyCode::SandboxMissing);
+    assert!(error.reason.contains("supported confined Codex worker"));
+}
+
+#[test]
+fn evidence_codex_route_rejects_missing_read_only_mode() {
+    let fx = Fixture::new();
+    let mut plan = fx.plan(Combo::ReviewerResume);
+    let at = plan
+        .argv
+        .iter()
+        .position(|token| token == r#"sandbox_mode="read-only""#)
+        .expect("read-only mode in adapter plan");
+    plan.argv.drain(at - 1..=at);
+    let mut ctx = fx.ctx_for(ProviderName::Codex, false);
+    ctx.evidence = true;
+    ctx.prompt_index = CodexAdapter.prompt_index(&plan);
+    let error = assert_safe_argv(plan, &ctx).expect_err("evidence needs a positive read-only mode");
+    assert_eq!(error.code, PolicyCode::SandboxMissing);
+    assert!(error.reason.contains("read-only sandbox mode"));
 }
 
 #[test]

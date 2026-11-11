@@ -41,6 +41,7 @@ fn seed() -> (TempDir, Core, RunId, AgentId, AttemptId, AgentId, AttemptId) {
                     description: "Inspect".into(),
                     files: vec![],
                     acceptance: vec![],
+                    evidence: None,
                 },
                 version: 1,
                 lead: None,

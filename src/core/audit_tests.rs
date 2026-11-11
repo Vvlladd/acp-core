@@ -63,6 +63,7 @@ fn seed(core: &mut Core, dir: &TempDir, prepared: bool) -> (RunId, AgentId) {
                     description: "Inspect the existing changes".into(),
                     files: vec![],
                     acceptance: vec!["Report checks".into()],
+                    evidence: None,
                 },
                 version: RUN_VERSION,
                 lead: None,

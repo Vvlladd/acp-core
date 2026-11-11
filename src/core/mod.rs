@@ -214,6 +214,12 @@ pub enum Command {
         attempt: AttemptId,
         result: Box<Result<SpawnedProc, SpawnError>>,
     },
+    EvidenceValidated {
+        attempt: AttemptId,
+        plan: Box<CheckedPlan>,
+        dir: PathBuf,
+        result: Result<(), String>,
+    },
     CommitDone {
         gate: GateId,
         result: Result<String, GitError>,
@@ -827,6 +833,10 @@ impl Core {
                 self.on_worktree_ready(&lineage, result);
                 self.after_turn().await;
             }
+            Command::EvidenceValidated { attempt, plan, dir, result } => {
+                self.on_evidence_validated(attempt, *plan, dir, result);
+                self.after_turn().await;
+            }
             Command::SpawnReady { attempt, result } => {
                 self.on_spawn_ready(&attempt, *result).await;
                 self.after_turn().await;
@@ -1211,6 +1221,30 @@ impl Core {
             };
             let _ = tx.send(Command::WorktreeReady { lineage, result }).await;
         })
+    }
+
+    /// Hash installed evidence off the actor, then return to the actor to recheck cancellation
+    /// and run admission before starting any provider process. PendingSpawn keeps this work busy.
+    fn validate_evidence_helper(
+        &self, attempt: AttemptId,
+        evidence: Box<crate::workspace::evidence::EvidenceReference>,
+        plan: CheckedPlan, dir: PathBuf,
+    ) {
+        let tx = self.tx.clone();
+        let repo_root = self.repo_root.clone();
+        let state_dir = self.registry.state_dir().to_path_buf();
+        tokio::spawn(async move {
+            let validation = tokio::task::spawn_blocking(move ||
+                evidence.validate_for(&repo_root, &state_dir).map(|_| ()));
+            let result = match tokio::time::timeout(git::GIT_OP_TIMEOUT, validation).await {
+                Ok(Ok(result)) => result.map_err(|error| error.to_string()),
+                Ok(Err(error)) => Err(format!("evidence validation helper failed: {error}")),
+                Err(_) => Err("evidence validation exceeded its time bound".into()),
+            };
+            let _ = tx.send(Command::EvidenceValidated {
+                attempt, plan: Box::new(plan), dir, result,
+            }).await;
+        });
     }
 
     /// Starts the provider off the actor and posts [`Command::SpawnReady`].
@@ -1928,6 +1962,7 @@ mod tests {
             description: "the mailbox".to_string(),
             files: vec![],
             acceptance: vec![],
+            evidence: None,
         }
     }
 

@@ -403,6 +403,7 @@ impl From<TaskArgs> for Task {
             description: args.description,
             files: args.files,
             acceptance: args.acceptance,
+            evidence: None,
         }
     }
 }

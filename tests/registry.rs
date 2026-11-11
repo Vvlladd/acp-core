@@ -38,6 +38,7 @@ fn task() -> Task {
         description: "append/reduce/replay/idempotency".into(),
         files: vec!["tests/registry.rs".into()],
         acceptance: vec!["cargo test --test registry exits 0".into()],
+        evidence: None,
     }
 }
 

@@ -760,12 +760,21 @@ async fn a_stale_socket_file_is_replaced_on_the_next_serve() {
     };
     assert!(path.exists(), "the socket file outlives the daemon");
 
-    let second = Door::start_in(dir, fake.handle.clone(), fixture_identity());
-    let mut client = Client::connect(&path).await;
-    let hello = client.call("hello", json!({})).await.expect("hello");
-    assert_eq!(hello["protocolVersion"], json!(PROTOCOL_VERSION));
-
-    second.stop().await.expect("the second door stopped");
+    // serve_socket binds before its first await. Poll it before the client so the stale
+    // socket has been replaced when the client starts its handshake.
+    let shutdown = CancellationToken::new();
+    let replacement = serve_socket(&path, fake.handle.clone(), fixture_identity(), shutdown.clone());
+    let handshake = async {
+        let mut client = Client::connect(&path).await;
+        let hello = client.call("hello", json!({})).await.expect("hello from replacement");
+        assert_eq!(hello["protocolVersion"], json!(PROTOCOL_VERSION));
+        shutdown.cancel();
+    };
+    tokio::time::timeout(LIMIT, async {
+        let (served, ()) = tokio::join!(biased; replacement, handshake);
+        served.expect("the replacement server stopped");
+    }).await.expect("replacement socket handshake completed");
+    drop(dir);
     fake.stop().await;
 }
 

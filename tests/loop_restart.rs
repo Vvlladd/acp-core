@@ -20,6 +20,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+use agent_control_plane::core::gates::GatePayload;
 use agent_control_plane::core::handoff::ADVISORY_OPEN;
 use agent_control_plane::core::types::{
     AgentId, AgentStatus, AttemptKind, AttemptStatus, Event, EventPayload, GateId, GateKind,
@@ -73,6 +74,17 @@ fn reviewers(events: &[Arc<Event>]) -> Vec<AgentId> {
     })
 }
 
+fn verifiers(events: &[Arc<Event>]) -> Vec<AgentId> {
+    pick(events, |p| match p {
+        EventPayload::AgentCreated {
+            agent_id,
+            role: RoleName::Verifier,
+            ..
+        } => Some(*agent_id),
+        _ => None,
+    })
+}
+
 /// The `seq` of the **last** event matching `pred`, so an assertion about ordering after a gate
 /// resolution is not satisfied by an identical event from earlier in the run.
 fn seq_of(events: &[Arc<Event>], what: &str, pred: impl Fn(&EventPayload) -> bool) -> u64 {
@@ -94,6 +106,22 @@ fn integrate_gates(events: &[Arc<Event>]) -> Vec<GateId> {
         } => Some(*gate_id),
         _ => None,
     })
+}
+
+fn gate_payload(
+    world: &LoopWorld,
+    run: &agent_control_plane::core::types::RunId,
+    gate: GateId,
+) -> GatePayload {
+    let path = world
+        .state_dir()
+        .join("runs")
+        .join(run.to_string())
+        .join("gates")
+        .join(format!("{gate}.payload.json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read gate payload {}: {err}", path.display()));
+    serde_json::from_str(&text).expect("the gate payload is valid")
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +494,14 @@ fn a_denied_gate_lets_the_resumed_builder_actually_run() {
         let attempts_before = attempts_started(&events).len();
 
         handle
-            .resolve_gate(gate, false, Some("needs work".to_string()), Actor::Mcp)
+            .resolve_gate(
+                gate,
+                false,
+                Some("needs work".to_string()),
+                Actor::Socket {
+                    client_name: "cli".into(),
+                },
+            )
             .await
             .expect("the denial is answered");
 
@@ -502,6 +537,50 @@ fn a_denied_gate_lets_the_resumed_builder_actually_run() {
             "one review per builder attempt"
         );
         assert_eq!(attempts_started(&events).len(), attempts_before + 3);
+
+        let denied_payload = gate_payload(&world, &run, gate);
+        let denied_hash = denied_payload
+            .diff_hash
+            .expect("the denied gate's diff hash");
+        let second_reviewer = *reviewers(&events)
+            .last()
+            .expect("the repaired change's reviewer");
+        let reviewer_dir = attempts_started(&events)
+            .into_iter()
+            .find_map(|(agent, _, dir)| (agent == second_reviewer).then_some(dir))
+            .expect("the second reviewer's attempt directory");
+        let prompt = rendered_prompt(&reviewer_dir);
+        assert!(prompt.contains("Resolution recorded by: cli"), "{prompt}");
+        assert!(
+            prompt.contains(&format!("Gate: {gate}")),
+            "the repair names its gate: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("Denied diffHash: {denied_hash}")),
+            "the repair stays bound to the diff the human denied: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches("needs work").count(),
+            1,
+            "the applicable feedback is carried once: {prompt}"
+        );
+        assert!(
+            prompt.contains("does not approve the current diff or grant integration authority"),
+            "repair context cannot be mistaken for approval: {prompt}"
+        );
+        let second_verifier = *verifiers(&events)
+            .last()
+            .expect("the repaired change's verifier");
+        let verifier_dir = attempts_started(&events)
+            .into_iter()
+            .find_map(|(agent, _, dir)| (agent == second_verifier).then_some(dir))
+            .expect("the second verifier's attempt directory");
+        let verifier_prompt = rendered_prompt(&verifier_dir);
+        assert!(
+            verifier_prompt.contains(&format!("Gate: {gate}")),
+            "{verifier_prompt}"
+        );
+        assert!(verifier_prompt.contains("needs work"), "{verifier_prompt}");
 
         // Step 19's durable order, read off the log rather than off a snapshot: by the time a test
         // can ask, the loop has already moved on — which is the point.
@@ -549,5 +628,128 @@ fn a_denied_gate_lets_the_resumed_builder_actually_run() {
 
         quiesce(&handle).await;
         actor.stop().await;
+    });
+}
+
+/// Restored prompt reconstruction keeps the newest human repair applicable even when a later MCP
+/// denial asks for something else. MCP feedback remains advisory and cannot supersede criteria
+/// established through the socket path.
+#[test]
+fn restarted_review_keeps_human_repair_past_a_later_mcp_denial() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("pass", &[]);
+        let first = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let out = first
+            .handle
+            .delegate(delegate_builder(loop_task("T38-deny-restart-review")))
+            .await
+            .expect("the delegation is accepted");
+        let run = out.run_id;
+        let events = wait_for_log(&world, &run, "the first integration gate", |events| {
+            !integrate_gates(events).is_empty()
+        })
+        .await;
+        let human_gate = integrate_gates(&events)[0];
+        let human_hash = gate_payload(&world, &run, human_gate)
+            .diff_hash
+            .expect("the human-denied gate's diff hash");
+        first
+            .handle
+            .resolve_gate(
+                human_gate,
+                false,
+                Some("replace the exact pinned behavior".to_string()),
+                Actor::Socket {
+                    client_name: "acp-mac".into(),
+                },
+            )
+            .await
+            .expect("the human denial is answered");
+        let events = wait_for_log(&world, &run, "the second integration gate", |events| {
+            integrate_gates(events).len() >= 2
+        })
+        .await;
+        let mcp_gate = integrate_gates(&events)[1];
+        first.stop().await;
+        let run_dir = world.state_dir().join("runs").join(run.to_string());
+        let denied_payload = run_dir
+            .join("gates")
+            .join(format!("{human_gate}.payload.json"));
+        std::fs::remove_file(&denied_payload)
+            .expect("remove the mutable payload after its denial is durable");
+        // Replay derives the target from diff.frozen + gate.created append order, without
+        // reopening the now-absent payload.
+        {
+            let attempt_id = events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    EventPayload::AttemptStarted { attempt_id, .. } => Some(*attempt_id),
+                    _ => None,
+                })
+                .expect("existing fixture attempt");
+            let mut log = world.reopen();
+            for src_line in 10_000..14_100 {
+                log.append(
+                    &run,
+                    EventPayload::AgentProgress {
+                        attempt_id,
+                        src_line,
+                        phase: "fixture".into(),
+                        note: None,
+                    },
+                )
+                .expect("append disposable transcript progress");
+            }
+        }
+
+        let restarted = start_actor(
+            &world,
+            embedded_roles(),
+            ActorOpts {
+                reattach: false,
+                no_tick: false,
+            },
+        );
+        restarted
+            .handle
+            .resolve_gate(
+                mcp_gate,
+                false,
+                Some("unrelated model feedback".to_string()),
+                Actor::Mcp,
+            )
+            .await
+            .expect("the MCP denial is answered");
+        let events = wait_for_log(&world, &run, "the restored core's reviewer", |events| {
+            reviewers(events).len() >= 3
+                && attempts_started(events).iter().any(|(agent, _, _)| {
+                    reviewers(events)
+                        .last()
+                        .is_some_and(|reviewer| agent == reviewer)
+                })
+        })
+        .await;
+        let reviewer = *reviewers(&events)
+            .last()
+            .expect("the post-restart reviewer");
+        let dir = attempts_started(&events)
+            .into_iter()
+            .find_map(|(agent, _, dir)| (agent == reviewer).then_some(dir))
+            .expect("the post-restart reviewer attempt");
+        let prompt = rendered_prompt(&dir);
+        assert!(prompt.contains(&format!("Gate: {human_gate}")), "{prompt}");
+        assert!(
+            prompt.contains(&format!("Denied diffHash: {human_hash}")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Resolution recorded by: acp-mac"), "{prompt}");
+        assert!(prompt.contains("replace the exact pinned behavior"), "{prompt}");
+        assert!(
+            !prompt.contains("unrelated model feedback"),
+            "MCP feedback superseded human criteria: {prompt}"
+        );
+
+        quiesce(&restarted.handle).await;
+        restarted.stop().await;
     });
 }

@@ -32,7 +32,7 @@ use thiserror::Error;
 use crate::core::registry::Registry;
 use crate::core::team::{provider_str, resolve_assignment, Effort, ValidTeam};
 use crate::core::types::{
-    Actor, AgentHandle, AgentId, AttemptStatus, Gate, GateKind, GateStatus, ProviderName, RoleName,
+    Actor, AgentHandle, AgentId, AgentStatus, AttemptStatus, Gate, GateKind, GateStatus, ProviderName, RoleName,
     RoleSpec, RolesConfig, Run, RunId, RunStatus, Task,
 };
 
@@ -583,7 +583,7 @@ pub fn check_send_message<'a>(
     if ctx.registry.run(&handle.run_id).is_some_and(|r| r.status == RunStatus::Cancelled) {
         return Err(PolicyError::new(PolicyCode::RunBlocked, "this task was cancelled; start a new task"));
     }
-    if !handle.resumable {
+    if handle.status == AgentStatus::Closed || !handle.resumable {
         return Err(PolicyError::new(
             PolicyCode::AgentNotResumable,
             format!("agent {agent} has no provider session to resume yet"),

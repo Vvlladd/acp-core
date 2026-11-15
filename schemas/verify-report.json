@@ -2,19 +2,38 @@
   "$defs": {
     "VerifyStatus": {
       "description": "What one verify attempt found (B1). `nothing-to-run` is a first-class answer: a repo with no\ndiscoverable build/test command must never fail verification for it, and a verifier must never\ninvent a command to have something to report.",
-      "enum": [
-        "pass",
-        "fail",
-        "nothing-to-run"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "pass",
+            "fail",
+            "nothing-to-run"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "blocked",
+          "description": "The selected checks could not run because the worker environment lacked a capability.",
+          "type": "string"
+        }
+      ]
     }
   },
   "additionalProperties": false,
   "description": "The verifier's schema-bound report (B1, `schemas/verify-report.json`). Every string is\nworker-authored and untrusted; the bounds here are the wire contract, enforced by the same\n`jsonschema` validation as the other worker results.",
   "properties": {
+    "blockers": {
+      "description": "Bounded environment capability reasons. Non-empty exactly for `status: blocked`.",
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 20,
+      "type": "array"
+    },
     "commands": {
-      "description": "The build/test commands actually run, for the human and the reviewer — never re-executed.",
+      "description": "The build/test commands run or concretely attempted, for the human and reviewer — never\nre-executed by ACP.",
       "items": {
         "maxLength": 500,
         "minLength": 1,
@@ -48,6 +67,7 @@
     }
   },
   "required": [
+    "blockers",
     "commands",
     "diffHash",
     "failures",

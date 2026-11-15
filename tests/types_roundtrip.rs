@@ -24,7 +24,8 @@ use agent_control_plane::core::plan::{Plan, PlanItem, PlanItemKind, PlanItemStat
 use agent_control_plane::core::types::{
     Actor, AgentHandle, AgentId, AgentStatus, Attempt, AttemptError, AttemptId, AttemptKind,
     AttemptStatus, CancelBy, CommitTarget, CostSource, DelegatedTarget, ErrorCode, Event,
-    EventBase, EventPayload, False, Gate, GateId, GateKind, GateStatus, LineageId, LoopBranch,
+    EventBase, EventPayload, ExternalCommandResult, ExternalCommandStatus,
+    ExternalVerificationEvidence, False, Gate, GateId, GateKind, GateStatus, LineageId, LoopBranch,
     LoopState, MessageRole, Origin, PolicyViolation, ProviderName, ReviewFinding, RoleName, RunId,
     RunStatus, SchemaName, Severity, Task, TokenUsage, Verdict, VerifyStatus, ViolationKind,
     EVENT_KINDS,
@@ -330,7 +331,9 @@ const EVENT_FIXTURES: &str = r#"[
     "builderAttemptId": "33333333-3333-4333-8333-333333333333",
     "status": "fail",
     "summary": "cargo test: 1 of 12 failing",
-    "failures": ["types::round_trip"]
+    "commands": ["cargo test"],
+    "failures": ["types::round_trip"],
+    "blockers": []
   },
   {
     "seq": 27, "ts": "2026-08-22T22:00:00.000Z", "runId": "11111111-1111-4111-8111-111111111111",
@@ -419,6 +422,21 @@ const EVENT_FIXTURES: &str = r#"[
       "agentId":"88888888-8888-4888-8888-888888888888", "by":"acp-mac",
       "gateIds":["44444444-4444-4444-8444-444444444444"]
     }
+  },
+  {
+    "seq":37, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
+    "kind":"verification.external.prepared", "gateId":"44444444-4444-4444-8444-444444444444",
+    "evidence": {
+      "builderAttemptId":"33333333-3333-4333-8333-333333333333",
+      "diffHash":"7d6d0f2c1b3a49586776859493a2b1c0dfeeddccbbaa99887766554433221100",
+      "expectedRunSeq":32,
+      "commands":[{"workerCommand":"cargo test --locked","argv":["cargo","test","--locked"],"status":"passed","exitStatus":0}],
+      "toolchainIdentity":"rustc 1.94.0", "provenance":"human host shell",
+      "sourceInventoryBeforeHash":"7d6d0f2c1b3a49586776859493a2b1c0dfeeddccbbaa99887766554433221100",
+      "sourceInventoryAfterHash":"7d6d0f2c1b3a49586776859493a2b1c0dfeeddccbbaa99887766554433221100",
+      "attestation":"I ran the recorded argv.", "limitations":["human attestation"]
+    },
+    "daemonCapturedInventoryHash":"7d6d0f2c1b3a49586776859493a2b1c0dfeeddccbbaa99887766554433221100"
   }
 ]"#;
 
@@ -619,6 +637,7 @@ fn payloads() -> Vec<EventPayload> {
             },
         },
         EventPayload::DiffFrozen {
+            source_inventory_hash: None,
             attempt_id: attempt_id(),
             diff_path: PathBuf::from(DIFF_PATH),
             diff_hash: DIFF_HASH.into(),
@@ -663,6 +682,7 @@ fn payloads() -> Vec<EventPayload> {
             gate_kind: GateKind::Integrate,
             summary: "Integrate T08 - 1 file changed".into(),
             payload_path: PathBuf::from(GATE_PAYLOAD_PATH),
+            repair_binding: None,
             requested_by: Origin::ControlPlane,
         },
         EventPayload::GateResolving {
@@ -673,6 +693,7 @@ fn payloads() -> Vec<EventPayload> {
                 client_name: "acp-mac".into(),
             },
             commit: Some(commit_target()),
+            external_verification: None,
         },
         EventPayload::GateResolved {
             gate_id: gate_id(),
@@ -703,7 +724,9 @@ fn payloads() -> Vec<EventPayload> {
             builder_attempt_id: attempt_id(),
             status: VerifyStatus::Fail,
             summary: "cargo test: 1 of 12 failing".into(),
+            commands: vec!["cargo test".into()],
             failures: vec!["types::round_trip".into()],
+            blockers: vec![],
         },
         EventPayload::PlanCreated {
             plan: Plan {
@@ -771,6 +794,19 @@ fn payloads() -> Vec<EventPayload> {
             agent_id: "88888888-8888-4888-8888-888888888888".parse().unwrap(),
             by: Actor::Socket { client_name: "acp-mac".into() }, gate_ids: vec![gate_id()],
         } },
+        EventPayload::ExternalVerificationPrepared {
+            gate_id: gate_id(),
+            evidence: ExternalVerificationEvidence {
+                builder_attempt_id: attempt_id(), diff_hash: DIFF_HASH.into(), expected_run_seq: 32,
+                commands: vec![ExternalCommandResult { worker_command: "cargo test --locked".into(),
+                    argv: vec!["cargo".into(), "test".into(), "--locked".into()],
+                    status: ExternalCommandStatus::Passed, exit_status: Some(0) }],
+                toolchain_identity: "rustc 1.94.0".into(), provenance: "human host shell".into(),
+                source_inventory_before_hash: DIFF_HASH.into(), source_inventory_after_hash: DIFF_HASH.into(),
+                attestation: "I ran the recorded argv.".into(), limitations: vec!["human attestation".into()],
+            },
+            daemon_captured_inventory_hash: DIFF_HASH.into(),
+        },
     ]
 }
 
@@ -797,8 +833,8 @@ fn event(seq: usize, payload: EventPayload) -> Event {
 fn every_design_event_kind_has_exactly_one_fixture() {
     assert_eq!(
         EVENT_KINDS.len(),
-        36,
-        "budget changes, blocked decisions and evidence updates extend the event history"
+        37,
+        "budget, evidence and external verification records each have a wire fixture"
     );
     let fixtures = fixtures();
     let kinds: Vec<&str> = fixtures
@@ -1107,4 +1143,27 @@ fn run_delegated_pins_the_plan_container_shape_too() {
     );
     let parsed: Event = serde_json::from_value(fixture).expect("deserialize container fixture");
     assert_eq!(parsed, original, "the container fixture deserialized wrong");
+}
+
+#[test]
+fn legacy_verify_events_and_stored_reports_remain_replayable() {
+    use agent_control_plane::core::{registry::Registry, types::VerifyReport};
+    let state = tempfile::tempdir().unwrap();
+    let log = state.path().join("runs").join(RUN_ID).join("events.jsonl");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let mut event = fixtures().into_iter().find(|value| value["kind"] == "verify.report").unwrap();
+    event.as_object_mut().unwrap().remove("commands");
+    event.as_object_mut().unwrap().remove("blockers");
+    std::fs::write(&log, format!("{}\n{}\n", fixtures()[0], event)).unwrap();
+    let registry = Registry::open(state.path()).unwrap();
+    assert!(registry.events(&run_id(), None, usize::MAX).iter().any(|event|
+        matches!(&event.payload, EventPayload::VerifyReport { commands, blockers, .. }
+            if commands.is_empty() && blockers.is_empty())));
+    let old_report = json!({ "status":"pass", "summary":"legacy passing checks", "commands":["cargo test"],
+        "failures":[], "diffHash":DIFF_HASH });
+    let report: VerifyReport = serde_json::from_value(old_report.clone()).unwrap();
+    assert!(report.blockers.is_empty());
+    let schema: Value = serde_json::from_str(include_str!("../schemas/verify-report.json")).unwrap();
+    assert!(!jsonschema::validator_for(&schema).unwrap().is_valid(&old_report),
+        "new worker output still requires explicit blockers");
 }

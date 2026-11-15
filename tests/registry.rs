@@ -474,6 +474,7 @@ fn reopening_after_a_kill_rebuilds_an_identical_state() {
                 gate_kind: GateKind::Integrate,
                 summary: "integrate".into(),
                 payload_path: state.path().join("gates/g.json"),
+                repair_binding: None,
                 requested_by: Origin::ControlPlane,
             },
             EventPayload::GateResolving {
@@ -484,6 +485,7 @@ fn reopening_after_a_kill_rebuilds_an_identical_state() {
                     client_name: "acp-mac".into(),
                 },
                 commit: None,
+                external_verification: None,
             },
         ] {
             registry.append(&run, event).expect("append");

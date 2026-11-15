@@ -395,6 +395,9 @@ impl super::Core {
         use super::types::{GateStatus, RunStatus};
         let state = self.registry.state();
         let mut reasons = Vec::new();
+        if !self.retention_waiters.is_empty() {
+            reasons.push("A worktree retirement is in progress".into());
+        }
         if !self.local_checks.is_empty() { reasons.push("A local code review is running".into()); }
         if let Some(failure) = &self.lifecycle.failure {
             reasons.push(failure.clone());
@@ -404,6 +407,8 @@ impl super::Core {
             || !self.pending_spawn.is_empty()
             || !self.pending_retry.is_empty()
             || !self.pending_audit.is_empty()
+            || !self.pending_source_inventory.is_empty()
+            || !self.pending_external_verification.is_empty()
             || !self.in_flight.is_empty()
             || !self.gate_waiters.is_empty()
             || !self.settled.is_empty()

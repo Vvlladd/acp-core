@@ -43,7 +43,7 @@ use crate::core::team::{self, Effort, ValidTeam};
 use crate::core::types::{
     require_all_properties, strip_dollar_schema, Actor, AgentId, AgentStatus, AttemptError, AttemptId,
     AttemptKind, AttemptStatus, BudgetContinuationAction, BuildResult, BuildStatus, CancelBy,
-    DelegatedTarget, ErrorCode, Event, EventPayload, False, GateId, GateKind, GateStatus, LineageId,
+    DelegatedTarget, ErrorCode, Event, EventPayload, ExternalVerificationEvidence, False, GateId, GateKind, GateStatus, LineageId,
     LoopBranch, LoopState,
     MessageRole, Origin, ProviderName, ReviewFinding, ReviewVerdict, RoleName, RolesConfig, Run,
     RunExecution, RunId, RunMode, RunStatus, RunSteps, SchemaName, Severity, Task, Verdict,
@@ -186,6 +186,10 @@ pub struct PendingSpawn {
 }
 
 impl PendingSpawn {
+    pub(super) fn run_id(&self) -> RunId {
+        self.ctx.run
+    }
+
     /// Which agent this spawn belongs to — the in-flight guard [`Core::reconcile_intents`] reads.
     #[must_use]
     pub fn agent(&self) -> AgentId {
@@ -2192,6 +2196,10 @@ impl Core {
         let kind = self.registry.gate(&gate).map(|g| g.kind);
         match r {
             GateResolution::Approved { .. } => {
+                if kind == Some(GateKind::ExternalVerification) {
+                    self.continue_external_verification(gate);
+                    return;
+                }
                 // Only an integrate approval concludes its run. A `plan` (or `escalate`) approval
                 // is an answered question: the conductor reads the gate itself on the poke below.
                 if kind == Some(GateKind::Integrate) {
@@ -2217,6 +2225,10 @@ impl Core {
                     );
                 }
                 self.drive_plans();
+            }
+            GateResolution::Denied { .. } if kind == Some(GateKind::ExternalVerification) => {
+                // The denial and its feedback are already durable on the gate. Keep the
+                // verifier's original block so a later approved report can resume its checks.
             }
             GateResolution::Denied { feedback } => {
                 let Some(agent) = self.live_builder(&run) else {
@@ -2323,6 +2335,13 @@ impl Core {
     pub fn reconcile_intents(&mut self) {
         self.reconcile_budget_continuations();
         self.drive_audits();
+        let external: Vec<GateId> = self.registry.state().gates.values()
+            .filter(|gate| gate.kind == GateKind::ExternalVerification && gate.status == GateStatus::Approved)
+            .map(|gate| gate.gate_id)
+            .collect();
+        for gate in external {
+            self.continue_external_verification(gate);
+        }
         for agent in self.agents_owed_a_spawn() {
             self.reissue_spawn(&agent);
         }
@@ -2498,12 +2517,16 @@ impl Core {
                     .and_then(|a| a.structured.clone())
                     .and_then(|v| serde_json::from_value::<BuildResult>(v).ok());
                 let verify = self.recorded_verify_report(&run, frozen.attempt);
-                handoff::build_reviewer_prompt(
+                let external = self.recorded_external_evidence(&run, frozen.attempt, &frozen.hash);
+                let repair = gates::current_integration_repair(&self.registry, &run, frozen.attempt);
+                handoff::build_reviewer_prompt_with_context(
                     &task,
                     &frozen.path,
                     &frozen.hash,
                     build.as_ref(),
                     verify.as_ref(),
+                    external.as_ref(),
+                    repair.as_ref(),
                 )
             }
             // B1: same reconstruction as the reviewer arm above, with the verifier's prompt.
@@ -2536,7 +2559,15 @@ impl Core {
                     .attempt(&frozen.attempt)
                     .and_then(|a| a.structured.clone())
                     .and_then(|v| serde_json::from_value::<BuildResult>(v).ok());
-                handoff::build_verifier_prompt(&task, &frozen.path, &frozen.hash, build.as_ref())
+                let repair =
+                    gates::current_integration_repair(&self.registry, &run, frozen.attempt);
+                handoff::build_verifier_prompt_with_repair(
+                    &task,
+                    &frozen.path,
+                    &frozen.hash,
+                    build.as_ref(),
+                    repair.as_ref(),
+                )
             }
             // A builder whose parent belongs to a **closed** lineage is 17d's replacement; one with
             // no parent at all is a lead's first builder.
@@ -3433,12 +3464,16 @@ impl Core {
         // prompt. Read from the log rather than passed by the caller so a replacement reviewer
         // after a crash — and a re-drive after a restart — carries it identically.
         let verify = self.recorded_verify_report(run, frozen.attempt);
-        let prompt = handoff::build_reviewer_prompt(
+        let external = self.recorded_external_evidence(run, frozen.attempt, &frozen.hash);
+        let repair = gates::current_integration_repair(&self.registry, run, frozen.attempt);
+        let prompt = handoff::build_reviewer_prompt_with_context(
             &task,
             &frozen.path,
             &frozen.hash,
             build.as_ref(),
             verify.as_ref(),
+            external.as_ref(),
+            repair.as_ref(),
         );
         self.start_attempt(StartSpawn {
             run: *run,
@@ -3530,8 +3565,14 @@ impl Core {
             .attempt(&frozen.attempt)
             .and_then(|a| a.structured.clone())
             .and_then(|v| serde_json::from_value::<BuildResult>(v).ok());
-        let prompt =
-            handoff::build_verifier_prompt(&task, &frozen.path, &frozen.hash, build.as_ref());
+        let repair = gates::current_integration_repair(&self.registry, run, frozen.attempt);
+        let prompt = handoff::build_verifier_prompt_with_repair(
+            &task,
+            &frozen.path,
+            &frozen.hash,
+            build.as_ref(),
+            repair.as_ref(),
+        );
         self.start_attempt(StartSpawn {
             run: *run,
             agent,
@@ -3651,6 +3692,26 @@ impl Core {
             return;
         }
 
+        if !valid_verify_report_shape(&report) {
+            self.emit(
+                &f.run,
+                EventPayload::AttemptFinished {
+                    attempt_id: f.attempt,
+                    status: AttemptStatus::InvalidOutput,
+                    exit_code: None,
+                    signal: None,
+                    post_sha: None,
+                    duration_ms: 0,
+                    error: Some(AttemptError {
+                        code: ErrorCode::SchemaInvalid,
+                        message: "verify status contradicts its failures/blockers fields".into(),
+                    }),
+                },
+            );
+            self.retry_verifier(f, &frozen, "the verifier returned a contradictory report");
+            return;
+        }
+
         if !self.verify_report_since(&f.run, f.finish_seq) {
             self.emit(
                 &f.run,
@@ -3661,8 +3722,16 @@ impl Core {
                     // Schema validation already bounds these (summary <= 4000, failures <= 50 x
                     // 1000); the clamp is belt-and-braces for a hand-written log.
                     summary: clamp_untrusted(&report.summary, 4_000),
+                    commands: report.commands.iter()
+                        .map(|line| clamp_untrusted(line, 500))
+                        .collect(),
                     failures: report
                         .failures
+                        .iter()
+                        .map(|line| clamp_untrusted(line, 1_000))
+                        .collect(),
+                    blockers: report
+                        .blockers
                         .iter()
                         .map(|line| clamp_untrusted(line, 1_000))
                         .collect(),
@@ -3681,6 +3750,19 @@ impl Core {
             };
             self.branch_strike(f, &builder, StrikeCause::VerifyFail(Box::new(report)))
                 .await;
+            return;
+        }
+
+
+        if report.status == VerifyStatus::Blocked {
+            self.block_run(
+                &f.run,
+                &format!(
+                    "verification is environment-blocked: {}",
+                    report.blockers.iter().map(String::as_str).collect::<Vec<_>>().join("; ")
+                ),
+            );
+            self.mark(f, LoopBranch::Verify);
             return;
         }
 
@@ -3891,10 +3973,12 @@ impl Core {
     /// Step 16: the gate a `PASS` opens. Its summary names **every** policy violation of the
     /// lineage, because the human approving it is the last reader before the work is committed.
     fn open_integrate_gate(&mut self, f: &Finished, frozen: &Frozen, reviewed: bool) {
-        if !self.security_ready_for_gate(f, frozen) {
-            return;
-        }
-        if self.gate_since(&f.run, f.finish_seq) {
+        if !self.security_ready_for_gate(f, frozen) { return; }
+        // An approved external-evidence gate authorizes continuation, not integration. Only
+        // an integration gate can satisfy this branch's replay/idempotence check.
+        if self.since(&f.run, f.finish_seq).iter().any(|event| matches!(
+            event.payload, EventPayload::GateCreated { gate_kind: GateKind::Integrate, .. }
+        )) {
             self.set_awaiting_gate(&f.run);
             return;
         }
@@ -3939,6 +4023,16 @@ impl Core {
                         clamp_untrusted(&report.summary, 200)
                     )
                 }
+                VerifyStatus::Blocked => {
+                    format!(
+                        "Verified in worker: BLOCKED — {}\n\n",
+                        clamp_untrusted(&report.summary, 200)
+                    )
+                }
+            });
+        let external_line = self.recorded_external_evidence(&f.run, frozen.attempt, &frozen.hash)
+            .map_or_else(String::new, |_| {
+                "Human host evidence: all recorded commands passed; explicit attestation, not cryptographic proof.\n\n".to_string()
             });
         let lead_line = if reviewed {
             "A reviewer passed this change."
@@ -3958,12 +4052,9 @@ impl Core {
             .task_of(&f.run)
             .map(|t| format!("{}: {}", t.id, t.title));
         let summary = format!(
-            "{lead_line}\n\n{}\n\n{verify_line}{}\n\n{} file(s) changed.\n\n{}",
-            if self.run_steps(&f.run).security {
-                "Security review passed for this frozen diff."
-            } else {
-                "Security review was not run."
-            },
+            "{lead_line}\n\n{}\n\n{verify_line}{external_line}{}\n\n{} file(s) changed.\n\n{}",
+            if self.run_steps(&f.run).security { "Security review passed for this frozen diff." }
+            else { "Security review was not run." },
             task_line.clone().unwrap_or_default(),
             frozen.files.len(),
             self.violation_summary(&violations_agent)
@@ -3973,6 +4064,7 @@ impl Core {
             // The commit subject is the task line; the summary above — review sentence first, as
             // loud as the human gate needs it — becomes the commit body.
             subject: task_line,
+            external_verification: None,
             diff_path: Some(frozen.path.clone()),
             // The three fields that bind an approval to this exact diff (Rev 25): the commit helper
             // re-freezes the worktree against `pre_sha` and refuses to commit unless it still
@@ -5358,6 +5450,102 @@ impl Core {
             .and_then(|v| serde_json::from_value::<VerifyReport>(v).ok())
     }
 
+    /// Approved human host evidence for exactly these frozen bytes. An older record becomes
+    /// invisible as soon as a repair produces a new builder attempt or diff hash.
+    fn recorded_external_evidence(
+        &self,
+        run: &RunId,
+        builder_attempt: AttemptId,
+        diff_hash: &str,
+    ) -> Option<ExternalVerificationEvidence> {
+        gates::accepted_external_evidence(&self.registry, run, builder_attempt, diff_hash)
+    }
+
+    /// Continues the selected ordinary checks after deliberate host evidence. The blocked worker
+    /// report remains durable, no verifier retry or builder strike is consumed, and replay is a
+    /// no-op once a reviewer (or integrate gate for a no-review team) exists.
+    fn continue_external_verification(&mut self, gate_id: GateId) {
+        let Some(gate) = self.registry.gate(&gate_id).cloned() else { return; };
+        if gate.kind != GateKind::ExternalVerification || gate.status != GateStatus::Approved {
+            return;
+        }
+        let events = self.registry.events(&gate.run_id, None, usize::MAX);
+        let Some(evidence) = events.iter().rev().find_map(|event| match &event.payload {
+            EventPayload::GateResolving { gate_id: id, external_verification: Some(evidence), .. }
+                if *id == gate_id => Some(evidence.clone()),
+            _ => None,
+        }) else {
+            self.block_run(&gate.run_id, "approved external verification has no durable accepted evidence");
+            return;
+        };
+        let is_current = self.registry.events(&gate.run_id, None, usize::MAX).iter().rev().find_map(|e| match &e.payload {
+            EventPayload::DiffFrozen { attempt_id, diff_hash, .. } => Some((*attempt_id, diff_hash.as_str())),
+            _ => None,
+        }).is_some_and(|(attempt, hash)| {
+            attempt == evidence.builder_attempt_id && hash == evidence.diff_hash
+        });
+        if !is_current {
+            return;
+        }
+        let Some(frozen) = self.frozen_diff(&gate.run_id, &evidence.builder_attempt_id)
+            .filter(|f| f.hash == evidence.diff_hash) else { return; };
+        if self.registry.run(&gate.run_id).is_some_and(|r| r.status == RunStatus::Cancelled) {
+            return;
+        }
+        let Some(builder) = self.registry.attempt(&frozen.attempt).map(|a| a.agent_id) else {
+            self.block_run(&gate.run_id, "external evidence names a builder attempt no longer on record");
+            return;
+        };
+        if !self.run_steps(&gate.run_id).review {
+            if self.registry.state().gates.values().any(|g| {
+                g.run_id == gate.run_id && g.kind == GateKind::Integrate
+                    && matches!(g.status, GateStatus::Pending | GateStatus::Resolving | GateStatus::Approved)
+            }) {
+                return;
+            }
+            if !self.resume_external_verification_block(&gate.run_id, gate_id) { return; }
+            let verifier_attempt = self.registry.events(&gate.run_id, None, usize::MAX).iter().rev().find_map(|e| match e.payload {
+                EventPayload::VerifyReport { attempt_id, builder_attempt_id, .. }
+                    if builder_attempt_id == frozen.attempt => Some(attempt_id),
+                _ => None,
+            });
+            if let Some(f) = verifier_attempt.and_then(|id| self.finished(&id)) {
+                self.open_integrate_gate(&f, &frozen, false);
+            }
+            return;
+        }
+        if self.workers_for(&gate.run_id, frozen.attempt, RoleName::Reviewer) != 0 {
+            return;
+        }
+        if !self.resume_external_verification_block(&gate.run_id, gate_id) { return; }
+        if self.workers_for(&gate.run_id, frozen.attempt, RoleName::Reviewer) == 0 {
+            if let Err(err) = self.start_reviewer(&gate.run_id, builder, &frozen) {
+                self.block_run(&gate.run_id, &format!("the reviewer could not be started: {}", err.reason));
+            }
+        }
+    }
+
+    fn resume_external_verification_block(&mut self, run: &RunId, gate_id: GateId) -> bool {
+        let Some(current) = self.registry.run(run) else { return false; };
+        if current.status == RunStatus::Running {
+            return true;
+        }
+        if current.status != RunStatus::Blocked { return false; }
+        let events = self.registry.events(run, None, usize::MAX);
+        let gate_seq = events.iter().find_map(|e| matches!(e.payload,
+            EventPayload::GateResolved { gate_id: id, status: GateStatus::Approved, .. } if id == gate_id)
+            .then_some(e.base.seq)).unwrap_or(0);
+        let Some((status_seq, reason)) = events.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::RunStatus_ { status: RunStatus::Blocked, reason } => Some((e.base.seq, reason.as_deref())),
+            _ => None,
+        }) else { return false; };
+        if status_seq > gate_seq || !reason.is_some_and(|r| r.starts_with("verification is environment-blocked:")) {
+            return false;
+        }
+        self.emit(run, EventPayload::RunStatus_ { status: RunStatus::Running, reason: None });
+        true
+    }
+
     /// B1's mirror of [`Self::reviewers_for`]: how many verifiers one frozen diff has consumed.
     fn verifiers_for(&self, run: &RunId, builder_attempt: AttemptId) -> usize {
         self.workers_for(run, builder_attempt, RoleName::Verifier)
@@ -5463,6 +5651,20 @@ impl Core {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Cross-field rules JSON Schema cannot express. A blocked report names bounded capability
+/// reasons and no code failures; every other outcome has no blockers, and only `fail` has failures.
+pub(crate) fn valid_verify_report_shape(report: &VerifyReport) -> bool {
+    match report.status {
+        VerifyStatus::Blocked => {
+            !report.commands.is_empty() && !report.blockers.is_empty() && report.failures.is_empty()
+        }
+        VerifyStatus::Fail => report.blockers.is_empty(),
+        VerifyStatus::Pass | VerifyStatus::NothingToRun => {
+            report.blockers.is_empty() && report.failures.is_empty()
+        }
+    }
+}
 
 fn run_created(
     p: &PendingWorktree,

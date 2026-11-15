@@ -82,6 +82,10 @@ const FIXTURES: &[(&str, &str)] = &[
         include_str!("../../fixtures/jsonl/claude/verify-nothing-1.jsonl"),
     ),
     (
+        "verify-blocked-1",
+        include_str!("../../fixtures/jsonl/claude/verify-blocked-1.jsonl"),
+    ),
+    (
         "verify-ftp-1",
         include_str!("../../fixtures/jsonl/claude/verify-ftp-1.jsonl"),
     ),
@@ -111,6 +115,7 @@ const TRANSCRIPTS: &[(&str, &str)] = &[
     ("verify_pass", "verify-pass"),
     ("verify_fail", "verify-fail"),
     ("verify_nothing", "verify-nothing"),
+    ("verify_blocked", "verify-blocked"),
     ("verify_fail_then_pass", "verify-ftp"),
 ];
 

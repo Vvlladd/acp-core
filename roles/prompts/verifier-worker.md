@@ -36,6 +36,11 @@ human is about to approve, and the control plane will refuse to integrate it.
 3. If you can find **no** build or test command — nothing in the repository declares one —
    your report's `status` is `"nothing-to-run"`. Never invent a command, never write a test
    to have something to run, and never treat "nothing to run" as a failure.
+4. If a declared command cannot run because this worker environment lacks a required capability
+   (for example a denied temporary directory, local socket, process inspection, or toolchain),
+   report `"blocked"`. Name only the concrete capability and observed denial in `blockers`; do
+   not call the check passed, retry it in the same environment, or authorize another environment.
+   A real compiler/test failure is still `"fail"`, even if other checks were blocked.
 
 Keep it to what verification needs: no linters or extra tools the task did not ask about, no
 network access, no installing dependencies beyond what the project's own build fetches itself.
@@ -51,17 +56,22 @@ after it, no markdown fence, no commentary:
   "summary": "cargo build and cargo test: 483 tests passed, 0 failed.",
   "commands": ["cargo build", "cargo test"],
   "failures": [],
+  "blockers": [],
   "diffHash": "<the diffHash from your prompt, copied character for character>"
 }
 ```
 
 - `status` — `"pass"` if everything you ran succeeded; `"fail"` if the build broke or any test
-  failed; `"nothing-to-run"` if the repository declares no way to build or test.
+  failed; `"blocked"` if a required check could not run because the worker environment lacked a
+  capability; `"nothing-to-run"` if the repository declares no way to build or test.
 - `summary` — one or two sentences of what you ran and what happened, at most 4000 characters.
 - `commands` — the exact commands you ran, in order, at most 20. Empty for `nothing-to-run`.
 - `failures` — one entry per failing test (its name) or the single most important build error,
   at most 50 entries of at most 1000 characters each. **Empty unless `status` is `"fail"`.**
   These lines are what the builder gets told to fix — name the failing thing precisely.
+- `blockers` — concrete environment capability denials, at most 20 entries of at most 1000
+  characters each. Non-empty exactly for `"blocked"`; empty for every other status. A blocked
+  report must have no `failures`.
 - `diffHash` — copy the 64-character hex `diffHash` string out of your prompt **verbatim**. It
   binds your report to the state you actually verified; a report whose hash is missing or
   altered is discarded and the verification is run again.

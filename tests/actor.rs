@@ -1707,7 +1707,9 @@ async fn a_restart_reissued_replacement_inherits_the_verify_failure_text() {
                 builder_attempt_id: attempt,
                 status: VerifyStatus::Fail,
                 summary: "the build broke before any test ran".to_string(),
+                commands: vec!["cargo test".into()],
                 failures: failures.clone(),
+                blockers: vec![],
             };
             let (first, second) = if verdict_first {
                 (verdict, report)

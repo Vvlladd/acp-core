@@ -546,6 +546,7 @@ fn verify_repair_prompt_carries_the_failure_text_verbatim_as_data() {
             "core::types::tests::round_trip".into(),
             "error[E0308]: mismatched types in src/core/loop.rs:42".into(),
         ],
+        blockers: vec![],
         diff_hash: DIFF_HASH.into(),
     };
     let prompt = build_verify_repair_prompt(&report, &task());
@@ -569,6 +570,7 @@ fn reviewer_prompt_quotes_the_verify_report_as_data() {
         summary: "cargo test: 490 passed".into(),
         commands: vec!["cargo test".into()],
         failures: vec![],
+        blockers: vec![],
         diff_hash: DIFF_HASH.into(),
     };
     let prompt = build_reviewer_prompt(
@@ -599,6 +601,7 @@ fn reviewer_prompt_with_build_and_verify_carries_two_balanced_advisory_blocks() 
         summary: "cargo test: 490 passed".into(),
         commands: vec!["cargo test".into()],
         failures: vec![],
+        blockers: vec![],
         diff_hash: DIFF_HASH.into(),
     };
     let prompt = build_reviewer_prompt(
@@ -626,6 +629,7 @@ fn verify_repair_prompt_renders_a_failures_section_even_when_the_list_is_empty()
         summary: "the build broke".into(),
         commands: vec!["cargo build".into()],
         failures: vec![],
+        blockers: vec![],
         diff_hash: DIFF_HASH.into(),
     };
     let prompt = build_verify_repair_prompt(&report, &task());

@@ -507,6 +507,7 @@ pub(super) fn reduce(state: &mut super::registry::State, event: &Event, record: 
         if let Some(a) = state.agents.get_mut(id) {
             if a.role != RoleName::Lead {
                 a.status = AgentStatus::Closed;
+                a.resumable = false;
             }
         }
     }

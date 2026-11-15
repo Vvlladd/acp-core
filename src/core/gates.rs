@@ -38,12 +38,15 @@
 //!   [`GateResolution::AlreadyResolved`] *while the first commit is still running* — one commit,
 //!   one `integrate.committed`, whichever door raced.
 //!
-//! **The payload file is read exactly once**, by [`begin_resolve`], and only while the gate is
-//! still `pending`. What the commit needs — worktree, subject, files — is copied into the
+//! **The commit path reads the payload file exactly once**, by [`begin_resolve`], and only while
+//! the gate is still `pending`. What the commit needs — worktree, subject, files — is copied into the
 //! `gate.resolving` event as a [`CommitTarget`] before any git call, and every later step reads it
 //! back from the projection. So a `<gateId>.payload.json` deleted or corrupted *after* the window
 //! opened (an `acp gc`, a partial restore) cannot strand a commit that exists in the repository
-//! with no event recording it, and cannot stop reconciliation finding it by trailer.
+//! with no event recording it, and cannot stop reconciliation finding it by trailer. A denied
+//! gate's downstream advisory context may read the payload again to attribute feedback to its
+//! exact frozen diff; a missing or invalid payload simply carries no such context and never
+//! affects commit reconciliation.
 //!
 //! Slow I/O is deliberately **not** done here: [`begin_resolve`] returns the [`CommitPlan`] and the
 //! actor runs [`run_commit`] in a helper task, posting `Command::CommitDone` back into the mailbox
@@ -54,7 +57,7 @@
 //! (design, Revision 23).
 
 use std::fs::{DirBuilder, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -68,8 +71,9 @@ use tokio::task::JoinHandle;
 use crate::core::policy::{self, PolicyError};
 use crate::core::registry::{Registry, RegistryError};
 use crate::core::types::{
-    Actor, CommitTarget, EventPayload, Gate, GateId, GateKind, GateStatus, Origin, RolesConfig,
-    RunId, RunStatus,
+    Actor, AgentStatus, AttemptId, AttemptStatus, CommitTarget, EventPayload, ExternalCommandStatus,
+    ExternalVerificationEvidence, Gate, GateId, GateKind, GateStatus, Origin, RolesConfig, RunId,
+    RunStatus, VerifyStatus,
 };
 use crate::workspace::git::{self, CommitMessage, GitError, MAX_SUBJECT_BYTES};
 
@@ -85,6 +89,7 @@ const RUNS_DIR: &str = "runs";
 
 /// `<state_dir>/runs/<runId>/gates/` — one payload file per gate (design, § On-disk layout).
 const GATES_DIR: &str = "gates";
+const MAX_GATE_PAYLOAD_BYTES: u64 = 1_048_576;
 
 /// Subject prefix of every commit the control plane makes, so `git log` shows at a glance which
 /// commits are the daemon's.
@@ -228,6 +233,63 @@ pub struct GatePayload {
     /// 72-byte subject that pushes the task out. Absent on payloads written before it existed,
     /// which keep deriving the subject from the summary.
     pub subject: Option<String>,
+    /// Present only on a socket-created `external-verification` gate.
+    pub external_verification: Option<ExternalVerificationEvidence>,
+}
+
+/// A denied integration gate whose human feedback applies to a later builder attempt in the same
+/// run. This is prompt context only: it carries no approval or publishing authority.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct IntegrationGateRepair {
+    pub gate_id: GateId,
+    pub builder_attempt_id: AttemptId,
+    pub denied_diff_hash: String,
+    pub feedback: String,
+    pub resolved_by: Actor,
+}
+
+/// Selects the newest attributable human integration-gate repair before `builder_attempt`.
+///
+/// Selection is entirely from the run's durable log and gate payloads. Matching the payload's
+/// diff path and hash back to `diff.frozen` keeps feedback tied to the exact gate evidence it
+/// amended; requiring the later attempt's `attempt.started` sequence keeps feedback from a
+/// different run, a future denial, or an unrelated pending gate out. MCP denials remain advisory:
+/// they are skipped while selecting the newest socket-resolved denial and cannot supersede its
+/// repair criterion. Once selected, however, a newer socket denial with absent feedback or broken
+/// binding supersedes an older socket denial and yields no criterion rather than reviving stale
+/// instructions.
+pub(crate) fn current_integration_repair(
+    reg: &Registry,
+    run: &RunId,
+    builder_attempt: AttemptId,
+) -> Option<IntegrationGateRepair> {
+    // These are sparse replay-built indexes rather than a suffix of the run log: normal progress
+    // noise cannot age out an applicable human criterion, and reconstruction does no actor-thread
+    // file I/O or unbounded event cloning.
+    let started_seq = reg.attempt_started_seq(run, &builder_attempt)?;
+    let (_gate_seq, gate_id, feedback, target) =
+        reg.human_integration_denial_before(run, started_seq)?;
+    let gate = reg.gate(&gate_id)?;
+    let feedback = feedback.filter(|text| !text.trim().is_empty())?;
+    let resolved_by = gate.resolved_by.clone()?;
+    let target = target?;
+    let builder_attempt_id = target.builder_attempt_id;
+    let denied_builder = reg.agent(&reg.attempt(&builder_attempt_id)?.agent_id)?;
+    let current_builder = reg.agent(&reg.attempt(&builder_attempt)?.agent_id)?;
+    if denied_builder.run_id != *run
+        || current_builder.run_id != *run
+        || denied_builder.lineage_id != Some(target.lineage_id)
+        || current_builder.lineage_id != Some(target.lineage_id)
+    {
+        return None;
+    }
+    Some(IntegrationGateRepair {
+        gate_id,
+        builder_attempt_id,
+        denied_diff_hash: target.diff_hash.clone(),
+        feedback: feedback.to_owned(),
+        resolved_by,
+    })
 }
 
 /// A gate to create. The id, the payload path and the timestamps are the control plane's to mint.
@@ -254,6 +316,36 @@ pub struct NewGate {
 /// [`CoreError::GatePayload`] if the payload cannot be written; [`CoreError::Registry`] if the
 /// event cannot be appended.
 pub fn create_gate(reg: &mut Registry, run: &RunId, g: NewGate) -> Result<Gate, CoreError> {
+    create_gate_inner(reg, run, g, false)
+}
+
+/// Core-actor-only half of the socket host-evidence flow. The caller has captured `inventory_hash`
+/// while retaining the worktree lock through this append sequence.
+#[doc(hidden)]
+pub fn create_external_verification_gate(
+    reg: &mut Registry,
+    run: &RunId,
+    g: NewGate,
+    inventory_hash: &str,
+) -> Result<Gate, CoreError> {
+    let evidence = g.payload.external_verification.as_ref().ok_or_else(|| {
+        policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed, "external-verification gate has no evidence record")
+    })?;
+    if g.kind != GateKind::ExternalVerification || evidence.source_inventory_after_hash != inventory_hash {
+        return Err(policy::PolicyError::new(
+            policy::PolicyCode::DelegationNotAllowed,
+            "external verification does not match the daemon-captured inventory",
+        ).into());
+    }
+    create_gate_inner(reg, run, g, true)
+}
+
+fn create_gate_inner(
+    reg: &mut Registry,
+    run: &RunId,
+    g: NewGate,
+    allow_external: bool,
+) -> Result<Gate, CoreError> {
     if reg.run(run).is_none() {
         return Err(CoreError::UnknownRun(*run));
     }
@@ -263,10 +355,40 @@ pub fn create_gate(reg: &mut Registry, run: &RunId, g: NewGate) -> Result<Gate, 
         return Err(policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
             "planning and audit tasks cannot create an integration gate").into());
     }
+    if g.kind == GateKind::ExternalVerification {
+        if !allow_external {
+            return Err(policy::PolicyError::new(
+                policy::PolicyCode::AgentApproveNotAllowed,
+                "external verification must be prepared by the socket-only host evidence route",
+            ).into());
+        }
+        validate_external_verification(reg, run, &g.payload, None)?;
+    } else if g.payload.external_verification.is_some() {
+        return Err(policy::PolicyError::new(
+            policy::PolicyCode::DelegationNotAllowed,
+            "external verification evidence requires an external-verification gate",
+        ).into());
+    }
     let gate_id = GateId::new_v4();
     let payload_path = payload_path(reg.state_dir(), run, &gate_id);
     write_payload(&payload_path, gate_id, &g.payload)?;
 
+    if let Some(evidence) = g.payload.external_verification.clone() {
+        // This event is the authority for approval. It is appended before the gate is exposed,
+        // and contains the inventory identity the daemon checked during socket submission.
+        reg.append(
+            run,
+            EventPayload::ExternalVerificationPrepared {
+                gate_id,
+                daemon_captured_inventory_hash: evidence.source_inventory_after_hash.clone(),
+                evidence,
+            },
+        )?;
+    }
+
+    let repair_binding = (g.kind == GateKind::Integrate).then(|| {
+        reg.gate_repair_binding(run, g.payload.diff_path.as_deref(), g.payload.diff_hash.as_deref())
+    });
     reg.append(
         run,
         EventPayload::GateCreated {
@@ -274,6 +396,7 @@ pub fn create_gate(reg: &mut Registry, run: &RunId, g: NewGate) -> Result<Gate, 
             gate_kind: g.kind,
             summary: g.summary,
             payload_path,
+            repair_binding,
             requested_by: g.requested_by,
         },
     )?;
@@ -311,6 +434,26 @@ pub fn begin_resolve(
     by: Actor,
     cfg: &RolesConfig,
 ) -> Result<ResolveOutcome, CoreError> {
+    begin_resolve_inner(reg, id, approve, feedback, by, cfg, None)
+}
+
+/// Only the actor's locked host capture can settle a pending external-evidence approval.
+/// The inventory is computed by ACP, never taken from an approval request on either door.
+pub fn approve_external_with_inventory(
+    reg: &mut Registry, id: &GateId, by: Actor, cfg: &RolesConfig, inventory: &str,
+    _guard: &tokio::sync::OwnedMutexGuard<()>,
+) -> Result<ResolveOutcome, CoreError> {
+    if reg.gate(id).ok_or(CoreError::UnknownGate(*id))?.kind != GateKind::ExternalVerification {
+        return Err(policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
+            "a host inventory can settle only an external-verification gate").into());
+    }
+    begin_resolve_inner(reg, id, true, None, by, cfg, Some(inventory))
+}
+
+fn begin_resolve_inner(
+    reg: &mut Registry, id: &GateId, approve: bool, feedback: Option<String>, by: Actor,
+    cfg: &RolesConfig, captured_inventory: Option<&str>,
+) -> Result<ResolveOutcome, CoreError> {
     let gate = reg.gate(id).cloned().ok_or(CoreError::UnknownGate(*id))?;
 
     // (1) The exactly-once boundary, read side. `Resolving` counts: the first commit may still be
@@ -319,7 +462,7 @@ pub fn begin_resolve(
         return Ok(ResolveOutcome::Settled(GateResolution::AlreadyResolved));
     }
 
-    if approve && gate.kind != GateKind::Plan && reg.run(&gate.run_id).and_then(|r| r.execution.as_ref())
+    if approve && !matches!(gate.kind, GateKind::Plan | GateKind::ExternalVerification) && reg.run(&gate.run_id).and_then(|r| r.execution.as_ref())
         .is_some_and(|e| e.mode != crate::core::types::RunMode::Build) {
         return Err(policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
             "planning and audit tasks cannot integrate changes").into());
@@ -328,12 +471,43 @@ pub fn begin_resolve(
     // (2) S2. Pure, and before any write: a rejection leaves no trace in the run log.
     policy::check_gate_resolve(&gate, approve, &by, cfg)?;
 
+    let accepted_external = if approve && gate.kind == GateKind::ExternalVerification {
+        if matches!(by, Actor::Mcp) {
+            return Err(policy::PolicyError::new(
+                policy::PolicyCode::AgentApproveNotAllowed,
+                "external verification is a socket-only human action",
+            ).into());
+        }
+        let payload = read_payload(&gate.payload_path, gate.gate_id)?;
+        validate_external_verification(reg, &gate.run_id, &payload, Some(gate.gate_id))?;
+        let submitted = payload.external_verification.ok_or_else(|| {
+            policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
+                "external-verification gate has no evidence record")
+        })?;
+        let prepared = prepared_external_verification(reg, &gate.run_id, gate.gate_id)
+            .ok_or_else(|| policy::PolicyError::new(
+                policy::PolicyCode::DelegationNotAllowed,
+                "external-verification gate has no immutable prepared evidence",
+            ))?;
+        if prepared != submitted {
+            return Err(policy::PolicyError::new(
+                policy::PolicyCode::DelegationNotAllowed,
+                "external-verification payload diverges from immutable prepared evidence",
+            ).into());
+        }
+        if captured_inventory != Some(prepared.source_inventory_after_hash.as_str()) {
+            return Err(policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
+                "external approval requires a fresh locked checkout inventory matching the prepared evidence").into());
+        }
+        Some(prepared)
+    } else { None };
+
     // (3) The one place the payload file is read, while the gate is still `pending`. A `plan`
     // approval commits nothing — it answers a question — so it alone skips the payload read.
     // An `escalate` approval still goes through `plan_from_payload` and is refused there for
     // its missing worktree: that refusal is pinned behavior (an escalation is answered with
     // deny-and-feedback, and "approving" one has no defined meaning).
-    let plan = if approve && gate.kind != GateKind::Plan {
+    let plan = if approve && !matches!(gate.kind, GateKind::Plan | GateKind::ExternalVerification) {
         Some(Box::new(plan_from_payload(&gate)?))
     } else {
         None
@@ -370,6 +544,7 @@ pub fn begin_resolve(
             feedback: feedback.clone(),
             by,
             commit: plan.as_ref().map(|p| p.target.clone()),
+            external_verification: accepted_external,
         },
     )?;
 
@@ -389,6 +564,27 @@ pub fn begin_resolve(
             Ok(ResolveOutcome::Settled(GateResolution::Denied { feedback }))
         }
     }
+}
+
+/// Returns only the append-only evidence accepted for an approved gate. The mutable gate payload
+/// is deliberately not consulted after approval.
+pub(crate) fn accepted_external_evidence(
+    reg: &Registry,
+    run: &RunId,
+    builder_attempt: crate::core::types::AttemptId,
+    diff_hash: &str,
+) -> Option<ExternalVerificationEvidence> {
+    reg.events(run, None, usize::MAX).iter().rev().find_map(|event| match &event.payload {
+        EventPayload::GateResolving { gate_id, external_verification: Some(evidence), .. }
+            if evidence.builder_attempt_id == builder_attempt
+                && evidence.diff_hash == diff_hash
+                && evidence.validate_attestation().is_ok()
+                && reg.gate(gate_id).is_some_and(|gate| gate.status == GateStatus::Approved) =>
+        {
+            Some(evidence.clone())
+        }
+        _ => None,
+    })
 }
 
 /// Appends the `gate.resolved{approved}` half of a commit-less approval (`plan`/`escalate`).
@@ -1007,6 +1203,7 @@ fn heal_commit_target(reg: &mut Registry, gate: &Gate) -> Result<Option<CommitTa
             feedback: gate.feedback.clone(),
             by,
             commit: Some(target.clone()),
+            external_verification: None,
         },
     )?;
     Ok(Some(target))
@@ -1033,7 +1230,7 @@ fn plan(gate: &Gate, target: CommitTarget) -> CommitPlan {
 }
 
 /// `<state_dir>/runs/<runId>/gates/<gateId>.payload.json`.
-fn payload_path(state_dir: &Path, run: &RunId, gate: &GateId) -> PathBuf {
+pub(super) fn payload_path(state_dir: &Path, run: &RunId, gate: &GateId) -> PathBuf {
     state_dir
         .join(RUNS_DIR)
         .join(run.to_string())
@@ -1058,6 +1255,9 @@ fn write_payload(path: &Path, gate: GateId, payload: &GatePayload) -> Result<(),
             .map_err(|e: io::Error| fail(format!("create_dir: {e}")))?;
     }
     let json = serde_json::to_vec_pretty(payload).map_err(|e| fail(format!("encode: {e}")))?;
+    if json.len() as u64 > MAX_GATE_PAYLOAD_BYTES {
+        return Err(fail(format!("payload exceeds {MAX_GATE_PAYLOAD_BYTES} bytes")));
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -1079,8 +1279,202 @@ fn read_payload(path: &Path, gate: GateId) -> Result<GatePayload, CoreError> {
         path: path.to_path_buf(),
         problem,
     };
-    let bytes = std::fs::read(path).map_err(|e| fail(format!("read: {e}")))?;
+    let file = std::fs::File::open(path).map_err(|e| fail(format!("open: {e}")))?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(file, MAX_GATE_PAYLOAD_BYTES + 1).read_to_end(&mut bytes)
+        .map_err(|e| fail(format!("read: {e}")))?;
+    if bytes.len() as u64 > MAX_GATE_PAYLOAD_BYTES {
+        return Err(fail(format!("payload exceeds {MAX_GATE_PAYLOAD_BYTES} bytes")));
+    }
     serde_json::from_slice(&bytes).map_err(|e| fail(format!("parse: {e}")))
+}
+
+fn validate_external_verification(
+    reg: &Registry,
+    run_id: &RunId,
+    payload: &GatePayload,
+    approving_gate: Option<GateId>,
+) -> Result<(), CoreError> {
+    let reject = |reason: String| -> CoreError {
+        policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed, reason).into()
+    };
+    let evidence = payload.external_verification.as_ref().ok_or_else(|| {
+        reject("external-verification gate has no evidence record".into())
+    })?;
+    evidence.validate_attestation().map_err(reject)?;
+    let run = reg.run(run_id).ok_or(CoreError::UnknownRun(*run_id))?;
+    if run.audit.is_some() || run.execution.as_ref().is_some_and(|e| e.mode != crate::core::types::RunMode::Build) {
+        return Err(reject("external verification applies only to builder runs".into()));
+    }
+    if approving_gate.is_none() && run.last_seq != evidence.expected_run_seq {
+        return Err(reject(format!(
+            "stale run state: expected seq {}, current seq {}",
+            evidence.expected_run_seq, run.last_seq
+        )));
+    }
+    if !matches!(run.status, RunStatus::Blocked | RunStatus::Running) {
+        return Err(reject(format!("run is {:?}; external verification is no longer applicable", run.status)));
+    }
+    if reg.state().agents.values().filter(|a| a.run_id == *run_id).any(|a| {
+        matches!(a.status, AgentStatus::Starting | AgentStatus::Running)
+            || a.attempt_ids.iter().any(|id| reg.attempt(id).is_some_and(|x| x.status == AttemptStatus::Running))
+    }) {
+        return Err(reject("an attempt is active or still finalizing for this run".into()));
+    }
+    if reg.state().gates.values().any(|g| {
+        g.run_id == *run_id
+            && matches!(g.status, GateStatus::Pending | GateStatus::Resolving)
+            && Some(g.gate_id) != approving_gate
+    }) {
+        return Err(reject("another gate is pending or resolving for this run".into()));
+    }
+    let events = reg.events(run_id, None, usize::MAX);
+    if let Some(gate_id) = approving_gate {
+        let newest = events.last().map(|e| (&e.payload, e.base.seq));
+        if !matches!(newest, Some((EventPayload::GateCreated { gate_id: id, .. }, _)) if *id == gate_id) {
+            return Err(reject("run state changed after external evidence was recorded".into()));
+        }
+    }
+    let current = events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::DiffFrozen { attempt_id, diff_hash, source_inventory_hash, .. } => Some((*attempt_id, diff_hash.as_str(), source_inventory_hash.as_deref())),
+        _ => None,
+    });
+    if current.as_ref().map(|(attempt, hash, _)| (*attempt, *hash))
+        != Some((evidence.builder_attempt_id, evidence.diff_hash.as_str())) {
+        return Err(reject("builder attempt or frozen diff hash is stale or mismatched".into()));
+    }
+    if current.and_then(|(_, _, hash)| hash) != Some(evidence.source_inventory_after_hash.as_str()) {
+        return Err(reject("host evidence does not match the source inventory captured with the frozen diff".into()));
+    }
+    let blocked = events.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::VerifyReport { builder_attempt_id, status, commands, blockers, .. }
+            if *builder_attempt_id == evidence.builder_attempt_id => Some((*status, commands, blockers)),
+        _ => None,
+    });
+    let Some((VerifyStatus::Blocked, required_commands, blockers)) = blocked else {
+        return Err(reject("the exact builder attempt has no environment-blocked verifier report".into()));
+    };
+    if required_commands.is_empty() || blockers.is_empty() {
+        return Err(reject("the blocked verifier record has no bounded command/capability evidence".into()));
+    }
+    if evidence.source_inventory_before_hash != evidence.source_inventory_after_hash {
+        return Err(reject("source inventory changed while host checks ran".into()));
+    }
+    if evidence.commands.is_empty()
+        || evidence.commands.iter().any(|c| {
+            c.argv.is_empty()
+                || c.status != ExternalCommandStatus::Passed
+                || c.exit_status != Some(0)
+        })
+    {
+        return Err(reject("every recorded host check must have run and passed with exit status 0".into()));
+    }
+    let mut required: Vec<_> = required_commands.iter().map(String::as_str).collect();
+    let mut supplied: Vec<_> = evidence.commands.iter().map(|c| c.worker_command.as_str()).collect();
+    required.sort_unstable();
+    supplied.sort_unstable();
+    if required != supplied {
+        return Err(reject("external evidence must cover exactly the blocked verifier command occurrences".into()));
+    }
+    Ok(())
+}
+
+fn prepared_external_verification(
+    reg: &Registry,
+    run_id: &RunId,
+    gate_id: GateId,
+) -> Option<ExternalVerificationEvidence> {
+    reg.events(run_id, None, usize::MAX).iter().rev().find_map(|event| match &event.payload {
+        EventPayload::ExternalVerificationPrepared {
+            gate_id: id,
+            evidence,
+            daemon_captured_inventory_hash,
+        } if *id == gate_id
+            && daemon_captured_inventory_hash == &evidence.source_inventory_after_hash =>
+        {
+            Some(evidence.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Resolve the only worktree eligible for an inventory capture. This check runs both before and
+/// after the helper so a stale sequence, finalization, cancellation or replacement cannot borrow
+/// an inventory captured for an earlier state.
+pub(crate) fn external_inventory_target(
+    reg: &Registry,
+    request: &crate::core::types::SourceInventoryRequest,
+) -> Result<(PathBuf, String), CoreError> {
+    inventory_target(reg, request, None)
+}
+
+/// Resolve the worktree from immutable preparation, never from mutable gate payload or caller
+/// input. Recheck this target after the helper returns; only this one pending gate is allowed.
+pub(crate) fn pending_external_target(reg: &Registry, id: GateId) -> Result<(PathBuf, String), CoreError> {
+    let gate = reg.gate(&id).ok_or(CoreError::UnknownGate(id))?;
+    let reject = |reason| policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed, reason);
+    if gate.kind != GateKind::ExternalVerification || gate.status != GateStatus::Pending {
+        return Err(reject("external-verification gate is no longer pending").into());
+    }
+    let prepared = prepared_external_verification(reg, &gate.run_id, id)
+        .ok_or_else(|| reject("external-verification gate has no immutable prepared evidence"))?;
+    let run = reg.run(&gate.run_id).ok_or(CoreError::UnknownRun(gate.run_id))?;
+    let expected_run_seq = run.last_seq;
+    let req = crate::core::types::SourceInventoryRequest { run_id: gate.run_id,
+        builder_attempt_id: prepared.builder_attempt_id, diff_hash: prepared.diff_hash.clone(), expected_run_seq };
+    validate_external_verification(reg, &gate.run_id, &GatePayload {
+        external_verification: Some(prepared), ..GatePayload::default()
+    }, Some(id))?;
+    inventory_target(reg, &req, Some(id))
+}
+
+fn inventory_target(reg: &Registry, request: &crate::core::types::SourceInventoryRequest,
+    allowed_gate: Option<GateId>) -> Result<(PathBuf, String), CoreError> {
+    let reject = |reason: String| -> CoreError {
+        policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed, reason).into()
+    };
+    let run = reg.run(&request.run_id).ok_or(CoreError::UnknownRun(request.run_id))?;
+    if run.last_seq != request.expected_run_seq {
+        return Err(reject(format!("stale run state: expected seq {}, current seq {}", request.expected_run_seq, run.last_seq)));
+    }
+    if !matches!(run.status, RunStatus::Blocked | RunStatus::Running) {
+        return Err(reject(format!("run is {:?}; source inventory is no longer applicable", run.status)));
+    }
+    if reg.state().agents.values().filter(|agent| agent.run_id == request.run_id).any(|agent| {
+        matches!(agent.status, AgentStatus::Starting | AgentStatus::Running)
+            || agent.attempt_ids.iter().any(|id| reg.attempt(id).is_some_and(|attempt| attempt.status == AttemptStatus::Running))
+    }) {
+        return Err(reject("an attempt is active or still finalizing for this run".into()));
+    }
+    if reg.state().gates.values().any(|gate| gate.run_id == request.run_id && Some(gate.gate_id) != allowed_gate
+        && matches!(gate.status, GateStatus::Pending | GateStatus::Resolving)) {
+        return Err(reject("a gate is pending or resolving for this run".into()));
+    }
+    let events = reg.events(&request.run_id, None, usize::MAX);
+    let current = events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::DiffFrozen { attempt_id, diff_hash, source_inventory_hash, .. } =>
+            Some((*attempt_id, diff_hash, source_inventory_hash.as_ref())),
+        _ => None,
+    });
+    if current.map(|(attempt, hash, _)| (attempt, hash)) != Some((request.builder_attempt_id, &request.diff_hash)) {
+        return Err(reject("builder attempt or frozen diff hash is stale or mismatched".into()));
+    }
+    let frozen_inventory = current.and_then(|(_, _, hash)| hash).ok_or_else(||
+        reject("the frozen diff has no complete source inventory; legacy or uncapturable source cannot accept host evidence".into()))?;
+    let blocked = events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::VerifyReport { builder_attempt_id, status, commands, blockers, .. }
+            if *builder_attempt_id == request.builder_attempt_id => Some((*status, commands, blockers)),
+        _ => None,
+    });
+    if !matches!(blocked, Some((VerifyStatus::Blocked, commands, blockers)) if !commands.is_empty() && !blockers.is_empty()) {
+        return Err(reject("the exact builder attempt has no complete environment-blocked verifier report".into()));
+    }
+    let attempt = reg.attempt(&request.builder_attempt_id)
+        .ok_or_else(|| reject("builder attempt is absent from the current projection".into()))?;
+    let agent = reg.agent(&attempt.agent_id)
+        .ok_or_else(|| reject("builder agent is absent from the current projection".into()))?;
+    let worktree = agent.worktree.clone().ok_or_else(|| reject("builder attempt has no recorded worktree".into()))?;
+    Ok((worktree, frozen_inventory.clone()))
 }
 
 /// The commit subject for a gate, pre-sanitized to exactly what `git.rs` would keep: the first line

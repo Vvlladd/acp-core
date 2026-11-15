@@ -721,6 +721,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         gate_kind: GateKind::Plan,
         summary: "plan only".into(),
         payload_path: world.dir.path().join("plan.json"),
+        repair_binding: None,
         requested_by: Origin::ControlPlane,
     });
     let other_run = RunId::new_v4();
@@ -734,6 +735,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
                 gate_kind: GateKind::Integrate,
                 summary: "another run".into(),
                 payload_path: world.dir.path().join("other.json"),
+                repair_binding: None,
                 requested_by: Origin::ControlPlane,
             },
         )
@@ -747,6 +749,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         gate_kind: GateKind::Integrate,
         summary: "integrate this run".into(),
         payload_path: world.dir.path().join("integrate.json"),
+        repair_binding: None,
         requested_by: Origin::ControlPlane,
     });
     let pending = check_send_message(&agent, &world.ctx(&cfg)).expect_err("pending gate blocks");
@@ -773,6 +776,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
             client_name: "cli".into(),
         },
         commit: None,
+        external_verification: None,
     });
     let resolving =
         check_send_message(&agent, &world.ctx(&cfg)).expect_err("resolving gate blocks");
@@ -806,6 +810,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         gate_kind: GateKind::Integrate,
         summary: "lead decision window".into(),
         payload_path: world.dir.path().join("lead-integrate.json"),
+        repair_binding: None,
         requested_by: Origin::ControlPlane,
     });
     let pending = check_send_message(&lead, &world.ctx(&cfg)).expect_err("lead pending gate");
@@ -826,6 +831,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
             client_name: "acp-mac".into(),
         },
         commit: None,
+        external_verification: None,
     });
     let resolving = check_send_message(&lead, &world.ctx(&cfg)).expect_err("lead resolving gate");
     assert_eq!(resolving.code, PolicyCode::GatePending);
@@ -847,6 +853,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         gate_kind: GateKind::Integrate,
         summary: "already integrated".into(),
         payload_path: world.dir.path().join("approved.json"),
+        repair_binding: None,
         requested_by: Origin::ControlPlane,
     });
     world.append(EventPayload::GateResolved {
@@ -866,6 +873,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         gate_kind: GateKind::Integrate,
         summary: "resolve me before checking budget".into(),
         payload_path: world.dir.path().join("budget-preempted.json"),
+        repair_binding: None,
         requested_by: Origin::ControlPlane,
     });
     assert_eq!(

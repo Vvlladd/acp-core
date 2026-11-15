@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 
 use agent_control_plane::core::registry::Registry;
 use agent_control_plane::core::types::{
-    AgentId, AgentStatus, EventPayload, False, LineageId, Origin, ProviderName, RoleName, RunId,
+    AgentId, AgentStatus, EventPayload, False, GateId, LineageId, LoopState, Origin, ProviderName,
+    RoleName, RunId, RunStatus,
 };
 use agent_control_plane::ipc::socket::MAX_SOCKET_PATH_BYTES;
 use serde_json::{json, Value};
@@ -104,6 +105,22 @@ fn acp(state: &Path, repo: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo)
         .env("ACP_STATE_DIR", state)
+        .env_remove("ACP_FAKE_RETIREMENT_TRASH_DESTINATION")
+        .output()
+        .unwrap_or_else(|err| panic!("run acp {args:?}: {err}"));
+    Output {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+fn acp_with_fixture_trash(state: &Path, repo: &Path, args: &[&str], destination: &Path) -> Output {
+    let out = Command::new(ACP)
+        .args(args)
+        .current_dir(repo)
+        .env("ACP_STATE_DIR", state)
+        .env("ACP_FAKE_RETIREMENT_TRASH_DESTINATION", destination)
         .output()
         .unwrap_or_else(|err| panic!("run acp {args:?}: {err}"));
     Output {
@@ -180,15 +197,36 @@ impl Daemon {
     }
 
     fn start_with_lifetime(state: &Path, cwd: &Path, no_mcp: bool, managed: bool) -> Self {
+        Self::start_with_options(state, cwd, no_mcp, managed, None)
+    }
+
+    fn start_with_fixture_trash(state: &Path, cwd: &Path, destination: &Path) -> Self {
+        Self::start_with_options(state, cwd, false, false, Some(destination))
+    }
+
+    fn start_with_options(
+        state: &Path,
+        cwd: &Path,
+        no_mcp: bool,
+        managed: bool,
+        trash: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(ACP);
         command.arg("serve");
-        if managed { command.arg("--managed"); }
+        if managed {
+            command.arg("--managed");
+        }
         if no_mcp {
             command.arg("--no-mcp");
         }
-        let child = command
+        command
             .current_dir(cwd)
             .env("ACP_STATE_DIR", state)
+            .env_remove("ACP_FAKE_RETIREMENT_TRASH_DESTINATION");
+        if let Some(destination) = trash {
+            command.env("ACP_FAKE_RETIREMENT_TRASH_DESTINATION", destination);
+        }
+        let child = command
             .stdin(if no_mcp {
                 Stdio::null()
             } else {
@@ -612,6 +650,59 @@ fn serve_accepts_a_compatible_history_with_a_truncated_tail() {
     let mut daemon = Daemon::start_no_mcp(state.path(), repo.path());
     daemon.signal(nix::sys::signal::Signal::SIGTERM);
     assert_eq!(daemon.wait("stop truncated-tail daemon"), Some(0));
+}
+
+fn complete_fixture_run(state: &Path, repo: &Path, task_id: &str) -> RunId {
+    let run_id = fixture_run(state, repo, task_id);
+    let mut registry = Registry::open(state).expect("reopen fixture registry");
+    let run = registry.run(&run_id).expect("fixture run").clone();
+    let lineage = run.lineages.first().expect("fixture lineage").clone();
+    let agent_id = *lineage.agent_ids.first().expect("fixture builder");
+    fs::create_dir_all(&lineage.worktree).expect("fixture worktree path");
+    let sha = head_sha(repo);
+    registry
+        .append(
+            &run_id,
+            EventPayload::AgentStatusChanged {
+                agent_id,
+                status: AgentStatus::Idle,
+                reason: None,
+            },
+        )
+        .expect("append idle agent");
+    registry
+        .append(
+            &run_id,
+            EventPayload::IntegrateCommitted {
+                gate_id: GateId::new_v4(),
+                worktree: lineage.worktree,
+                sha,
+                subject: "integrated fixture".into(),
+                files: vec![],
+            },
+        )
+        .expect("append integration");
+    registry
+        .append(
+            &run_id,
+            EventPayload::RunStatus_ {
+                status: RunStatus::Integrated,
+                reason: None,
+            },
+        )
+        .expect("append integrated status");
+    registry
+        .append(
+            &run_id,
+            EventPayload::LoopStateChanged {
+                state: LoopState::Done,
+                builder_agent_id: Some(agent_id),
+                attempt_no: 1,
+                strikes: 0,
+            },
+        )
+        .expect("append completed lifecycle");
+    run_id
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +1130,13 @@ fn serve_refuses_a_socket_path_over_the_limit() {
 fn gc_prunes_only_the_retired_worktree_of_a_closed_lineage() {
     let state = short_dir();
     let repo = repo_with_exclude();
+    // fixture_lineages records the real exhausted-lineage facts only: ownership, closure and
+    // WorktreeRetired. It deliberately has neither an integration event nor a prebuilt cleanup
+    // receipt, so `gc --closed` must validate and prepare the genuine non-integrated route.
     let (run, closed, open) = fixture_lineages(state.path(), repo.path());
+    let trash = repo.path().join("fixture-trash");
+    fs::create_dir(&trash).expect("private fixture Trash");
+    let recoverable = trash.join("closed-lineage");
     assert!(closed.is_dir() && open.is_dir(), "both worktrees exist");
 
     let dry = acp(state.path(), repo.path(), &["gc"]);
@@ -1056,14 +1153,22 @@ fn gc_prunes_only_the_retired_worktree_of_a_closed_lineage() {
     );
     assert!(closed.is_dir(), "a dry run removes nothing");
 
-    let pruned = acp(state.path(), repo.path(), &["gc", "--closed"]);
+    let pruned =
+        acp_with_fixture_trash(state.path(), repo.path(), &["gc", "--closed"], &recoverable);
     pruned.ok("acp gc --closed");
     assert!(
         pruned.stdout.contains("pruned 1 of 1"),
         "one worktree, pruned: {}",
         pruned.stdout
     );
-    assert!(!closed.exists(), "the retired worktree is gone");
+    assert!(
+        !closed.exists(),
+        "the retired worktree left its registered path"
+    );
+    assert!(
+        recoverable.join(".git").is_file(),
+        "the complete tree remains recoverable"
+    );
     assert!(open.is_dir(), "the resumable worktree is untouched");
     assert!(
         !acp(
@@ -1077,13 +1182,103 @@ fn gc_prunes_only_the_retired_worktree_of_a_closed_lineage() {
     );
 
     // Nothing left to do, and saying so is not an error.
-    let empty = acp(state.path(), repo.path(), &["gc", "--closed"]);
+    let empty =
+        acp_with_fixture_trash(state.path(), repo.path(), &["gc", "--closed"], &recoverable);
     empty.ok("acp gc --closed, twice");
     assert!(
         empty.stdout.contains("no retired worktrees"),
         "{}",
         empty.stdout
     );
+}
+
+#[test]
+fn gc_refuses_a_retired_path_whose_branch_advanced_past_the_recorded_commit() {
+    let state = short_dir();
+    let repo = repo_with_exclude();
+    let (_, closed, open) = fixture_lineages(state.path(), repo.path());
+    fs::write(closed.join("advanced.txt"), "replacement state\n").expect("advance fixture");
+    for args in [
+        &["add", "advanced.txt"][..],
+        &["commit", "--quiet", "-m", "advanced after retirement"][..],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&closed)
+            .output()
+            .expect("advance retired branch");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let advanced = head_sha(&closed);
+    let trash = repo.path().join("fixture-trash");
+    fs::create_dir(&trash).expect("private fixture Trash");
+    let recoverable = trash.join("must-not-exist");
+
+    let refused =
+        acp_with_fixture_trash(state.path(), repo.path(), &["gc", "--closed"], &recoverable);
+    assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+    assert!(refused.stderr.contains("recorded integrated commit"), "{}", refused.stderr);
+    assert_eq!(head_sha(&closed), advanced, "the advanced tree is preserved");
+    assert!(closed.is_dir() && open.is_dir());
+    assert!(!recoverable.exists(), "no substituted tree reached Trash");
+}
+
+#[test]
+fn scoped_worktree_inventory_previews_a_run_omitted_by_the_global_bound() {
+    let state = short_dir();
+    let repo = repo_with_exclude();
+    let runs: Vec<_> = (0..=128)
+        .map(|index| complete_fixture_run(state.path(), repo.path(), &format!("retention-{index}")))
+        .collect();
+    let mut daemon = Daemon::start(state.path(), repo.path());
+
+    let listed = acp(state.path(), repo.path(), &["worktree", "list"]);
+    listed.ok("unfiltered worktree inventory");
+    let inventory: Value = serde_json::from_str(&listed.stdout).expect("inventory JSON");
+    assert_eq!(inventory["items"].as_array().expect("items").len(), 128);
+    assert_eq!(inventory["truncated"], json!(true));
+    let omitted = runs
+        .into_iter()
+        .find(|run| {
+            !inventory["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .any(|item| item["runId"] == json!(run))
+        })
+        .expect("one run is omitted by the global bound");
+
+    let preview = acp(
+        state.path(),
+        repo.path(),
+        &["worktree", "retire", &omitted.to_string()],
+    );
+    preview.ok("scoped retirement preview");
+    let preview_json = preview
+        .stdout
+        .split("\npreview only")
+        .next()
+        .expect("preview JSON");
+    let first: Value = serde_json::from_str(preview_json).expect("preview object");
+    assert_eq!(first["runId"], json!(omitted));
+    assert_eq!(first["disposition"], json!("eligible"));
+
+    let repeated = acp(
+        state.path(),
+        repo.path(),
+        &["worktree", "retire", &omitted.to_string()],
+    );
+    repeated.ok("repeated scoped retirement preview");
+    let repeated_json = repeated
+        .stdout
+        .split("\npreview only")
+        .next()
+        .expect("repeat preview JSON");
+    let second: Value = serde_json::from_str(repeated_json).expect("repeat preview object");
+    assert_eq!(second["confirmationToken"], first["confirmationToken"]);
+
+    daemon.signal(nix::sys::signal::Signal::SIGTERM);
+    assert_eq!(daemon.wait("after scoped inventory"), Some(0));
 }
 
 /// Two real git worktrees and the log that describes them: one lineage closed and retired, one
@@ -1167,6 +1362,11 @@ fn fixture_lineages(state: &Path, repo: &Path) -> (RunId, PathBuf, PathBuf) {
     let (closed_agent, closed_lineage, closed) = make("closed");
     let (_, _, open) = make("open");
 
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        .block_on(agent_control_plane::workspace::git::record_original_worktree(
+            repo, &closed, state, &run.to_string(), &closed_lineage.to_string(),
+        )).expect("record the original registration before lineage closure");
+
     registry
         .append(
             &run,
@@ -1221,13 +1421,25 @@ fn the_cli_drives_a_pass_loop_from_delegate_to_an_approved_commit() {
     common::with_shared_env(|| async { pass_loop() });
 }
 
+#[test]
+fn retirement_confirmation_preserves_a_replacement_legacy_checkout() {
+    common::with_shared_env(|| async { run_pass_loop(true) });
+}
+
 fn pass_loop() {
+    run_pass_loop(false);
+}
+
+fn run_pass_loop(replace_after_preview: bool) {
     let state = short_dir();
     let repo = repo_with_exclude();
     install_fake_clis();
     configure_fakes(repo.path(), "pass", &[]);
 
-    let mut daemon = Daemon::start(state.path(), repo.path());
+    let trash = repo.path().join("fixture-trash");
+    fs::create_dir(&trash).expect("private fixture Trash");
+    let destination = trash.join("completed-lineage");
+    let mut daemon = Daemon::start_with_fixture_trash(state.path(), repo.path(), &destination);
     let follower = Follower::start(state.path(), repo.path());
 
     let task = loop_task("T44-cli");
@@ -1322,6 +1534,124 @@ fn pass_loop() {
         "including the gate that was approved from another process"
     );
     drop(follower);
+
+    if replace_after_preview {
+        // Older installations did not capture a registration when creating a worktree.
+        let receipts = state.path().join("retired").join(&run);
+        if receipts.is_dir() {
+            for item in fs::read_dir(receipts).expect("fixture receipts") {
+                let path = item.unwrap().path();
+                if path.extension().is_some_and(|extension| extension == "identity") {
+                    fs::remove_file(path).expect("simulate a pre-upgrade history");
+                }
+            }
+        }
+    }
+
+    let listed = acp(state.path(), repo.path(), &["worktree", "list"]);
+    listed.ok("acp worktree list");
+    assert!(
+        listed.stdout.contains(&worktree.display().to_string()),
+        "{}",
+        listed.stdout
+    );
+    assert!(listed.stdout.contains("eligible"), "{}", listed.stdout);
+
+    let preview = acp(state.path(), repo.path(), &["worktree", "retire", &run]);
+    preview.ok("acp worktree retire preview");
+    assert!(
+        preview.stdout.contains("preview only"),
+        "{}",
+        preview.stdout
+    );
+    assert!(worktree.exists(), "preview preserves the worktree");
+    let preview_json = preview
+        .stdout
+        .split("\npreview only")
+        .next()
+        .expect("preview json");
+    let preview_value: serde_json::Value =
+        serde_json::from_str(preview_json).expect("decode preview");
+    let token = preview_value["confirmationToken"]
+        .as_str()
+        .expect("confirmation token");
+
+    if replace_after_preview {
+        let branch = preview_value["branch"].as_str().expect("selected branch");
+        let moved = worktree.with_file_name("moved-original");
+        let original_path = worktree.to_str().unwrap();
+        let moved_path = moved.to_str().unwrap();
+        for args in [
+            vec!["worktree", "move", original_path, moved_path],
+            vec!["-C", moved_path, "checkout", "--detach"],
+            vec!["worktree", "add", original_path, branch],
+        ] {
+            let output = Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let result = acp(state.path(), repo.path(), &["worktree", "retire", &run, "--confirm", token]);
+        assert_ne!(result.code, Some(0), "the held preview accepted a different checkout");
+        assert!(worktree.join(".git").is_file() && moved.join(".git").is_file());
+        assert!(!destination.exists());
+        acp(state.path(), repo.path(), &["serve", "--stop"]).ok("stop stale-preview fixture");
+        assert_eq!(daemon.wait("after the refused retirement"), Some(0));
+        return;
+    }
+
+    let retired = acp(
+        state.path(),
+        repo.path(),
+        &["worktree", "retire", &run, "--confirm", token],
+    );
+    retired.ok("acp worktree retire --confirm");
+    assert!(
+        !worktree.exists(),
+        "confirmed cleanup removes the exact registered worktree"
+    );
+    assert!(
+        retired.stdout.contains("refs/acp/retained/"),
+        "{}",
+        retired.stdout
+    );
+
+    let stale = acp(
+        state.path(),
+        repo.path(),
+        &["worktree", "retire", &run, "--confirm", token],
+    );
+    assert_ne!(
+        stale.code,
+        Some(0),
+        "an old preview token must not select changed actor state"
+    );
+    assert!(
+        stale.stderr.contains("fresh") || stale.stderr.contains("changed"),
+        "{}",
+        stale.stderr
+    );
+    let repeat_preview = acp(state.path(), repo.path(), &["worktree", "retire", &run]);
+    repeat_preview.ok("repeat preview");
+    let repeat_json = repeat_preview
+        .stdout
+        .split("\npreview only")
+        .next()
+        .expect("repeat preview json");
+    let repeat_value: serde_json::Value =
+        serde_json::from_str(repeat_json).expect("decode repeat preview");
+    let repeat_token = repeat_value["confirmationToken"]
+        .as_str()
+        .expect("repeat token");
+    let repeated = acp(
+        state.path(),
+        repo.path(),
+        &["worktree", "retire", &run, "--confirm", repeat_token],
+    );
+    repeated.ok("repeat acp worktree retire --confirm");
+    assert!(
+        repeated.stdout.contains("alreadyRetired"),
+        "{}",
+        repeated.stdout
+    );
 
     let stop = acp(state.path(), repo.path(), &["serve", "--stop"]);
     stop.ok("acp serve --stop");
@@ -2265,7 +2595,10 @@ fn up_lifecycle() {
 
     let lifecycle = acp(state.path(), repo.path(), &["session", "status"]);
     lifecycle.ok("managed status");
-    assert_eq!(serde_json::from_str::<Value>(&lifecycle.stdout).unwrap()["managed"], true);
+    assert_eq!(
+        serde_json::from_str::<Value>(&lifecycle.stdout).unwrap()["managed"],
+        true
+    );
     let again = acp(state.path(), repo.path(), &["up"]);
     again.ok("acp up, again");
     assert!(
@@ -2301,34 +2634,69 @@ fn audit_cli_captures_existing_work_and_finishes_without_integration() {
         let repo = repo_with_exclude();
         install_fake_clis();
         configure_fakes(repo.path(), "pass", &[]);
-        fs::write(repo.path().join(".git/info/exclude"), ".acp/\n.acp-fake-*\n").unwrap();
-        fs::write(repo.path().join("existing.txt"), "selected existing change\n").unwrap();
+        fs::write(
+            repo.path().join(".git/info/exclude"),
+            ".acp/\n.acp-fake-*\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("existing.txt"),
+            "selected existing change\n",
+        )
+        .unwrap();
         let before = head_sha(repo.path());
         let mut daemon = Daemon::start_no_mcp(state.path(), repo.path());
         let team = state.path().join("chosen-team.json");
-        fs::write(&team, serde_json::to_vec(&json!({"version":3,"mode":"audit","name":"Audit",
+        fs::write(
+            &team,
+            serde_json::to_vec(&json!({"version":3,"mode":"audit","name":"Audit",
             "roles":{"verifier":{"provider":"claude","model":"haiku"},
-                     "reviewer":{"provider":"codex","model":"gpt-5.5"}}})).unwrap()).unwrap();
-        acp(state.path(), repo.path(), &["team", "set", team.to_str().unwrap()]).ok("set audit team");
+                     "reviewer":{"provider":"codex","model":"gpt-5.5"}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        acp(
+            state.path(),
+            repo.path(),
+            &["team", "set", team.to_str().unwrap()],
+        )
+        .ok("set audit team");
         let input = state.path().join("audit-input.json");
-        fs::write(&input, serde_json::to_vec(&json!({"task":loop_task("cli-audit"),
-            "selection":{"baseRef":"HEAD","target":{"kind":"workingTree"}}})).unwrap()).unwrap();
-        let output = acp(state.path(), repo.path(), &["audit", input.to_str().unwrap()]);
+        fs::write(
+            &input,
+            serde_json::to_vec(&json!({"task":loop_task("cli-audit"),
+            "selection":{"baseRef":"HEAD","target":{"kind":"workingTree"}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = acp(
+            state.path(),
+            repo.path(),
+            &["audit", input.to_str().unwrap()],
+        );
         output.ok("acp audit");
         let result: Value = serde_json::from_str(&output.stdout).unwrap();
         let run: RunId = result["runId"].as_str().unwrap().parse().unwrap();
         wait_for("audit terminal", LOOP_LIMIT, || {
-            Registry::open(state.path()).unwrap().run(&run).is_some_and(|r|
-                r.status != agent_control_plane::core::types::RunStatus::Running)
+            Registry::open(state.path())
+                .unwrap()
+                .run(&run)
+                .is_some_and(|r| r.status != agent_control_plane::core::types::RunStatus::Running)
         });
         let reg = Registry::open(state.path()).unwrap();
         let record = reg.run(&run).unwrap();
-        assert_eq!(record.status, agent_control_plane::core::types::RunStatus::Completed);
+        assert_eq!(
+            record.status,
+            agent_control_plane::core::types::RunStatus::Completed
+        );
         assert_eq!(record.audit.as_ref().unwrap().checks.len(), 2);
         assert!(record.gate_ids.is_empty());
         assert!(record.lineages.is_empty());
         assert_eq!(head_sha(repo.path()), before);
-        assert_eq!(fs::read_to_string(repo.path().join("existing.txt")).unwrap(), "selected existing change\n");
+        assert_eq!(
+            fs::read_to_string(repo.path().join("existing.txt")).unwrap(),
+            "selected existing change\n"
+        );
         acp(state.path(), repo.path(), &["stop"]).ok("safe stop after audit");
         assert_eq!(daemon.wait("audit owner stops"), Some(0));
         assert!(!daemon.socket().exists());
@@ -2430,7 +2798,6 @@ fn plan_door() {
     });
 }
 
-
 #[test]
 fn session_handles_and_safe_stop_roundtrip_without_converting_external_owner() {
     common::with_shared_env(|| async {
@@ -2439,9 +2806,16 @@ fn session_handles_and_safe_stop_roundtrip_without_converting_external_owner() {
         let mut daemon = Daemon::start(state.path(), repo.path());
         acp(state.path(), repo.path(), &["up", "--managed"]).ok("attach managed to external");
         let mut wire = Wire::connect(&daemon.socket());
-        let a = wire.call("session.acquire", json!({"label":"codex"})).unwrap();
-        let b = wire.call("session.acquire", json!({"label":"claude"})).unwrap();
-        assert_eq!(a["managed"], false, "external lifetime must remain unchanged");
+        let a = wire
+            .call("session.acquire", json!({"label":"codex"}))
+            .unwrap();
+        let b = wire
+            .call("session.acquire", json!({"label":"claude"}))
+            .unwrap();
+        assert_eq!(
+            a["managed"], false,
+            "external lifetime must remain unchanged"
+        );
         assert_ne!(a["sessionId"], b["sessionId"]);
         assert_eq!(b["sessions"], 2);
         let handle = json!({"instanceId":a["instanceId"], "sessionId":a["sessionId"]});
@@ -2450,8 +2824,12 @@ fn session_handles_and_safe_stop_roundtrip_without_converting_external_owner() {
         wire.call("session.release", handle.clone()).unwrap();
         let err = wire.call("session.renew", handle).unwrap_err();
         assert_eq!(err["data"]["code"], "session_expired");
-        let wrong = json!({"instanceId":uuid::Uuid::new_v4().to_string(), "sessionId":b["sessionId"]});
-        assert_eq!(wire.call("session.release", wrong).unwrap_err()["data"]["code"], "daemon_restarted");
+        let wrong =
+            json!({"instanceId":uuid::Uuid::new_v4().to_string(), "sessionId":b["sessionId"]});
+        assert_eq!(
+            wire.call("session.release", wrong).unwrap_err()["data"]["code"],
+            "daemon_restarted"
+        );
         let stop = acp(state.path(), repo.path(), &["stop"]);
         stop.ok("safe stop returns its acknowledgement");
         assert!(stop.stdout.contains("when_idle"));
@@ -2469,35 +2847,84 @@ fn closing_last_host_stops_managed_owner_and_preserves_history_across_restart() 
         let mut daemon = Daemon::start_with_lifetime(state.path(), repo.path(), true, true);
         // This empty audit produces durable history without any provider process.
         let team = state.path().join("chosen-team.json");
-        fs::write(&team, serde_json::to_vec(&json!({"version":3,"mode":"audit","name":"History",
-            "roles":{"reviewer":{"provider":"codex","model":"gpt-5.5"}}})).unwrap()).unwrap();
-        acp(state.path(), repo.path(), &["team", "set", team.to_str().unwrap()]).ok("set team");
+        fs::write(
+            &team,
+            serde_json::to_vec(&json!({"version":3,"mode":"audit","name":"History",
+            "roles":{"reviewer":{"provider":"codex","model":"gpt-5.5"}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        acp(
+            state.path(),
+            repo.path(),
+            &["team", "set", team.to_str().unwrap()],
+        )
+        .ok("set team");
         let input = state.path().join("input.json");
-        fs::write(&input, serde_json::to_vec(&json!({"task":loop_task("close-history"),
-            "selection":{"baseRef":"HEAD","target":{"kind":"workingTree"}}})).unwrap()).unwrap();
-        let run = acp(state.path(), repo.path(), &["audit", input.to_str().unwrap()]);
+        fs::write(
+            &input,
+            serde_json::to_vec(&json!({"task":loop_task("close-history"),
+            "selection":{"baseRef":"HEAD","target":{"kind":"workingTree"}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let run = acp(
+            state.path(),
+            repo.path(),
+            &["audit", input.to_str().unwrap()],
+        );
         run.ok("empty audit");
         let run: Value = serde_json::from_str(&run.stdout).unwrap();
         let run_id: RunId = run["runId"].as_str().unwrap().parse().unwrap();
-        wait_for("history is complete", LIMIT, || Registry::open(state.path()).unwrap().run(&run_id)
-            .is_some_and(|r| r.status == agent_control_plane::core::types::RunStatus::Completed));
+        wait_for("history is complete", LIMIT, || {
+            Registry::open(state.path())
+                .unwrap()
+                .run(&run_id)
+                .is_some_and(|r| r.status == agent_control_plane::core::types::RunStatus::Completed)
+        });
         let mut host = Command::new("/bin/sleep").arg("60").spawn().unwrap();
-        let handle = acp(state.path(), repo.path(), &["session", "acquire", "--owner-pid", &host.id().to_string()]);
+        let handle = acp(
+            state.path(),
+            repo.path(),
+            &["session", "acquire", "--owner-pid", &host.id().to_string()],
+        );
         handle.ok("bind actual host");
         let mut observer = Wire::connect(&daemon.socket());
-        host.kill().unwrap(); host.wait().unwrap();
-        wait_for("host ownership ends", Duration::from_secs(15), || observer.call("daemon.status", json!({})).unwrap()["sessions"] == 0);
-        assert!(daemon.child.try_wait().unwrap().is_none(), "other clients retain supervision");
+        host.kill().unwrap();
+        host.wait().unwrap();
+        wait_for("host ownership ends", Duration::from_secs(15), || {
+            observer.call("daemon.status", json!({})).unwrap()["sessions"] == 0
+        });
+        assert!(
+            daemon.child.try_wait().unwrap().is_none(),
+            "other clients retain supervision"
+        );
         drop(observer);
-        wait_for("managed owner exits promptly", Duration::from_secs(15), || daemon.child.try_wait().unwrap().is_some());
+        wait_for(
+            "managed owner exits promptly",
+            Duration::from_secs(15),
+            || daemon.child.try_wait().unwrap().is_some(),
+        );
         assert_eq!(daemon.wait("host closed"), Some(0));
-        assert!(!daemon.socket().exists()); assert!(!daemon.lock().exists());
-        let before = acp(state.path(), repo.path(), &["status", run_id.to_string().as_str(), "--json"]);
+        assert!(!daemon.socket().exists());
+        assert!(!daemon.lock().exists());
+        let before = acp(
+            state.path(),
+            repo.path(),
+            &["status", run_id.to_string().as_str(), "--json"],
+        );
         before.ok("offline history");
         let mut restarted = Daemon::start_no_mcp(state.path(), repo.path());
-        let after = acp(state.path(), repo.path(), &["status", run_id.to_string().as_str(), "--json"]);
+        let after = acp(
+            state.path(),
+            repo.path(),
+            &["status", run_id.to_string().as_str(), "--json"],
+        );
         after.ok("replayed history");
-        assert_eq!(serde_json::from_str::<Value>(&before.stdout).unwrap()["runs"], serde_json::from_str::<Value>(&after.stdout).unwrap()["runs"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&before.stdout).unwrap()["runs"],
+            serde_json::from_str::<Value>(&after.stdout).unwrap()["runs"]
+        );
         acp(state.path(), repo.path(), &["stop"]).ok("stop test owner");
         restarted.wait("cleanup");
     });
@@ -2510,22 +2937,36 @@ fn process_bound_session_ends_when_its_host_process_exits() {
         let repo = repo_with_exclude();
         let mut daemon = Daemon::start(state.path(), repo.path());
         let mut wire = Wire::connect(&daemon.socket());
-        let mut host = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let mut host = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
         let pid = i32::try_from(host.id()).unwrap();
-        let bound = wire.call("session.acquire", json!({"label":"claude", "ownerPid": pid})).unwrap();
+        let bound = wire
+            .call(
+                "session.acquire",
+                json!({"label":"claude", "ownerPid": pid}),
+            )
+            .unwrap();
         assert_eq!(bound["sessions"], 1);
         // A pid with no process cannot own a session.
-        assert!(wire.call("session.acquire", json!({"label":"claude", "ownerPid": 999_999})).is_err());
+        assert!(wire
+            .call(
+                "session.acquire",
+                json!({"label":"claude", "ownerPid": 999_999})
+            )
+            .is_err());
         host.kill().unwrap();
         host.wait().unwrap();
-        wait_for("the dead host's lease is reaped", Duration::from_secs(15), || {
-            wire.call("daemon.status", json!({})).unwrap()["sessions"] == 0
-        });
+        wait_for(
+            "the dead host's lease is reaped",
+            Duration::from_secs(15),
+            || wire.call("daemon.status", json!({})).unwrap()["sessions"] == 0,
+        );
         acp(state.path(), repo.path(), &["down"]).ok("stop the test daemon");
         daemon.wait("down");
     });
 }
-
 
 #[test]
 fn cancel_work_stop_drains_preparing_and_running_workers_before_exit() {
@@ -2538,9 +2979,14 @@ fn cancel_work_stop_drains_preparing_and_running_workers_before_exit() {
             let mut daemon = Daemon::start(state.path(), repo.path());
             let mut wire = Wire::connect(&daemon.socket());
             let task = loop_task("cancel-stop");
-            let delegated = wire.call("delegate", json!({
-                "role":"builder", "session":"fresh", "task":task
-            })).unwrap();
+            let delegated = wire
+                .call(
+                    "delegate",
+                    json!({
+                        "role":"builder", "session":"fresh", "task":task
+                    }),
+                )
+                .unwrap();
             let run = delegated["runId"].as_str().unwrap();
             let attempt = delegated["attemptId"].as_str().unwrap();
             let mut worker = None;
@@ -2561,12 +3007,20 @@ fn cancel_work_stop_drains_preparing_and_running_workers_before_exit() {
             let registry = Registry::open(state.path()).unwrap();
             let run_id: RunId = run.parse().unwrap();
             let recorded = registry.run(&run_id).unwrap();
-            assert_eq!(recorded.status, agent_control_plane::core::types::RunStatus::Cancelled);
+            assert_eq!(
+                recorded.status,
+                agent_control_plane::core::types::RunStatus::Cancelled
+            );
             assert!(registry.state().attempts.values().all(|a| {
                 a.status == agent_control_plane::core::types::AttemptStatus::Cancelled
             }));
-            assert!(registry.state().gates.is_empty(), "cancellation must not dispatch repairs or approval");
-            for lineage in &recorded.lineages { assert!(lineage.worktree.exists()); }
+            assert!(
+                registry.state().gates.is_empty(),
+                "cancellation must not dispatch repairs or approval"
+            );
+            for lineage in &recorded.lineages {
+                assert!(lineage.worktree.exists());
+            }
             if let Some(worker) = worker {
                 wait_for("the cancelled worker has exited", LIMIT, || {
                     nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker), None).is_err()
@@ -2574,4 +3028,27 @@ fn cancel_work_stop_drains_preparing_and_running_workers_before_exit() {
             }
         }
     });
+}
+
+#[test]
+fn gc_preserves_a_new_worktree_at_a_retired_worktrees_original_path() {
+    let state = short_dir();
+    let repo = repo_with_exclude();
+    let (run, closed, open) = fixture_lineages(state.path(), repo.path());
+    let original = closed.with_file_name("original-checkout");
+    let path = closed.to_str().unwrap();
+    let retained = original.to_str().unwrap();
+    let branch = format!("acp/{run}/closed");
+    for args in [vec!["worktree", "move", path, retained], vec!["-C", retained, "checkout", "--detach"], vec!["worktree", "add", path, &branch]] {
+        let result = Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+    let new_registration = fs::read(closed.join(".git")).expect("replacement checkout");
+    let trash = repo.path().join("disposable-trash");
+    fs::create_dir(&trash).unwrap();
+    let destination = trash.join("retired");
+    let result = acp_with_fixture_trash(state.path(), repo.path(), &["gc", "--closed"], &destination);
+    assert!(closed.join(".git").is_file() && !destination.exists(), "cleanup took the replacement checkout: {}", result.stdout);
+    assert_eq!(fs::read(closed.join(".git")).unwrap(), new_registration);
+    assert!(original.is_dir() && open.is_dir());
 }

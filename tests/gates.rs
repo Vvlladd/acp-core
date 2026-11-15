@@ -37,14 +37,16 @@ use agent_control_plane::core::r#loop::reattach_running;
 use agent_control_plane::core::registry::Registry;
 use agent_control_plane::core::supervisor::{ProcessProbe, Supervisor, SupervisorSignal};
 use agent_control_plane::core::types::{
-    Actor, AgentId, AttemptId, AttemptKind, CommitTarget, Defaults, EventPayload, Gate, GateId,
+    Actor, AgentId, AttemptId, AttemptKind, CommitTarget, Defaults, EventPayload,
+    ExternalCommandResult, ExternalCommandStatus, ExternalVerificationEvidence, Gate, GateId,
     GateKind, GateStatus, GatesConfig, Limits, LineageId, Origin, ProviderName, RoleName,
-    RolesConfig, Run, RunId, RunStatus, Task, ViolationKind,
+    RolesConfig, Run, RunId, RunStatus, Task, VerifyStatus, ViolationKind,
 };
 use agent_control_plane::workspace::git::{
     self, GitError, FROZEN_DIFF_TRUNCATION_MARKER, MAX_FROZEN_DIFF_BYTES,
 };
 use tempfile::TempDir;
+use sha2::{Digest, Sha256};
 
 const SHA: &str = "1111111111111111111111111111111111111111";
 
@@ -1647,6 +1649,7 @@ fn crash_after_resolving(w: &mut World, gate: &Gate) {
                     pre_sha: Some(w.head()),
                     diff_path: Some(w.diff_path()),
                 }),
+                external_verification: None,
             },
         )
         .expect("gate.resolving");
@@ -1772,6 +1775,7 @@ fn reconciliation_finishes_a_denial_caught_inside_the_window() {
                     feedback: Some("not this diff".into()),
                     by: Actor::Mcp,
                     commit: None,
+                    external_verification: None,
                 },
             )
             .expect("gate.resolving");
@@ -1949,6 +1953,7 @@ fn crash_after_old_shape_resolving(w: &mut World, gate: &Gate) {
                 feedback: None,
                 by: cli(),
                 commit: None,
+                external_verification: None,
             },
         )
         .expect("gate.resolving");
@@ -2427,6 +2432,7 @@ fn reconciliation_finishes_a_plan_approval_caught_inside_the_window() {
                     feedback: None,
                     by: cli(),
                     commit: None,
+                    external_verification: None,
                 },
             )
             .expect("gate.resolving");
@@ -2498,4 +2504,189 @@ fn a_payload_subject_leads_the_commit_and_the_summary_becomes_the_body() {
             "integrate.committed carries the same subject"
         );
     });
+}
+
+fn external_evidence(w: &mut World) -> (AttemptId, ExternalVerificationEvidence) {
+    let attempt = AttemptId::new_v4();
+    let hash = "a".repeat(64);
+    let diff_path = w.state.path().join("blocked.patch");
+    std::fs::write(&diff_path, b"frozen blocked source\n").unwrap();
+    let mut inventory = Sha256::new();
+    inventory.update(b"acp-source-inventory-v1\0");
+    inventory.update(b"frozen blocked source\n");
+    let inventory = format!("{:x}", inventory.finalize());
+    w.registry.append(&w.run, EventPayload::DiffFrozen {
+        source_inventory_hash: Some(inventory.clone()),
+        attempt_id: attempt,
+        diff_path,
+        diff_hash: hash.clone(),
+        files: vec!["src/adder.ts".into()],
+        added: 1,
+        deleted: 0,
+    }).expect("diff.frozen");
+    w.registry.append(&w.run, EventPayload::VerifyReport {
+        attempt_id: AttemptId::new_v4(),
+        builder_attempt_id: attempt,
+        status: VerifyStatus::Blocked,
+        summary: "socket creation denied".into(),
+        commands: vec!["cargo test --locked".into()],
+        failures: vec![],
+        blockers: vec!["local Unix socket creation: Operation not permitted".into()],
+    }).expect("verify.report");
+    let expected_run_seq = w.registry.run(&w.run).unwrap().last_seq;
+    (attempt, ExternalVerificationEvidence {
+        builder_attempt_id: attempt,
+        diff_hash: hash,
+        expected_run_seq,
+        commands: vec![ExternalCommandResult {
+            worker_command: "cargo test --locked".into(),
+            argv: vec!["cargo".into(), "test".into(), "--locked".into()],
+            status: ExternalCommandStatus::Passed,
+            exit_status: Some(0),
+        }],
+        toolchain_identity: "rustc 1.94.0; Xcode 27.2".into(),
+        provenance: "human-operated host shell".into(),
+        source_inventory_before_hash: inventory.clone(),
+        source_inventory_after_hash: inventory,
+        attestation: "I ran the recorded argv against the named frozen builder diff.".into(),
+        limitations: vec!["attestation is not cryptographic execution proof".into()],
+    })
+}
+
+#[test]
+fn external_verification_is_exact_state_bound_and_socket_only() {
+    let mut w = World::new();
+    let (_, evidence) = external_evidence(&mut w);
+    let expected_provenance = evidence.provenance.clone();
+    let inventory = evidence.source_inventory_after_hash.clone();
+    let gate = gates::create_external_verification_gate(&mut w.registry, &w.run, NewGate {
+        kind: GateKind::ExternalVerification,
+        summary: "host evidence".into(),
+        requested_by: Origin::ControlPlane,
+        payload: GatePayload { external_verification: Some(evidence), ..GatePayload::default() },
+    }, &inventory).expect("exact current evidence");
+    let err = gates::begin_resolve(
+        &mut w.registry, &gate.gate_id, true, None, Actor::Mcp, &roles_cfg(true),
+    ).expect_err("MCP cannot approve external evidence");
+    assert!(matches!(err, CoreError::Policy(ref p) if p.code == PolicyCode::AgentApproveNotAllowed));
+    let err = gates::begin_resolve(&mut w.registry, &gate.gate_id, true, None, cli(),
+        &roles_cfg(false)).expect_err("generic approval has no freshly captured inventory");
+    assert!(err.to_string().contains("fresh locked checkout inventory"));
+    let resolution = expect_settled(gates::approve_external_with_inventory(
+        &mut w.registry, &gate.gate_id, cli(), &roles_cfg(false), &inventory,
+        &lock().try_lock_owned().unwrap(),
+    ).expect("socket approval with a fresh locked capture"));
+    assert_eq!(resolution, GateResolution::Approved { sha: None });
+    std::fs::write(&gate.payload_path, br#"{"externalVerification":{"provenance":"tampered"}}"#)
+        .expect("tamper mutable payload after approval");
+    let accepted = w.registry.events(&w.run, None, usize::MAX).into_iter().find_map(|event| match &event.payload {
+        EventPayload::GateResolving { gate_id, external_verification: Some(evidence), .. }
+            if *gate_id == gate.gate_id => Some(evidence.clone()),
+        _ => None,
+    }).expect("append-only accepted evidence");
+    assert_eq!(accepted.provenance, expected_provenance);
+}
+
+#[test]
+fn external_verification_refuses_stale_mismatched_and_tampered_evidence() {
+    for mutation in ["stale", "diff", "inventory", "failed", "toolchain", "provenance", "attestation"] {
+        let mut w = World::new();
+        let (_, mut evidence) = external_evidence(&mut w);
+        match mutation {
+            "stale" => evidence.expected_run_seq = evidence.expected_run_seq.saturating_sub(1),
+            "toolchain" => evidence.toolchain_identity = "  ".into(),
+            "provenance" => evidence.provenance = "host\nrecord".into(),
+            "attestation" => evidence.attestation = "\u{2003}".into(),
+            "diff" => evidence.diff_hash = "c".repeat(64),
+            "inventory" => evidence.source_inventory_after_hash = "d".repeat(64),
+            "failed" => {
+                evidence.commands[0].status = ExternalCommandStatus::Failed;
+                evidence.commands[0].exit_status = Some(1);
+            }
+            _ => unreachable!(),
+        }
+        let inventory = evidence.source_inventory_after_hash.clone();
+        let result = gates::create_external_verification_gate(&mut w.registry, &w.run, NewGate {
+            kind: GateKind::ExternalVerification,
+            summary: "host evidence".into(),
+            requested_by: Origin::ControlPlane,
+            payload: GatePayload { external_verification: Some(evidence), ..GatePayload::default() },
+        }, &inventory);
+        assert!(result.is_err(), "{mutation} evidence was accepted");
+        assert!(w.registry.state().gates.is_empty(), "{mutation} wrote a gate before refusal");
+    }
+}
+
+#[test]
+fn host_verification_matches_each_blocked_command_occurrence() {
+    for (required, supplied, accepted) in [
+        (vec!["first", "first"], vec!["first"], false),
+        (vec!["first"], vec!["first", "extra"], false),
+        (vec!["first", "second"], vec!["first", "first"], false),
+        (vec!["first", "second", "first"], vec!["first", "first", "second"], true),
+    ] {
+        let mut w = World::new();
+        let (builder, mut evidence) = external_evidence(&mut w);
+        w.registry.append(&w.run, EventPayload::VerifyReport {
+            attempt_id: AttemptId::new_v4(), builder_attempt_id: builder,
+            status: VerifyStatus::Blocked, summary: "disposable blocked checks".into(),
+            commands: required.into_iter().map(String::from).collect(),
+            failures: vec![], blockers: vec!["fixture".into()],
+        }).unwrap();
+        evidence.expected_run_seq = w.registry.run(&w.run).unwrap().last_seq;
+        let record = evidence.commands[0].clone();
+        evidence.commands = supplied.into_iter().map(|name| ExternalCommandResult {
+            worker_command: name.into(), ..record.clone()
+        }).collect();
+        let inventory = evidence.source_inventory_after_hash.clone();
+        let result = gates::create_external_verification_gate(&mut w.registry, &w.run, NewGate {
+            kind: GateKind::ExternalVerification, summary: "host evidence".into(),
+            requested_by: Origin::ControlPlane,
+            payload: GatePayload { external_verification: Some(evidence), ..GatePayload::default() },
+        }, &inventory);
+        assert_eq!(result.is_ok(), accepted);
+    }
+}
+
+#[test]
+fn external_verification_refuses_complete_payload_replacement_after_restart() {
+    for replace_inventory in [true, false] {
+    let mut w = World::new();
+    let (_, evidence) = external_evidence(&mut w);
+    let inventory = evidence.source_inventory_after_hash.clone();
+    let gate = gates::create_external_verification_gate(&mut w.registry, &w.run, NewGate {
+        kind: GateKind::ExternalVerification,
+        summary: "host evidence".into(),
+        requested_by: Origin::ControlPlane,
+        payload: GatePayload { external_verification: Some(evidence.clone()), ..GatePayload::default() },
+    }, &inventory).expect("prepare evidence");
+
+    let mut replacement = evidence;
+    if replace_inventory {
+        replacement.source_inventory_before_hash = "e".repeat(64);
+        replacement.source_inventory_after_hash = "e".repeat(64);
+    }
+    replacement.commands[0].argv = vec!["cargo".into(), "test".into(), "--release".into()];
+    replacement.provenance = "different host and shell".into();
+    replacement.toolchain_identity = "different toolchain".into();
+    std::fs::write(
+        &gate.payload_path,
+        serde_json::to_vec(&GatePayload {
+            external_verification: Some(replacement),
+            ..GatePayload::default()
+        }).unwrap(),
+    ).expect("replace both hashes and the rest of the mutable evidence");
+    w.reopen();
+
+    let err = gates::begin_resolve(
+        &mut w.registry, &gate.gate_id, true, None, cli(), &roles_cfg(false),
+    ).expect_err("replayed immutable preparation rejects replaced payload");
+    let expected = if replace_inventory { "source inventory captured with the frozen diff" }
+        else { "diverges from immutable prepared evidence" };
+    assert!(err.to_string().contains(expected), "{err}");
+    assert_eq!(w.gate_now(&gate).status, GateStatus::Pending);
+    assert!(!w.registry.events(&w.run, None, usize::MAX).iter().any(|event| {
+        matches!(&event.payload, EventPayload::GateResolving { gate_id, .. } if *gate_id == gate.gate_id)
+    }));
+    }
 }

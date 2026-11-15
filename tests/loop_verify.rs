@@ -272,6 +272,262 @@ fn nothing_to_run_proceeds_to_review_and_the_gate_says_so() {
     });
 }
 
+#[test]
+fn environment_blocked_is_recorded_without_retry_repair_or_strike() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("pass", &[("ACP_FAKE_VERIFY_SCENARIO", "verify_blocked")]);
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let handle = actor.handle.clone();
+        let run = handle.delegate(delegate_builder(loop_task("T65-blocked")))
+            .await.expect("delegate").run_id;
+        wait_for_status(
+            &handle,
+            StatusQuery { run_id: Some(run), ..StatusQuery::default() },
+            "environment-blocked verification",
+            |s| s.runs.first().is_some_and(|r| r.status == RunStatus::Blocked),
+        ).await;
+        let events = world.events(&run);
+        assert_eq!(verify_reports(&events).len(), 1);
+        assert_eq!(verify_reports(&events)[0].0, VerifyStatus::Blocked);
+        assert_eq!(agents_of(&events, RoleName::Verifier).len(), 1, "no equivalent retry");
+        assert!(agents_of(&events, RoleName::Reviewer).is_empty());
+        assert!(strike_reasons(&events).is_empty(), "environment blockers are not builder strikes");
+        assert!(gate_summaries(&events, GateKind::Integrate).is_empty());
+        quiesce(&handle).await;
+        actor.stop().await;
+    });
+}
+
+/// Matching host hashes are insufficient if source changed after the reviewed diff was frozen.
+#[test]
+fn external_host_evidence_rejects_changes_before_the_first_host_inventory() {
+    common::with_shared_env(|| async {
+        use agent_control_plane::core::types::{Actor, ExternalCommandResult,
+            ExternalCommandStatus, ExternalVerificationEvidence};
+        use agent_control_plane::workspace::git;
+        for change_source in ["file", "empty_directory", "none"] {
+            let world = LoopWorld::new("pass", &[("ACP_FAKE_VERIFY_SCENARIO", "verify_blocked")]);
+            let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+            let handle = actor.handle.clone();
+            let run = handle.delegate(delegate_builder(loop_task("T65-host-binding")))
+                .await.unwrap().run_id;
+            wait_for_status(&handle, StatusQuery { run_id: Some(run), ..StatusQuery::default() },
+                "blocked verification", |s| s.runs.first().is_some_and(|r| r.status == RunStatus::Blocked)).await;
+            let registry = world.reopen();
+            let events = registry.events(&run, None, usize::MAX);
+            let (attempt, diff_hash) = events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::DiffFrozen { attempt_id, diff_hash, .. } => Some((*attempt_id, diff_hash.clone())),
+                _ => None,
+            }).unwrap();
+            let commands = events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::VerifyReport { commands, .. } => Some(commands.clone()), _ => None,
+            }).unwrap();
+            let worktree = registry.agent(&registry.attempt(&attempt).unwrap().agent_id)
+                .unwrap().worktree.as_ref().unwrap();
+            match change_source {
+                "file" => std::fs::write(worktree.join("changed-after-freeze.txt"),
+                    "untested frozen source\n").unwrap(),
+                "empty_directory" => std::fs::create_dir(worktree.join("empty-after-freeze")).unwrap(),
+                "none" => {}
+                _ => unreachable!(),
+            }
+            let inventory = git::source_inventory_hash(worktree).await.unwrap();
+            let seq = registry.run(&run).unwrap().last_seq;
+            let result = handle.prepare_external_verification(run, ExternalVerificationEvidence {
+                builder_attempt_id: attempt, diff_hash, expected_run_seq: seq,
+                commands: commands.iter().map(|command| ExternalCommandResult {
+                    worker_command: command.clone(), argv: vec!["cargo".into(), "test".into(), "--locked".into()],
+                    status: ExternalCommandStatus::Passed, exit_status: Some(0),
+                }).collect(),
+                toolchain_identity: "fake host test toolchain".into(), provenance: "disposable regression fixture".into(),
+                source_inventory_before_hash: inventory.clone(), source_inventory_after_hash: inventory,
+                attestation: "Regression fixture attestation only".into(), limitations: vec!["fake providers".into()],
+            }, Actor::Socket { client_name: "test-human".into() }).await;
+            quiesce(&handle).await;
+            actor.stop().await;
+            if change_source != "none" {
+                assert!(result.is_err(), "source changed after freeze was accepted: {result:?}");
+                assert!(world.events(&run).iter().all(|event| !matches!(&event.payload,
+                    EventPayload::GateResolving { external_verification: Some(_), .. })));
+            } else {
+                assert!(result.is_ok(), "unchanged frozen source was refused: {result:?}");
+            }
+        }
+    });
+}
+
+/// Accepting host evidence is distinct from the integration gate, even with all reviews off.
+#[test]
+fn host_evidence_without_reviews_opens_one_pending_integration_gate_across_restart() {
+    common::with_shared_env(|| async {
+        use agent_control_plane::core::team::{save_team, Team};
+        use agent_control_plane::core::types::{Actor, ExternalCommandResult,
+            ExternalCommandStatus, ExternalVerificationEvidence, GateStatus};
+        use agent_control_plane::workspace::git;
+
+        let world = LoopWorld::new("pass", &[("ACP_FAKE_VERIFY_SCENARIO", "verify_blocked")]);
+        let team: Team = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "name": "host evidence without reviews",
+            "roles": {
+                "builder": { "provider": "claude", "model": "haiku" },
+                "verifier": { "provider": "claude", "model": "haiku" }
+            }
+        })).unwrap();
+        save_team(world.state_dir(), &team).unwrap();
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let handle = actor.handle.clone();
+        let run = handle.delegate(delegate_builder(loop_task("T65-host-no-review")))
+            .await.unwrap().run_id;
+        wait_for_status(&handle, StatusQuery { run_id: Some(run), ..StatusQuery::default() },
+            "blocked verification", |s| s.runs.first().is_some_and(|r| r.status == RunStatus::Blocked)).await;
+        let registry = world.reopen();
+        let events = registry.events(&run, None, usize::MAX);
+        let (attempt, diff_hash) = events.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::DiffFrozen { attempt_id, diff_hash, .. } => Some((*attempt_id, diff_hash.clone())),
+            _ => None,
+        }).unwrap();
+        let commands = events.iter().rev().find_map(|e| match &e.payload {
+            EventPayload::VerifyReport { commands, .. } => Some(commands.clone()), _ => None,
+        }).unwrap();
+        let worktree = registry.agent(&registry.attempt(&attempt).unwrap().agent_id)
+            .unwrap().worktree.as_ref().unwrap();
+        let inventory = git::source_inventory_hash(worktree).await.unwrap();
+        let accepted = handle.prepare_external_verification(run, ExternalVerificationEvidence {
+            builder_attempt_id: attempt, diff_hash,
+            expected_run_seq: registry.run(&run).unwrap().last_seq,
+            commands: commands.iter().map(|command| ExternalCommandResult {
+                worker_command: command.clone(), argv: vec!["cargo".into(), "test".into()],
+                status: ExternalCommandStatus::Passed, exit_status: Some(0),
+            }).collect(),
+            toolchain_identity: "fake host test toolchain".into(),
+            provenance: "disposable regression fixture".into(),
+            source_inventory_before_hash: inventory.clone(), source_inventory_after_hash: inventory,
+            attestation: "Regression fixture attestation only".into(),
+            limitations: vec!["fake providers".into()],
+        }, Actor::Socket { client_name: "test-human".into() }).await.unwrap();
+        wait_for_status(&handle, StatusQuery { run_id: Some(run), ..StatusQuery::default() },
+            "awaiting integration", |s| s.runs.first().is_some_and(|r| r.status == RunStatus::AwaitingGate)).await;
+        quiesce(&handle).await;
+        actor.stop().await;
+
+        let assert_gate = || {
+            let registry = world.reopen();
+            assert_eq!(registry.gate(&accepted.gate_id).unwrap().status, GateStatus::Approved);
+            let gates: Vec<_> = registry.state().gates.values()
+                .filter(|gate| gate.run_id == run && gate.kind == GateKind::Integrate).collect();
+            assert_eq!(gates.len(), 1, "approved evidence must lead to exactly one integration gate");
+            assert_eq!(gates[0].status, GateStatus::Pending, "evidence cannot approve integration");
+            let events = registry.events(&run, None, usize::MAX);
+            assert_eq!(gate_summaries(&events, GateKind::Integrate).len(), 1);
+            assert!(gate_summaries(&events, GateKind::Integrate)[0].starts_with("NO reviewer ran"));
+            assert!(agents_of(&events, RoleName::Reviewer).is_empty());
+            assert!(agents_of(&events, RoleName::Security).is_empty());
+            assert!(strike_reasons(&events).is_empty());
+        };
+        assert_gate();
+        for _ in 0..2 {
+            let actor = start_actor(&world, embedded_roles(), ActorOpts { reattach: true, ..ActorOpts::default() });
+            quiesce(&actor.handle).await;
+            actor.stop().await;
+            assert_gate();
+        }
+    });
+}
+
+/// A crash can leave the external gate pending between preparation and immediate approval.
+/// Resolving that durable gate must check the checkout as it is now under the shared lock.
+#[test]
+fn pending_host_evidence_after_restart_recaptures_the_checkout_before_approval() {
+    common::with_shared_env(|| async {
+        use agent_control_plane::core::gates::{self, GatePayload, NewGate};
+        use agent_control_plane::core::types::{ExternalCommandResult, ExternalCommandStatus,
+            ExternalVerificationEvidence, GateStatus, Origin};
+        use agent_control_plane::workspace::git;
+        for (changed, deny) in [(true, false), (false, false), (false, true)] {
+            let world = LoopWorld::new("pass", &[("ACP_FAKE_VERIFY_SCENARIO", "verify_blocked")]);
+            let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+            let run = actor.handle.delegate(delegate_builder(loop_task("T65-pending-host"))).await.unwrap().run_id;
+            wait_for_status(&actor.handle, StatusQuery { run_id: Some(run), ..StatusQuery::default() },
+                "blocked verification", |s| s.runs.first().is_some_and(|r| r.status == RunStatus::Blocked)).await;
+            quiesce(&actor.handle).await;
+            actor.stop().await;
+
+            let mut registry = world.reopen();
+            let events = registry.events(&run, None, usize::MAX);
+            let (attempt, diff_hash) = events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::DiffFrozen { attempt_id, diff_hash, .. } => Some((*attempt_id, diff_hash.clone())),
+                _ => None,
+            }).unwrap();
+            let commands = events.iter().rev().find_map(|e| match &e.payload {
+                EventPayload::VerifyReport { commands, .. } => Some(commands.clone()), _ => None,
+            }).unwrap();
+            let worktree = registry.agent(&registry.attempt(&attempt).unwrap().agent_id)
+                .unwrap().worktree.clone().unwrap();
+            let inventory = git::source_inventory_hash(&worktree).await.unwrap();
+            let evidence = ExternalVerificationEvidence {
+                builder_attempt_id: attempt, diff_hash, expected_run_seq: registry.run(&run).unwrap().last_seq,
+                commands: commands.into_iter().map(|worker_command| ExternalCommandResult {
+                    worker_command, argv: vec!["cargo".into(), "test".into()],
+                    status: ExternalCommandStatus::Passed, exit_status: Some(0),
+                }).collect(),
+                toolchain_identity: "test host".into(), provenance: "disposable test".into(),
+                source_inventory_before_hash: inventory.clone(), source_inventory_after_hash: inventory.clone(),
+                attestation: "regression fixture".into(), limitations: vec!["fake providers".into()],
+            };
+            let gate = gates::create_external_verification_gate(&mut registry, &run, NewGate {
+                kind: GateKind::ExternalVerification, summary: "prepared host evidence".into(),
+                requested_by: Origin::ControlPlane,
+                payload: GatePayload { external_verification: Some(evidence.clone()), ..GatePayload::default() },
+            }, &inventory).unwrap();
+            drop(registry); // durable log ends at gate.created, before acceptance
+            if changed { std::fs::write(worktree.join("changed-after-gate-created"), "new bytes").unwrap(); }
+            let actor = start_actor(&world, embedded_roles(), ActorOpts { reattach: true, ..ActorOpts::default() });
+            if deny {
+                let attempts_before = world.reopen().state().attempts.len();
+                let denied = actor.handle.resolve_gate(gate.gate_id, false, Some("wrong host report".into()), common::cli_actor()).await.unwrap();
+                assert!(matches!(denied, agent_control_plane::core::GateResolution::Denied { .. }));
+                quiesce(&actor.handle).await;
+                let current = world.reopen();
+                assert_eq!(current.run(&run).unwrap().status, RunStatus::Blocked);
+                assert_eq!(current.state().attempts.len(), attempts_before);
+                assert!(agents_of(&current.events(&run, None, usize::MAX), RoleName::Reviewer).is_empty());
+                let mut fresh = evidence;
+                fresh.expected_run_seq = current.run(&run).unwrap().last_seq;
+                drop(current);
+                actor.stop().await;
+                let actor = start_actor(&world, embedded_roles(), ActorOpts { reattach: true, ..ActorOpts::default() });
+                let accepted = actor.handle.prepare_external_verification(run, fresh, common::cli_actor()).await.unwrap();
+                assert!(matches!(accepted.resolution, agent_control_plane::core::GateResolution::Approved { sha: None }));
+                actor.handle.status(StatusQuery { run_id: Some(run), ..StatusQuery::default() }).await.unwrap();
+                let events = world.events(&run);
+                assert_eq!(agents_of(&events, RoleName::Reviewer).len(), 1, "fresh evidence must start the selected reviewer");
+                wait_for_status(&actor.handle, StatusQuery { run_id: Some(run), ..StatusQuery::default() },
+                    "integration after replacement host evidence", |s| s.gates.iter().any(|g|
+                        g.kind == GateKind::Integrate && g.status == GateStatus::Pending)).await;
+                quiesce(&actor.handle).await;
+                actor.stop().await;
+                assert_eq!(gate_summaries(&world.events(&run), GateKind::Integrate).len(), 1);
+                continue;
+            }
+            let result = actor.handle.resolve_gate(gate.gate_id, true, None, common::cli_actor()).await;
+            quiesce(&actor.handle).await;
+            actor.stop().await;
+            let registry = world.reopen();
+            if changed {
+                assert!(result.is_err(), "stale checkout accepted after pending-gate restart: {result:?}");
+                assert_eq!(registry.gate(&gate.gate_id).unwrap().status, GateStatus::Pending);
+                assert!(!registry.events(&run, None, usize::MAX).iter().any(|e| matches!(&e.payload,
+                    EventPayload::GateResolving { gate_id, .. } if *gate_id == gate.gate_id)));
+                assert!(agents_of(&registry.events(&run, None, usize::MAX), RoleName::Reviewer).is_empty());
+            } else {
+                assert!(matches!(result, Ok(agent_control_plane::core::GateResolution::Approved { sha: None })));
+                assert_eq!(registry.gate(&gate.gate_id).unwrap().status, GateStatus::Approved);
+            }
+        }
+    });
+}
+
 /// Rev 25's mirror on the verify side: a report that does not echo the frozen diff's hash decides
 /// nothing — one replacement verifier, then the run blocks. No reviewer, no gate, no strike, and
 /// the mismatch is recorded on the attempt.

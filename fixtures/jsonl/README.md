@@ -38,6 +38,7 @@ One JSON object per line; the last line is the `result` object (`session_id`, `t
 | `verify-pass-1.jsonl` | 5 | B1 verifier happy path: `system/init` (agents `["verifier"]`) → `Bash` `tool_use`/`tool_result` (`cargo build && cargo test`) → final `text` = a `verify-report` JSON (`status:"pass"`) → `result` with the same `structured_output`. The `diffHash` value is a 64×`f` placeholder in **both** its forms (escaped inside the JSON strings, plain inside `structured_output`); the fake bin substitutes `ACP_FAKE_VERIFY_HASH` — lifted from the verifier's own prompt by the test wrapper — into every occurrence, mirroring the codex reviewer mechanism. |
 | `verify-fail-1.jsonl` | 5 | Same shape, `status:"fail"`, two `failures` lines (a failing test name and a compiler error) that the strike's repair prompt must deliver verbatim. |
 | `verify-nothing-1.jsonl` | 5 | Same shape, `status:"nothing-to-run"`, empty `commands`/`failures` — the repo-declares-no-test-command edge that must never fail a run. |
+| `verify-blocked-1.jsonl` | 5 | Same shape, `status:"blocked"`, a concrete local-socket capability blocker and no failures — recorded without retrying or striking the builder. |
 | `verify-ftp-1.jsonl` / `verify-ftp-2.jsonl` | 5 each | `verify_fail_then_pass`: the first verifier invocation replays the fail report, the second (after the builder's repair) the pass — the numbered-fixture walk the fake bins already use for `fail_then_pass` reviews. `verify-ftp-1` carries the same report content as `verify-fail-1` (its `session_id` differs), the way `worker_commits-1` mirrors `pass-1`. The verify fixtures' session ids form their own `aaaaaaaa-2222…6666` family. |
 
 ## `codex/` — `codex exec --json …`
@@ -78,6 +79,7 @@ fake bins in T03/T04.
 | `verify_pass` (argv-selected: `--agent verifier` + `ACP_FAKE_VERIFY_SCENARIO`, default) | `verify-pass-1.jsonl` | — | B1 verifier reports `pass`, echoing `ACP_FAKE_VERIFY_HASH`; makes no worktree change. |
 | `verify_fail` | `verify-fail-1.jsonl` | — | Verifier reports `fail` with two failure lines; drives the 17b strike with the failure text. |
 | `verify_nothing` | `verify-nothing-1.jsonl` | — | Verifier reports `nothing-to-run`; the loop proceeds to review. |
+| `verify_blocked` | `verify-blocked-1.jsonl` | — | Verifier reports an environment capability blocker; the loop records it and stops without a retry or builder strike. |
 | `verify_fail_then_pass` | `verify-ftp-1.jsonl`, `verify-ftp-2.jsonl` | — | First verify fails, the post-repair verify passes — the full strike-and-recover arc. |
 | `verify_crash` | — | — | Behavioural: the verifier dies before any output (one replacement, then the run blocks). |
 | `fail_then_pass` | `pass-1.jsonl` | `review-fail-1.jsonl`, then `review-pass-2.jsonl` | The builder always succeeds; the FAIL comes from the reviewer. |

@@ -54,6 +54,9 @@ impl Core {
             Command::CreateGate { reply, .. } => {
                 let _ = reply.send(Err(refusal(reason)));
             }
+            Command::PrepareExternalVerification { reply, .. } => {
+                let _ = reply.send(Err(refusal(reason)));
+            }
             Command::ResolveGate {
                 approve: true,
                 reply,

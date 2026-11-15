@@ -24,15 +24,21 @@
 //! No `regex` dependency: the sha and trailer predicates are hand-written char checks.
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::future::Future;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::RwLock;
 use std::time::Duration;
 
 use globset::GlobSet;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -67,9 +73,23 @@ pub const MAX_FROZEN_DIFF_BYTES: usize = 8 * 1024 * 1024;
 pub const FROZEN_DIFF_TRUNCATION_MARKER: &[u8] =
     b"\n(frozen diff truncated by the control plane)\n";
 
+/// Bounds for the host-verification source inventory. The inventory deliberately covers the
+/// complete tracked checkout plus all ignored and untracked files, not merely the frozen patch.
+pub const MAX_SOURCE_INVENTORY_PATHS: usize = 20_000;
+pub const MAX_SOURCE_INVENTORY_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SOURCE_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SOURCE_INVENTORY_LIST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SOURCE_INVENTORY_SUBMODULE_DEPTH: usize = 8;
+const MAX_SOURCE_INVENTORY_DIRECTORY_DEPTH: usize = 128;
+
 /// Error text retained from a streaming git child. The pipe is drained beyond this bound so a
 /// noisy child cannot deadlock, but an error cannot make the daemon retain unbounded stderr.
 const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
+
+/// Retirement journals contain only one filesystem identity and two recovery paths. Bound reads
+/// so a damaged or replaced receipt cannot make inventory or confirmation allocate arbitrarily.
+const MAX_RETIREMENT_IDENTITY_BYTES: u64 = 64 * 1024;
+const RETIREMENT_RECEIPT_VERSION: u32 = 2;
 
 /// `core.hooksPath` for every commit the control plane makes.
 ///
@@ -173,6 +193,62 @@ pub struct CommitMessage {
     pub body: String,
 }
 
+/// A preview names the directory and its linked-worktree control file at the time of selection.
+/// A missing directory is valid only for the existing journal-recovery path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) enum PreviewCheckout {
+    Absent,
+    Present {
+        root: (u64, u64),
+        git_file: Option<(u64, u64, i64, i64)>,
+    },
+}
+
+impl PreviewCheckout {
+    pub(crate) fn capture(path: &Path) -> std::io::Result<Self> {
+        let root = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::Absent),
+            Err(error) => return Err(error),
+        };
+        if !root.is_dir() {
+            return Err(std::io::Error::other("the worktree path is not a directory"));
+        }
+        let git_file = match std::fs::symlink_metadata(path.join(".git")) {
+            Ok(meta) if meta.is_file() => Some((meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())),
+            Ok(_) => return Err(std::io::Error::other("the worktree .git entry is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self::Present { root: (root.dev(), root.ino()), git_file })
+    }
+}
+
+/// Filesystem and Git-admin identity captured immediately before a retirement Trash handoff.
+/// The device/inode pair binds the later recovery record to the directory that was validated.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetirementTicket {
+    #[serde(default)]
+    version: u32,
+    pub preserved_ref: String,
+    root_dev: u64,
+    root_ino: u64,
+    git_file: Vec<u8>,
+    #[serde(default)]
+    common_dir: PathBuf,
+    #[serde(default)]
+    git_admin_name: String,
+    git_dir_dev: u64,
+    git_dir_ino: u64,
+    #[serde(default)]
+    trash_path: Option<PathBuf>,
+    #[serde(default)]
+    git_quarantine_path: Option<PathBuf>,
+    #[serde(default)]
+    registration_retired: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
@@ -236,26 +312,1500 @@ pub async fn resolve_ref(repo: &Path, r: &str) -> Result<String, GitError> {
 
 /// Validate a recorded recovery draft without resetting or copying any files. The caller wraps
 /// this sequence in one GIT_OP_TIMEOUT, outside the core actor.
-pub async fn recovery_status(repo: &Path, worktree: &Path, base_sha: &str) -> Result<String, GitError> {
-    let invalid = || GitError::RecoveryInvalid { reason:
-        "The preserved draft is missing, redirected, belongs to another repository, or its base commit changed.".into() };
+pub async fn recovery_status(
+    repo: &Path,
+    worktree: &Path,
+    base_sha: &str,
+) -> Result<String, GitError> {
+    let invalid = || {
+        GitError::RecoveryInvalid { reason:
+        "The preserved draft is missing, redirected, belongs to another repository, or its base commit changed.".into() }
+    };
     let canonical_repo = tokio::fs::canonicalize(repo).await.map_err(|_| invalid())?;
     let relative = worktree.strip_prefix(repo).map_err(|_| invalid())?;
-    if !relative.starts_with(".acp/worktrees") { return Err(invalid()); }
-    let canonical = tokio::fs::canonicalize(worktree).await.map_err(|_| invalid())?;
+    if !relative.starts_with(".acp/worktrees") {
+        return Err(invalid());
+    }
+    let canonical = tokio::fs::canonicalize(worktree)
+        .await
+        .map_err(|_| invalid())?;
     // macOS's /var and /tmp aliases may occur above the repository. Links within the draft path
     // still fail: its canonical location must be exactly the same suffix under the real root.
-    let top = tokio::fs::canonicalize(repo_root(worktree).await?).await.map_err(|_| invalid())?;
-    if canonical != canonical_repo.join(relative) || top != canonical || head_sha(worktree).await? != base_sha {
+    let top = tokio::fs::canonicalize(repo_root(worktree).await?)
+        .await
+        .map_err(|_| invalid())?;
+    if canonical != canonical_repo.join(relative)
+        || top != canonical
+        || head_sha(worktree).await? != base_sha
+    {
         return Err(invalid());
     }
     async fn common_dir(path: &Path) -> Result<PathBuf, GitError> {
-        let out = git("recovery_repository", path, [tok("rev-parse"), tok("--path-format=absolute"), tok("--git-common-dir")]).await?;
+        let out = git(
+            "recovery_repository",
+            path,
+            [
+                tok("rev-parse"),
+                tok("--path-format=absolute"),
+                tok("--git-common-dir"),
+            ],
+        )
+        .await?;
         let dir = PathBuf::from(trim_eol(&out.stdout()));
-        tokio::fs::canonicalize(&dir).await.map_err(|source| GitError::Io { op: "recovery_repository", source })
+        tokio::fs::canonicalize(&dir)
+            .await
+            .map_err(|source| GitError::Io {
+                op: "recovery_repository",
+                source,
+            })
     }
-    if common_dir(repo).await? != common_dir(worktree).await? { return Err(invalid()); }
+    if common_dir(repo).await? != common_dir(worktree).await? {
+        return Err(invalid());
+    }
     status_porcelain(worktree).await
+}
+
+fn retirement_invalid(reason: impl Into<String>) -> GitError {
+    GitError::RecoveryInvalid {
+        reason: reason.into(),
+    }
+}
+
+fn retirement_identity(store: &Path, run: &str, lineage: &str) -> PathBuf {
+    store
+        .join("retired")
+        .join(run)
+        .join(format!("{lineage}.identity"))
+}
+
+fn registration_recovery_path(common: &Path, run: &str, lineage: &str) -> PathBuf {
+    common
+        .join("acp-retired-worktrees")
+        .join(run)
+        .join(format!("{lineage}.git-admin"))
+}
+
+fn c_name(value: &OsStr) -> Result<CString, GitError> {
+    CString::new(value.as_bytes())
+        .map_err(|_| retirement_invalid("a retirement path component contains a NUL byte"))
+}
+
+fn open_dir_at(parent: BorrowedFd<'_>, name: &OsStr, create: bool) -> Result<OwnedFd, GitError> {
+    let name = c_name(name)?;
+    if create {
+        // SAFETY: the parent descriptor and NUL-terminated component are valid for this call.
+        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if rc != 0 {
+            let source = std::io::Error::last_os_error();
+            if source.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(GitError::Io {
+                    op: "retirement_directory",
+                    source,
+                });
+            }
+        }
+    }
+    // SAFETY: the parent descriptor and NUL-terminated component are valid. O_NOFOLLOW refuses
+    // repository-controlled symlinks instead of allowing them to redirect cleanup state.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op: "retirement_directory",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful openat returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn retirement_run_dir_sync(store: &Path, run: &str, create: bool) -> Result<OwnedFd, GitError> {
+    if Path::new(run).components().count() != 1
+        || !matches!(
+            Path::new(run).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(retirement_invalid(
+            "the retirement run id is not a path component",
+        ));
+    }
+    let canonical_store = std::fs::canonicalize(store).map_err(|source| GitError::Io {
+        op: "retirement_directory",
+        source,
+    })?;
+    let raw = CString::new(canonical_store.as_os_str().as_bytes())
+        .map_err(|_| retirement_invalid("the retirement state path contains a NUL byte"))?;
+    // SAFETY: raw is a valid NUL-terminated canonical path. O_NOFOLLOW binds the trusted anchor.
+    let fd = unsafe {
+        libc::open(
+            raw.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op: "retirement_directory",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful open returned a new owned descriptor.
+    let root = unsafe { OwnedFd::from_raw_fd(fd) };
+    let retired = open_dir_at(root.as_fd(), OsStr::new("retired"), create)?;
+    open_dir_at(retired.as_fd(), OsStr::new(run), create)
+}
+
+async fn retirement_run_dir(store: &Path, run: &str, create: bool) -> Result<OwnedFd, GitError> {
+    retirement_run_dir_sync(store, run, create)
+}
+
+fn registration_run_dir_sync(common: &Path, run: &str, create: bool) -> Result<OwnedFd, GitError> {
+    if Path::new(run).components().count() != 1
+        || !matches!(
+            Path::new(run).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(retirement_invalid(
+            "the retirement run id is not a path component",
+        ));
+    }
+    let canonical_common = std::fs::canonicalize(common).map_err(|source| GitError::Io {
+        op: "retirement_deregister",
+        source,
+    })?;
+    let raw = CString::new(canonical_common.as_os_str().as_bytes())
+        .map_err(|_| retirement_invalid("the Git common directory contains a NUL byte"))?;
+    // SAFETY: raw is a canonical, NUL-terminated path. O_NOFOLLOW binds the Git common directory.
+    let fd = unsafe {
+        libc::open(
+            raw.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op: "retirement_deregister",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful open returned a new owned descriptor.
+    let root = unsafe { OwnedFd::from_raw_fd(fd) };
+    let retired = open_dir_at(root.as_fd(), OsStr::new("acp-retired-worktrees"), create)?;
+    open_dir_at(retired.as_fd(), OsStr::new(run), create)
+}
+
+async fn registration_run_dir(common: &Path, run: &str, create: bool) -> Result<OwnedFd, GitError> {
+    registration_run_dir_sync(common, run, create)
+}
+
+async fn save_retirement_identity(
+    store: &Path,
+    run: &str,
+    lineage: &str,
+    ticket: &RetirementTicket,
+) -> Result<(), GitError> {
+    let bytes = serde_json::to_vec(ticket).map_err(|error| {
+        retirement_invalid(format!("could not encode cleanup identity: {error}"))
+    })?;
+    let dir = retirement_run_dir(store, run, true).await?;
+    let final_name = c_name(OsStr::new(&format!("{lineage}.identity")))?;
+    let temporary_name = c_name(OsStr::new(&format!("{lineage}.identity.tmp")))?;
+    // A stale temporary (including a hostile symlink) is only unlinked by name beneath the bound
+    // directory. O_EXCL below then closes the unlink/create symlink race.
+    // SAFETY: descriptor and names are valid; unlinkat never follows the named symlink.
+    unsafe { libc::unlinkat(dir.as_raw_fd(), temporary_name.as_ptr(), 0) };
+    // SAFETY: descriptor and name are valid. O_EXCL|O_NOFOLLOW prevents overwrite/redirection.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            temporary_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op: "retirement_identity",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful openat returned a new owned descriptor.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    std::io::Write::write_all(&mut file, &bytes).map_err(|source| GitError::Io {
+        op: "retirement_identity",
+        source,
+    })?;
+    file.sync_all().map_err(|source| GitError::Io {
+        op: "retirement_identity",
+        source,
+    })?;
+    drop(file);
+    // SAFETY: both names are in the same bound directory, so the replacement is atomic and
+    // cannot be redirected through repository-controlled path components.
+    let rc = unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            temporary_name.as_ptr(),
+            dir.as_raw_fd(),
+            final_name.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(GitError::Io {
+            op: "retirement_identity",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // Persist the directory entry as well as the identity contents.
+    let directory = unsafe { std::fs::File::from_raw_fd(dir.into_raw_fd()) };
+    directory.sync_all().map_err(|source| GitError::Io {
+        op: "retirement_identity",
+        source,
+    })?;
+    Ok(())
+}
+
+fn read_retirement_identity(
+    dir: BorrowedFd<'_>,
+    lineage: &str,
+) -> Result<RetirementTicket, GitError> {
+    let name = c_name(OsStr::new(&format!("{lineage}.identity")))?;
+    // SAFETY: the bound directory and name are valid. O_NOFOLLOW refuses a substituted journal.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op: "retirement_identity",
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful openat returned a new owned descriptor.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|source| GitError::Io {
+        op: "retirement_identity",
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_RETIREMENT_IDENTITY_BYTES {
+        return Err(retirement_invalid(
+            "the durable cleanup identity is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut bounded = std::io::Read::take(&mut file, MAX_RETIREMENT_IDENTITY_BYTES + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes).map_err(|source| GitError::Io {
+        op: "retirement_identity",
+        source,
+    })?;
+    if bytes.len() as u64 > MAX_RETIREMENT_IDENTITY_BYTES {
+        return Err(retirement_invalid(
+            "the durable cleanup identity exceeds its size limit",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        retirement_invalid(format!("the durable cleanup identity is invalid: {error}"))
+    })?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    if !matches!(version, Some(1) | Some(2)) {
+        return Err(retirement_invalid(
+            "the cleanup receipt is legacy or unauthenticated; request a fresh preview while the registered worktree still exists",
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| {
+        retirement_invalid(format!("the durable cleanup identity is invalid: {error}"))
+    })
+}
+
+async fn load_retirement_identity(
+    store: &Path,
+    run: &str,
+    lineage: &str,
+) -> Result<RetirementTicket, GitError> {
+    let dir = retirement_run_dir(store, run, false).await?;
+    let ticket = read_retirement_identity(dir.as_fd(), lineage)?;
+    if ticket.version != RETIREMENT_RECEIPT_VERSION {
+        return Err(retirement_invalid("the cleanup receipt is legacy or unauthenticated; request a fresh preview while the registered worktree still exists"));
+    }
+    Ok(ticket)
+}
+
+async fn load_retirement_identity_any_version(
+    store: &Path,
+    run: &str,
+    lineage: &str,
+) -> Result<RetirementTicket, GitError> {
+    let dir = retirement_run_dir(store, run, false).await?;
+    read_retirement_identity(dir.as_fd(), lineage)
+}
+
+/// Validate the durable handoff plan needed when the public worktree path is already absent.
+/// This does not inspect the Trash item; confirmation does that under the per-worktree lock.
+pub fn retirement_handoff_planned(
+    store: &Path,
+    repo: &Path,
+    run: &str,
+    lineage: &str,
+) -> Result<(), GitError> {
+    let dir = retirement_run_dir_sync(store, run, false)?;
+    let ticket = read_retirement_identity(dir.as_fd(), lineage)?;
+    if ticket.version != RETIREMENT_RECEIPT_VERSION {
+        return Err(retirement_invalid("the cleanup receipt is legacy or unauthenticated; request a fresh preview while the registered worktree still exists"));
+    }
+    let preserved_ref = format!("refs/acp/retained/{run}/{lineage}");
+    if ticket.preserved_ref != preserved_ref {
+        return Err(retirement_invalid(
+            "the cleanup receipt names another retained ref",
+        ));
+    }
+    let Some(trash_path) = ticket.trash_path.as_deref() else {
+        return Err(retirement_invalid(
+            "the cleanup receipt has no planned recoverable Trash location",
+        ));
+    };
+    if !trash_path.is_absolute() || !ticket.common_dir.is_absolute() {
+        return Err(retirement_invalid(
+            "the cleanup receipt contains a relative recovery identity",
+        ));
+    }
+    validate_store_layout_sync(store, repo, &ticket.common_dir)?;
+    validate_admin_name(&ticket.git_admin_name)?;
+    let expected_quarantine = registration_recovery_path(&ticket.common_dir, run, lineage);
+    if ticket.git_quarantine_path.as_deref() != Some(expected_quarantine.as_path()) {
+        return Err(retirement_invalid(
+            "the cleanup receipt names another Git registration recovery location",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_admin_name(name: &str) -> Result<(), GitError> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(retirement_invalid(
+            "the cleanup receipt contains an invalid Git registration identity",
+        ));
+    }
+    Ok(())
+}
+
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn validate_store_layout_sync(store: &Path, repo: &Path, common: &Path) -> Result<(), GitError> {
+    let store = std::fs::canonicalize(store).map_err(|source| GitError::Io {
+        op: "retirement_directory",
+        source,
+    })?;
+    let repo = std::fs::canonicalize(repo).map_err(|source| GitError::Io {
+        op: "retirement_repository",
+        source,
+    })?;
+    let common = std::fs::canonicalize(common).map_err(|source| GitError::Io {
+        op: "retirement_repository",
+        source,
+    })?;
+    if overlaps(&store, &repo) || overlaps(&store, &common) {
+        return Err(retirement_invalid("the daemon retirement state overlaps repository-controlled storage; choose a separate ACP state directory"));
+    }
+    Ok(())
+}
+
+async fn validate_store_layout(store: &Path, repo: &Path, common: &Path) -> Result<(), GitError> {
+    validate_store_layout_sync(store, repo, common)
+}
+
+async fn common_dir(path: &Path) -> Result<PathBuf, GitError> {
+    let out = git(
+        "retirement_repository",
+        path,
+        [
+            tok("rev-parse"),
+            tok("--path-format=absolute"),
+            tok("--git-common-dir"),
+        ],
+    )
+    .await?;
+    tokio::fs::canonicalize(PathBuf::from(trim_eol(&out.stdout())))
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_repository",
+            source,
+        })
+}
+
+async fn git_file_identity(
+    worktree: &Path,
+    common: &Path,
+) -> Result<(Vec<u8>, String, PathBuf, u64, u64), GitError> {
+    let path = worktree.join(".git");
+    let meta = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_identity",
+            source,
+        })?;
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+        return Err(retirement_invalid(
+            "the registered worktree .git entry is not a regular file",
+        ));
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_identity",
+            source,
+        })?;
+    let line = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.trim().strip_prefix("gitdir: "))
+        .ok_or_else(|| retirement_invalid("the registered worktree .git file is malformed"))?;
+    let raw = PathBuf::from(line);
+    let git_dir = tokio::fs::canonicalize(if raw.is_absolute() {
+        raw
+    } else {
+        worktree.join(raw)
+    })
+    .await
+    .map_err(|source| GitError::Io {
+        op: "retirement_identity",
+        source,
+    })?;
+    let admin = tokio::fs::metadata(&git_dir)
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_identity",
+            source,
+        })?;
+    if !admin.is_dir() {
+        return Err(retirement_invalid(
+            "the registered worktree Git admin entry is not a directory",
+        ));
+    }
+    let expected_parent = tokio::fs::canonicalize(common.join("worktrees"))
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_identity",
+            source,
+        })?;
+    if git_dir.parent() != Some(expected_parent.as_path()) {
+        return Err(retirement_invalid(
+            "the registered Git administration path is outside the resolved common directory",
+        ));
+    }
+    let admin_name = git_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            retirement_invalid("the registered Git administration identity is not valid UTF-8")
+        })?
+        .to_owned();
+    validate_admin_name(&admin_name)?;
+    Ok((bytes, admin_name, git_dir, admin.dev(), admin.ino()))
+}
+
+fn derived_git_dir(common: &Path, ticket: &RetirementTicket) -> Result<PathBuf, GitError> {
+    validate_admin_name(&ticket.git_admin_name)?;
+    Ok(common.join("worktrees").join(&ticket.git_admin_name))
+}
+
+async fn verify_recorded_branch(git_dir: &Path, expected_branch: &str) -> Result<(), GitError> {
+    let head = tokio::fs::read(git_dir.join("HEAD"))
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_identity",
+            source,
+        })?;
+    let expected = format!("ref: refs/heads/{expected_branch}");
+    if String::from_utf8_lossy(&head).trim() != expected {
+        return Err(retirement_invalid(
+            "the path is not the ACP worktree branch recorded for this lineage",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a freshly created lineage to its original filesystem directory and Git registration.
+/// This records identity only. The retained Git ref and Trash plan are created at retirement.
+pub async fn record_original_worktree(
+    repo: &Path, worktree: &Path, store: &Path, run: &str, lineage: &str,
+) -> Result<(), GitError> {
+    let common = common_dir(repo).await?;
+    validate_store_layout(store, repo, &common).await?;
+    let ticket = current_worktree_identity(worktree, common, run, lineage).await?;
+    if tokio::fs::try_exists(retirement_identity(store, run, lineage)).await
+        .map_err(|source| GitError::Io { op: "worktree_identity", source })? {
+        return Err(retirement_invalid("this lineage already has a worktree identity"));
+    }
+    save_retirement_identity(store, run, lineage, &ticket).await
+}
+
+async fn current_worktree_identity(
+    worktree: &Path, common: PathBuf, run: &str, lineage: &str,
+) -> Result<RetirementTicket, GitError> {
+    let root = tokio::fs::symlink_metadata(worktree).await
+        .map_err(|source| GitError::Io { op: "worktree_identity", source })?;
+    if !root.is_dir() {
+        return Err(retirement_invalid("the recorded worktree is not a directory"));
+    }
+    let (git_file, git_admin_name, _, git_dir_dev, git_dir_ino) =
+        git_file_identity(worktree, &common).await?;
+    Ok(RetirementTicket {
+        version: RETIREMENT_RECEIPT_VERSION,
+        preserved_ref: format!("refs/acp/retained/{run}/{lineage}"),
+        root_dev: root.dev(), root_ino: root.ino(), git_file, common_dir: common,
+        git_admin_name, git_dir_dev, git_dir_ino,
+        trash_path: None, git_quarantine_path: None, registration_retired: false,
+    })
+}
+
+impl RetirementTicket {
+    fn same_worktree(&self, other: &Self) -> bool {
+        self.preserved_ref == other.preserved_ref
+            && self.root_dev == other.root_dev && self.root_ino == other.root_ino
+            && self.git_file == other.git_file && self.common_dir == other.common_dir
+            && self.git_admin_name == other.git_admin_name
+            && self.git_dir_dev == other.git_dir_dev && self.git_dir_ino == other.git_dir_ino
+    }
+}
+
+/// A closed lineage can be collected only when the original registration is known.
+/// A missing public path is handled by the journal's separate interrupted-move checks.
+pub async fn verify_closed_worktree(
+    repo: &Path, worktree: &Path, store: &Path, run: &str, lineage: &str,
+) -> Result<(), GitError> {
+    let common = common_dir(repo).await?;
+    validate_store_layout(store, repo, &common).await?;
+    let recorded = load_retirement_identity_any_version(store, run, lineage).await?;
+    let current = current_worktree_identity(worktree, common, run, lineage).await?;
+    if recorded.registration_retired || !recorded.same_worktree(&current) {
+        return Err(retirement_invalid("the original worktree registration no longer matches; the current checkout was preserved"));
+    }
+    Ok(())
+}
+
+/// Validate exact recorded ownership and content, then preserve the integrated commit outside the
+/// worktree. Nothing is removed here; the caller records retirement before using the ticket.
+pub async fn prepare_retirement(
+    repo: &Path,
+    worktree: &Path,
+    integrated_sha: &str,
+    expected_branch: &str,
+    store: &Path,
+    run: &str,
+    lineage: &str,
+) -> Result<RetirementTicket, GitError> {
+    prepare_retirement_with_identity(repo, worktree, integrated_sha, expected_branch,
+        store, RetirementTarget::new(run, lineage), RetirementAuthorization::Human).await
+}
+
+pub(crate) async fn prepare_previewed_retirement(
+    repo: &Path, worktree: &Path, sha: &str, branch: &str, store: &Path,
+    target: RetirementTarget<'_>, expected: &PreviewCheckout,
+) -> Result<RetirementTicket, GitError> {
+    prepare_retirement_with_identity(repo, worktree, sha, branch, store, target,
+        RetirementAuthorization::Preview(expected)).await
+}
+
+/// GC has no human preview to establish ownership. Require the previously recorded identity
+/// inside preparation as well as during candidate selection, including after a racing removal.
+pub async fn prepare_closed_retirement(
+    repo: &Path, worktree: &Path, sha: &str, branch: &str, store: &Path, target: RetirementTarget<'_>,
+) -> Result<RetirementTicket, GitError> {
+    prepare_retirement_with_identity(repo, worktree, sha, branch, store, target, RetirementAuthorization::Recorded).await
+}
+
+enum RetirementAuthorization<'a> {
+    Human,
+    Recorded,
+    Preview(&'a PreviewCheckout),
+}
+
+async fn prepare_retirement_with_identity(
+    repo: &Path, worktree: &Path, integrated_sha: &str, expected_branch: &str,
+    store: &Path, target: RetirementTarget<'_>, authorization: RetirementAuthorization<'_>,
+) -> Result<RetirementTicket, GitError> {
+    let RetirementTarget { run, lineage, .. } = target;
+    checked_sha("prepare_retirement", integrated_sha)?;
+    let prior = if matches!(authorization, RetirementAuthorization::Recorded) || tokio::fs::symlink_metadata(retirement_identity(store, run, lineage))
+        .await
+        .is_ok()
+    {
+        let durable = load_retirement_identity_any_version(store, run, lineage).await?;
+        if durable.registration_retired {
+            return Err(retirement_invalid(
+                "this lineage already has a recoverable Trash item; the old path was reused and was preserved",
+            ));
+        }
+        Some(durable)
+    } else {
+        None
+    };
+    let canonical_repo = tokio::fs::canonicalize(repo)
+        .await
+        .map_err(|source| GitError::Io {
+            op: "prepare_retirement",
+            source,
+        })?;
+    let canonical_worktree =
+        tokio::fs::canonicalize(worktree)
+            .await
+            .map_err(|source| GitError::Io {
+                op: "prepare_retirement",
+                source,
+            })?;
+    let relative = canonical_worktree
+        .strip_prefix(&canonical_repo)
+        .map_err(|_| retirement_invalid("the recorded path is outside its repository"))?;
+    if !relative.starts_with(Path::new(".acp/worktrees")) || relative.components().count() <= 2 {
+        return Err(retirement_invalid(
+            "the recorded path is not in ACP's worktree directory",
+        ));
+    }
+    // An alternate spelling such as /var or /private/var may identify the repository.
+    // Every component below that anchor must still be the recorded, unredirected suffix.
+    let anchor = worktree
+        .ancestors()
+        .nth(relative.components().count())
+        .ok_or_else(|| retirement_invalid("the recorded worktree path was redirected"))?;
+    if !worktree.ends_with(relative)
+        || tokio::fs::canonicalize(anchor)
+            .await
+            .map_err(|source| GitError::Io {
+                op: "prepare_retirement",
+                source,
+            })?
+            != canonical_repo
+    {
+        return Err(retirement_invalid(
+            "the recorded worktree path was redirected",
+        ));
+    }
+    let resolved_common = common_dir(repo).await?;
+    validate_store_layout(store, repo, &resolved_common).await?;
+    let ticket = current_worktree_identity(worktree, resolved_common.clone(), run, lineage).await?;
+    if let RetirementAuthorization::Preview(expected) = authorization {
+        let observed = PreviewCheckout::capture(worktree).map_err(|source|
+            GitError::Io { op: "retirement_preview", source })?;
+        if expected != &observed || !matches!(observed, PreviewCheckout::Present {
+            root, git_file: Some(_),
+        } if root == (ticket.root_dev, ticket.root_ino)) {
+            return Err(retirement_invalid("the worktree registration changed after preview; request a fresh preview"));
+        }
+    }
+    if prior.as_ref().is_some_and(|identity| !identity.same_worktree(&ticket)) {
+        return Err(retirement_invalid("the recorded cleanup identity no longer matches this worktree"));
+    }
+    verify_recorded_branch(&derived_git_dir(&resolved_common, &ticket)?, expected_branch).await?;
+    let top = tokio::fs::canonicalize(repo_root(worktree).await?)
+        .await
+        .map_err(|source| GitError::Io {
+            op: "prepare_retirement",
+            source,
+        })?;
+    if top != canonical_worktree || resolved_common != common_dir(worktree).await? {
+        return Err(retirement_invalid(
+            "the path belongs to another Git repository",
+        ));
+    }
+    if head_sha(worktree).await? != integrated_sha {
+        return Err(retirement_invalid(
+            "the worktree HEAD is not the recorded integrated commit",
+        ));
+    }
+    let branch_ref = format!("refs/heads/{expected_branch}");
+    if resolve_ref(repo, &branch_ref).await? != integrated_sha {
+        return Err(retirement_invalid(
+            "the recorded integrated commit is not reachable from the recorded ACP branch",
+        ));
+    }
+    let status = git(
+        "retirement_status",
+        worktree,
+        [
+            tok("status"),
+            tok("--porcelain"),
+            tok("-z"),
+            tok("--untracked-files=all"),
+            tok("--ignored=matching"),
+        ],
+    )
+    .await?;
+    if !status.into_raw().is_empty() {
+        return Err(retirement_invalid(
+            "the worktree has modified, untracked, or ignored content; it was preserved",
+        ));
+    }
+    let preserved_ref = format!("refs/acp/retained/{run}/{lineage}");
+    let existing = git_raw(
+        "retirement_ref",
+        repo,
+        [
+            tok("rev-parse"),
+            tok("--verify"),
+            tok("--end-of-options"),
+            OsStr::new(&preserved_ref),
+        ],
+    )
+    .await?;
+    if existing.status.success() {
+        let found = checked_sha(
+            "retirement_ref",
+            String::from_utf8_lossy(&existing.stdout).trim(),
+        )?;
+        if found != integrated_sha {
+            return Err(retirement_invalid(
+                "the preserved ACP ref already names another commit",
+            ));
+        }
+    } else {
+        git(
+            "retirement_ref",
+            repo,
+            [
+                tok("update-ref"),
+                OsStr::new(&preserved_ref),
+                OsStr::new(integrated_sha),
+                OsStr::new(&"0".repeat(40)),
+            ],
+        )
+        .await?;
+    }
+    let durable = if let Some(durable) = prior {
+        if durable.version == RETIREMENT_RECEIPT_VERSION {
+            durable
+        } else {
+            // A v1 plan kept the Git-registration recovery item in private state, which may be a
+            // different volume. While the original registered tree is still present, the exact
+            // inode/Git identities above authorize replacing only that plan with the v2
+            // same-filesystem destination. Once the tree has moved, v1 remains fail-closed.
+            ticket
+        }
+    } else {
+        ticket
+    };
+    // The event log may only advertise a prepared retirement after the exact worktree identity is
+    // durable. Persist both first-time and migrated receipts here so a crash cannot leave a
+    // WorktreeRetired event whose cleanup identity never existed.
+    save_retirement_identity(store, run, lineage, &durable).await?;
+    Ok(durable)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetirementResult {
+    pub preserved_ref: String,
+    pub restore_path: PathBuf,
+    pub disk_space_reclaimed: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn system_trash_destination(source: &Path, leaf: &OsStr) -> Result<PathBuf, GitError> {
+    use std::ffi::{c_char, c_void, CStr};
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {}
+
+    unsafe fn class(name: &'static [u8]) -> Id {
+        unsafe { objc_getClass(name.as_ptr().cast()) }
+    }
+    unsafe fn sel(name: &'static [u8]) -> Sel {
+        unsafe { sel_registerName(name.as_ptr().cast()) }
+    }
+    unsafe fn send0(receiver: Id, selector: Sel) -> Id {
+        let call: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { call(receiver, selector) }
+    }
+    unsafe fn send_url(receiver: Id, selector: Sel, path: *const c_char, len: usize) -> Id {
+        let call: unsafe extern "C" fn(Id, Sel, *const c_char, bool, Id) -> Id =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { call(receiver, selector, path, len != 0, std::ptr::null_mut()) }
+    }
+    unsafe fn send_directory(receiver: Id, selector: Sel, appropriate: Id, error: *mut Id) -> Id {
+        let call: unsafe extern "C" fn(Id, Sel, usize, usize, Id, bool, *mut Id) -> Id =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        // NSTrashDirectory (102), NSUserDomainMask (1). With an appropriate URL Foundation
+        // returns the Trash directory on the source volume.
+        unsafe { call(receiver, selector, 102, 1, appropriate, true, error) }
+    }
+    unsafe fn send_cstr(receiver: Id, selector: Sel) -> *const c_char {
+        let call: unsafe extern "C" fn(Id, Sel) -> *const c_char =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { call(receiver, selector) }
+    }
+
+    let raw = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| retirement_invalid("the worktree path contains a NUL byte"))?;
+    // SAFETY: Foundation objects remain alive inside this autorelease pool and all selectors have
+    // the documented signatures used below. NSURL's filesystem-representation initializer keeps
+    // non-UTF-8 POSIX paths intact.
+    unsafe {
+        let pool = send0(class(b"NSAutoreleasePool\0"), sel(b"new\0"));
+        let url_class = class(b"NSURL\0");
+        let url = send_url(
+            url_class,
+            sel(b"fileURLWithFileSystemRepresentation:isDirectory:relativeToURL:\0"),
+            raw.as_ptr(),
+            raw.as_bytes().len(),
+        );
+        let manager = send0(class(b"NSFileManager\0"), sel(b"defaultManager\0"));
+        let mut error: Id = std::ptr::null_mut();
+        let trash = send_directory(
+            manager,
+            sel(b"URLForDirectory:inDomain:appropriateForURL:create:error:\0"),
+            url,
+            &mut error,
+        );
+        if trash.is_null() {
+            let detail = if error.is_null() {
+                "the system Trash service declined the move".to_string()
+            } else {
+                let description = send0(error, sel(b"localizedDescription\0"));
+                let bytes = send_cstr(description, sel(b"UTF8String\0"));
+                if bytes.is_null() {
+                    "the system Trash service declined the move".to_string()
+                } else {
+                    CStr::from_ptr(bytes)
+                        .to_string_lossy()
+                        .chars()
+                        .take(512)
+                        .collect()
+                }
+            };
+            let _: () = {
+                let call: unsafe extern "C" fn(Id, Sel) =
+                    std::mem::transmute(objc_msgSend as *const ());
+                call(pool, sel(b"drain\0"));
+            };
+            return Err(retirement_invalid(format!(
+                "the worktree was preserved because {detail}"
+            )));
+        }
+        let bytes = send_cstr(trash, sel(b"fileSystemRepresentation\0"));
+        if bytes.is_null() {
+            return Err(retirement_invalid(
+                "the Trash service returned no recoverable path",
+            ));
+        }
+        let destination =
+            PathBuf::from(OsStr::from_bytes(CStr::from_ptr(bytes).to_bytes())).join(leaf);
+        let call: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc_msgSend as *const ());
+        call(pool, sel(b"drain\0"));
+        Ok(destination)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_trash_destination(_source: &Path, _leaf: &OsStr) -> Result<PathBuf, GitError> {
+    Err(retirement_invalid(
+        "this platform has no supported ACP Trash handoff; the worktree was preserved",
+    ))
+}
+
+fn open_bound_directory(path: &Path, op: &'static str) -> Result<OwnedFd, GitError> {
+    let canonical = std::fs::canonicalize(path).map_err(|source| GitError::Io { op, source })?;
+    if !canonical.is_absolute() {
+        return Err(retirement_invalid(
+            "a retirement parent directory is not absolute",
+        ));
+    }
+    let root = c_name(OsStr::new("/"))?;
+    // SAFETY: root is NUL terminated. Opening the filesystem root gives component-by-component
+    // traversal a stable anchor; every child below is opened with O_NOFOLLOW.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op,
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful open returned a new owned descriptor.
+    let mut directory = unsafe { OwnedFd::from_raw_fd(fd) };
+    for component in canonical.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => directory = open_dir_at(directory.as_fd(), name, false)?,
+            _ => {
+                return Err(retirement_invalid(
+                    "a retirement parent path has an unsupported component",
+                ))
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn directory_metadata_at(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    op: &'static str,
+) -> Result<(OwnedFd, std::fs::Metadata), GitError> {
+    let name = c_name(name)?;
+    // SAFETY: parent is a bound directory and name is NUL terminated. O_NOFOLLOW and O_DIRECTORY
+    // reject a symlink or non-directory source entry before the exclusive rename.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(GitError::Io {
+            op,
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful openat returned a new owned descriptor. Metadata is read through that
+    // descriptor, not by resolving the source pathname a second time.
+    let directory = unsafe { OwnedFd::from_raw_fd(fd) };
+    let file = std::fs::File::from(
+        directory
+            .try_clone()
+            .map_err(|source| GitError::Io { op, source })?,
+    );
+    let metadata = file
+        .metadata()
+        .map_err(|source| GitError::Io { op, source })?;
+    Ok((directory, metadata))
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive_at(
+    source_parent: BorrowedFd<'_>,
+    source_name: &OsStr,
+    destination_parent: BorrowedFd<'_>,
+    destination_name: &OsStr,
+    op: &'static str,
+) -> Result<(), GitError> {
+    let source_name = c_name(source_name)?;
+    let destination_name = c_name(destination_name)?;
+    // SAFETY: both descriptors and NUL-terminated leaf names are valid. RENAME_EXCL performs the
+    // no-replace decision and rename atomically within the kernel.
+    let rc = unsafe {
+        libc::renameatx_np(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(GitError::Io {
+            op,
+            source: std::io::Error::last_os_error(),
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_exclusive_at(
+    _source_parent: BorrowedFd<'_>,
+    _source_name: &OsStr,
+    _destination_parent: BorrowedFd<'_>,
+    _destination_name: &OsStr,
+    _op: &'static str,
+) -> Result<(), GitError> {
+    Err(retirement_invalid(
+        "this platform has no supported descriptor-relative no-replace rename; content was preserved",
+    ))
+}
+
+fn sync_directory(directory: BorrowedFd<'_>, op: &'static str) -> Result<(), GitError> {
+    std::fs::File::from(
+        directory
+            .try_clone_to_owned()
+            .map_err(|source| GitError::Io { op, source })?,
+    )
+    .sync_all()
+    .map_err(|source| GitError::Io { op, source })
+}
+
+fn identity_mismatch_after_move(
+    source_parent: BorrowedFd<'_>,
+    source_name: &OsStr,
+    destination_parent: BorrowedFd<'_>,
+    destination_name: &OsStr,
+    source: &Path,
+    destination: &Path,
+    op: &'static str,
+) -> GitError {
+    match rename_exclusive_at(
+        destination_parent,
+        destination_name,
+        source_parent,
+        source_name,
+        op,
+    ) {
+        Ok(()) => {
+            let durability = sync_directory(source_parent, op)
+                .and_then(|()| sync_directory(destination_parent, op));
+            retirement_invalid(if let Err(error) = durability {
+                format!(
+                    "the source leaf changed during retirement; the moved directory was restored without overwrite at {}, but synchronizing its parent failed ({error}); preserve that exact path",
+                    source.display(),
+                )
+            } else {
+                format!(
+                    "the source leaf changed during retirement; the moved directory was restored without overwrite at {}",
+                    source.display(),
+                )
+            })
+        }
+        Err(error) => retirement_invalid(format!(
+            "the source leaf changed during retirement and safe restoration failed ({error}); preserve and recover the moved directory at {}",
+            destination.display(),
+        )),
+    }
+}
+
+fn move_directory_no_replace(
+    source: &Path,
+    destination_parent: BorrowedFd<'_>,
+    destination_parent_path: &Path,
+    destination_name: &OsStr,
+    expected_dev: u64,
+    expected_ino: u64,
+    op: &'static str,
+) -> Result<(), GitError> {
+    let source_parent_path = source
+        .parent()
+        .ok_or_else(|| retirement_invalid("the retirement source has no parent"))?;
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| retirement_invalid("the retirement source has no name"))?;
+    let source_parent = open_bound_directory(source_parent_path, op)?;
+    let destination_parent_file = std::fs::File::from(
+        destination_parent
+            .try_clone_to_owned()
+            .map_err(|source| GitError::Io { op, source })?,
+    );
+    let destination_parent_meta = destination_parent_file
+        .metadata()
+        .map_err(|source| GitError::Io { op, source })?;
+    let (_source_entry, source_meta) =
+        directory_metadata_at(source_parent.as_fd(), source_name, op)?;
+    if source_meta.dev() != expected_dev || source_meta.ino() != expected_ino {
+        return Err(retirement_invalid(
+            "the descriptor-bound retirement source has the wrong identity; it was preserved",
+        ));
+    }
+    if source_meta.dev() != destination_parent_meta.dev() {
+        return Err(retirement_invalid(
+            "the retirement destination is not on the source filesystem",
+        ));
+    }
+    rename_exclusive_at(
+        source_parent.as_fd(),
+        source_name,
+        destination_parent,
+        destination_name,
+        op,
+    )?;
+    let destination = destination_parent_path.join(destination_name);
+    let moved = directory_metadata_at(destination_parent, destination_name, op);
+    let identity_matches = moved.as_ref().is_ok_and(|(_, metadata)| {
+        metadata.dev() == expected_dev && metadata.ino() == expected_ino
+    });
+    if !identity_matches {
+        return Err(identity_mismatch_after_move(
+            source_parent.as_fd(),
+            source_name,
+            destination_parent,
+            destination_name,
+            source,
+            &destination,
+            op,
+        ));
+    }
+    sync_directory(source_parent.as_fd(), op)?;
+    Ok(())
+}
+
+fn move_to_fixture_trash(
+    source: &Path,
+    destination: &Path,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> Result<(), GitError> {
+    let destination_parent_path = destination
+        .parent()
+        .ok_or_else(|| retirement_invalid("the Trash destination has no parent"))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| retirement_invalid("the Trash destination has no name"))?;
+    let destination_parent = open_bound_directory(destination_parent_path, "retirement_trash")?;
+    move_directory_no_replace(
+        source,
+        destination_parent.as_fd(),
+        destination_parent_path,
+        destination_name,
+        expected_dev,
+        expected_ino,
+        "retirement_trash",
+    )?;
+    sync_directory(destination_parent.as_fd(), "retirement_trash")
+}
+
+fn move_registration_to_journal(
+    source: &Path,
+    journal: BorrowedFd<'_>,
+    journal_path: &Path,
+    destination_name: &OsStr,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> Result<(), GitError> {
+    move_directory_no_replace(
+        source,
+        journal,
+        journal_path,
+        destination_name,
+        expected_dev,
+        expected_ino,
+        "retirement_deregister",
+    )
+}
+
+#[cfg(debug_assertions)]
+fn injected_trash_destination() -> Option<PathBuf> {
+    std::env::var_os("ACP_FAKE_RETIREMENT_TRASH_DESTINATION").map(PathBuf::from)
+}
+
+#[cfg(not(debug_assertions))]
+fn injected_trash_destination() -> Option<PathBuf> {
+    None
+}
+
+/// Hand the validated tree to the platform Trash, retain its exact identity for recovery, and
+/// remove only that now-absent worktree's Git registration. File contents are never unlinked here.
+pub struct RetirementTarget<'a> {
+    pub run: &'a str,
+    pub lineage: &'a str,
+    fixture_trash: Option<&'a Path>,
+}
+
+impl<'a> RetirementTarget<'a> {
+    pub fn new(run: &'a str, lineage: &'a str) -> Self {
+        Self {
+            run,
+            lineage,
+            fixture_trash: None,
+        }
+    }
+}
+
+pub async fn quarantine_and_remove_worktree(
+    repo: &Path,
+    worktree: &Path,
+    integrated_sha: &str,
+    store: &Path,
+    expected_branch: &str,
+    target: RetirementTarget<'_>,
+    ticket: Option<RetirementTicket>,
+) -> Result<RetirementResult, GitError> {
+    let RetirementTarget {
+        run,
+        lineage,
+        fixture_trash,
+    } = target;
+    checked_sha("retirement_remove", integrated_sha)?;
+    let resolved_common = common_dir(repo).await?;
+    validate_store_layout(store, repo, &resolved_common).await?;
+    let public_exists = tokio::fs::symlink_metadata(worktree).await.is_ok();
+    if public_exists {
+        let mut ticket = ticket
+            .ok_or_else(|| retirement_invalid("cleanup lost its validated filesystem identity"))?;
+        let meta = tokio::fs::metadata(worktree)
+            .await
+            .map_err(|source| GitError::Io {
+                op: "retirement_identity",
+                source,
+            })?;
+        let (git_file, admin_name, git_dir, git_dev, git_ino) =
+            git_file_identity(worktree, &resolved_common).await?;
+        if meta.dev() != ticket.root_dev
+            || meta.ino() != ticket.root_ino
+            || git_file != ticket.git_file
+            || resolved_common != ticket.common_dir
+            || admin_name != ticket.git_admin_name
+            || git_dir != derived_git_dir(&resolved_common, &ticket)?
+            || git_dev != ticket.git_dir_dev
+            || git_ino != ticket.git_dir_ino
+        {
+            return Err(retirement_invalid(
+                "the validated worktree path was substituted before cleanup",
+            ));
+        }
+        verify_recorded_branch(&git_dir, expected_branch).await?;
+        let status = git(
+            "retirement_recheck",
+            worktree,
+            [
+                tok("status"),
+                tok("--porcelain"),
+                tok("-z"),
+                tok("--untracked-files=all"),
+                tok("--ignored=matching"),
+            ],
+        )
+        .await?;
+        if !status.into_raw().is_empty() {
+            return Err(retirement_invalid(
+                "content changed after retirement validation; the worktree was preserved",
+            ));
+        }
+        if ticket.registration_retired {
+            return Err(retirement_invalid(
+                "the recorded path was reused after its ACP tree moved to Trash",
+            ));
+        }
+        if ticket.trash_path.is_none() {
+            let injected = injected_trash_destination();
+            let fixture_trash = fixture_trash.or(injected.as_deref());
+            let leaf = format!(
+                "acp-{run}-{lineage}-{}-{}",
+                ticket.root_dev, ticket.root_ino
+            );
+            ticket.trash_path = Some(if let Some(destination) = fixture_trash {
+                destination.to_path_buf()
+            } else {
+                system_trash_destination(worktree, OsStr::new(&leaf))?
+            });
+            ticket.git_quarantine_path =
+                Some(registration_recovery_path(&resolved_common, run, lineage));
+        }
+        // Both recovery locations and the bound identities are durable before either directory
+        // moves. A restart can therefore find the tree even if the process dies on the next line.
+        save_retirement_identity(store, run, lineage, &ticket).await?;
+        let destination = ticket
+            .trash_path
+            .clone()
+            .expect("planned Trash destination");
+        move_to_fixture_trash(worktree, &destination, ticket.root_dev, ticket.root_ino)?;
+        let moved = tokio::fs::metadata(&destination)
+            .await
+            .map_err(|source| GitError::Io {
+                op: "retirement_identity",
+                source,
+            })?;
+        let (moved_file, moved_admin_name, moved_dir, moved_dev, moved_ino) =
+            git_file_identity(&destination, &resolved_common).await?;
+        if moved.dev() != ticket.root_dev
+            || moved.ino() != ticket.root_ino
+            || moved_file != ticket.git_file
+            || moved_admin_name != ticket.git_admin_name
+            || moved_dir != derived_git_dir(&resolved_common, &ticket)?
+            || moved_dev != ticket.git_dir_dev
+            || moved_ino != ticket.git_dir_ino
+        {
+            return Err(retirement_invalid(
+                "the Trash item is not the worktree that was validated; it was preserved",
+            ));
+        }
+    }
+
+    let mut durable = load_retirement_identity(store, run, lineage).await?;
+    if durable.common_dir != resolved_common {
+        return Err(retirement_invalid(
+            "the cleanup receipt belongs to another Git common directory",
+        ));
+    }
+    let git_dir = derived_git_dir(&resolved_common, &durable)?;
+    let destination = durable.trash_path.clone().ok_or_else(|| retirement_invalid(
+        "cleanup stopped before the recoverable Trash location was recorded; the tree was preserved",
+    ))?;
+    if tokio::fs::symlink_metadata(worktree).await.is_ok() {
+        return Err(retirement_invalid(
+            "the retired path has been reused; no new tree was inspected or removed",
+        ));
+    }
+    let root = match tokio::fs::symlink_metadata(&destination).await {
+        Ok(root) => root,
+        Err(source)
+            if source.kind() == std::io::ErrorKind::NotFound && durable.registration_retired =>
+        {
+            let found = resolve_ref(repo, &durable.preserved_ref).await?;
+            if found != integrated_sha {
+                return Err(retirement_invalid(
+                    "the retained ACP ref no longer names the integrated commit",
+                ));
+            }
+            return Ok(RetirementResult {
+                preserved_ref: durable.preserved_ref,
+                restore_path: destination,
+                disk_space_reclaimed: true,
+            });
+        }
+        Err(source) => {
+            return Err(GitError::Io {
+                op: "retirement_identity",
+                source,
+            })
+        }
+    };
+    if !root.file_type().is_dir()
+        || root.file_type().is_symlink()
+        || root.dev() != durable.root_dev
+        || root.ino() != durable.root_ino
+    {
+        return Err(retirement_invalid(
+            "the recorded Trash item is unavailable or was substituted",
+        ));
+    }
+    let gitfile = tokio::fs::symlink_metadata(destination.join(".git"))
+        .await
+        .map_err(|source| GitError::Io {
+            op: "retirement_identity",
+            source,
+        })?;
+    if !gitfile.file_type().is_file()
+        || gitfile.file_type().is_symlink()
+        || tokio::fs::read(destination.join(".git"))
+            .await
+            .map_err(|source| GitError::Io {
+                op: "retirement_identity",
+                source,
+            })?
+            != durable.git_file
+    {
+        return Err(retirement_invalid(
+            "the recorded Trash item's Git identity changed",
+        ));
+    }
+    let found = resolve_ref(repo, &durable.preserved_ref).await?;
+    if found != integrated_sha {
+        return Err(retirement_invalid(
+            "the retained ACP ref no longer names the integrated commit",
+        ));
+    }
+    let quarantine = durable.git_quarantine_path.clone().ok_or_else(|| {
+        retirement_invalid(
+            "cleanup stopped before the Git registration recovery location was recorded",
+        )
+    })?;
+    let expected_quarantine = registration_recovery_path(&resolved_common, run, lineage);
+    if quarantine != expected_quarantine {
+        return Err(retirement_invalid(
+            "the Git registration recovery location is inconsistent",
+        ));
+    }
+    if !durable.registration_retired {
+        if tokio::fs::symlink_metadata(&git_dir).await.is_ok() {
+            let admin = tokio::fs::metadata(&git_dir)
+                .await
+                .map_err(|source| GitError::Io {
+                    op: "retirement_deregister",
+                    source,
+                })?;
+            if admin.dev() != durable.git_dir_dev || admin.ino() != durable.git_dir_ino {
+                return Err(retirement_invalid(
+                    "the Git registration was substituted; it was preserved",
+                ));
+            }
+            if tokio::fs::symlink_metadata(worktree).await.is_ok() {
+                return Err(retirement_invalid(
+                    "the retired path was reused; its registration was preserved",
+                ));
+            }
+            // Git registration metadata may be on a different volume from private ACP state.
+            // Keep its recovery directory beside the common Git directory (but outside Git's
+            // `worktrees` registrations) so the no-replace rename remains atomic.
+            let journal = registration_run_dir(&resolved_common, run, true).await?;
+            let quarantine_name = quarantine.file_name().ok_or_else(|| {
+                retirement_invalid("the Git registration recovery path has no name")
+            })?;
+            move_registration_to_journal(
+                &git_dir,
+                journal.as_fd(),
+                quarantine
+                    .parent()
+                    .expect("retirement quarantine has a parent"),
+                quarantine_name,
+                durable.git_dir_dev,
+                durable.git_dir_ino,
+            )?;
+            std::fs::File::from(journal)
+                .sync_all()
+                .map_err(|source| GitError::Io {
+                    op: "retirement_deregister",
+                    source,
+                })?;
+        }
+        let quarantined =
+            tokio::fs::metadata(&quarantine)
+                .await
+                .map_err(|source| GitError::Io {
+                    op: "retirement_deregister",
+                    source,
+                })?;
+        if quarantined.dev() != durable.git_dir_dev || quarantined.ino() != durable.git_dir_ino {
+            return Err(retirement_invalid(
+                "the quarantined Git registration has the wrong identity",
+            ));
+        }
+        durable.registration_retired = true;
+        save_retirement_identity(store, run, lineage, &durable).await?;
+    }
+    if tokio::fs::symlink_metadata(&git_dir).await.is_ok() {
+        return Err(retirement_invalid(
+            "the target Git registration still exists",
+        ));
+    }
+    Ok(RetirementResult {
+        preserved_ref: durable.preserved_ref,
+        restore_path: destination,
+        disk_space_reclaimed: false,
+    })
+}
+
+pub fn retirement_identity_path(store: &Path, run: &str, lineage: &str) -> PathBuf {
+    retirement_identity(store, run, lineage)
+}
+
+/// A completed handoff has a recorded recovery path and no remaining selected Git administration
+/// directory. This bounded journal read lets ordinary GC keep its historical "nothing left" result
+/// without using repository-wide prune or inspecting the Trash item.
+pub fn retirement_complete(store: &Path, repo: &Path, run: &str, lineage: &str) -> bool {
+    if retirement_handoff_planned(store, repo, run, lineage).is_err() {
+        return false;
+    }
+    let Ok(dir) = retirement_run_dir_sync(store, run, false) else {
+        return false;
+    };
+    let Ok(ticket) = read_retirement_identity(dir.as_fd(), lineage) else {
+        return false;
+    };
+    let Ok(git_dir) = derived_git_dir(&ticket.common_dir, &ticket) else {
+        return false;
+    };
+    ticket.version == RETIREMENT_RECEIPT_VERSION
+        && ticket.registration_retired
+        && std::fs::symlink_metadata(git_dir).is_err()
 }
 
 /// Create `path` as a new worktree of `repo` on a new branch `branch`, checked out at `base_sha`.
@@ -305,6 +1855,561 @@ pub async fn head_sha(wt: &Path) -> Result<String, GitError> {
 pub async fn status_porcelain(wt: &Path) -> Result<String, GitError> {
     let out = git("status_porcelain", wt, [tok("status"), tok("--porcelain")]).await?;
     Ok(out.into_stdout())
+}
+
+/// Hash the actual checkout used by a host verification.
+///
+/// Entries use deterministic byte-sorted directory order and include the checkout root, every
+/// directory and every ordinary file, whether tracked, ignored or untracked, plus sorted deletion
+/// markers from the index. Each entry binds the raw relative name, kind, permission bits and
+/// complete content. The actual tree is discovered by one descriptor-relative walk; Git supplies
+/// only index-only facts such as tracked deletions and gitlinks. Reads never follow symlinks, and a
+/// symlink's own target bytes are inventory data. Git administrative metadata is excluded only at
+/// each known repository root. Counts, depth, individual files and aggregate input are bounded so
+/// capture cannot become an unbounded read.
+pub async fn source_inventory_hash(wt: &Path) -> Result<String, GitError> {
+    source_inventory_hash_with_limits(wt, MAX_SOURCE_INVENTORY_PATHS, MAX_SOURCE_INVENTORY_BYTES)
+        .await
+}
+
+async fn source_inventory_hash_with_limits(
+    wt: &Path,
+    path_limit: usize,
+    byte_limit: usize,
+) -> Result<String, GitError> {
+    let top = tokio::fs::canonicalize(wt)
+        .await
+        .map_err(|source| GitError::Io {
+            op: "source_inventory",
+            source,
+        })?;
+    let mut state = InventoryState {
+        digest: Sha256::new(),
+        bytes_left: byte_limit,
+        paths_left: path_limit,
+        top: top.clone(),
+        visited: HashSet::from([top.clone()]),
+    };
+    // v5 adds directories and their permission bits. Older reports remain readable in history but
+    // cannot retain authority over source inputs their inventory domain omitted.
+    state.digest.update(b"acp-source-inventory-v5\0");
+    let root = open_root_dir(&top).map_err(|source| GitError::Io {
+        op: "source_inventory",
+        source,
+    })?;
+    inventory_repository(&top, root, Vec::new(), 0, true, &mut state).await?;
+    Ok(format!("{:x}", state.digest.finalize()))
+}
+
+struct InventoryState {
+    digest: Sha256,
+    bytes_left: usize,
+    paths_left: usize,
+    top: PathBuf,
+    visited: HashSet<PathBuf>,
+}
+
+type InventoryFuture<'a> = Pin<Box<dyn Future<Output = Result<(), GitError>> + Send + 'a>>;
+#[derive(Clone)]
+struct IndexEntry {
+    mode: Vec<u8>,
+    oid: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct InventoryDepth {
+    directory: usize,
+    submodule: usize,
+}
+
+fn inventory_repository<'a>(
+    wt: &'a Path,
+    root: OwnedFd,
+    prefix: Vec<u8>,
+    submodule_depth: usize,
+    record_root: bool,
+    state: &'a mut InventoryState,
+) -> InventoryFuture<'a> {
+    Box::pin(async move {
+        let tracked = git_stdout_capped(
+            "source_inventory",
+            wt,
+            [tok("ls-files"), tok("--cached"), tok("--stage"), tok("-z")],
+            MAX_SOURCE_INVENTORY_LIST_BYTES,
+        )
+        .await?;
+        let (tracked, tracked_truncated) = tracked.into_raw();
+        if tracked_truncated {
+            return Err(GitError::Io {
+                op: "source_inventory",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("source path listing exceeds {MAX_SOURCE_INVENTORY_LIST_BYTES} bytes"),
+                ),
+            });
+        }
+
+        // Bound index-path retention independently at ingestion. This is an allocation guard,
+        // not inventory accounting: paths also found by the descriptor walk are charged there,
+        // while entries left in this map are charged once as deletions below.
+        let mut index_paths_left = state.paths_left;
+        let mut index_bytes_left = state.bytes_left;
+        let mut index = BTreeMap::new();
+        for field in tracked.split(|byte| *byte == 0).filter(|f| !f.is_empty()) {
+            let Some(tab) = field.iter().position(|byte| *byte == b'\t') else {
+                return Err(GitError::Io {
+                    op: "source_inventory",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed git index entry",
+                    ),
+                });
+            };
+            let header = &field[..tab];
+            let mut parts = header.split(|byte| *byte == b' ');
+            let mode = parts.next().unwrap_or_default();
+            let oid = parts.next().unwrap_or_default();
+            let stage = parts.next().unwrap_or_default();
+            let path = &field[tab + 1..];
+            if mode.is_empty() || oid.len() != 40 || stage != b"0" || path.is_empty() {
+                return Err(GitError::Io {
+                    op: "source_inventory",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed git index identity",
+                    ),
+                });
+            }
+            if index.contains_key(path) {
+                return Err(inventory_invalid(
+                    "source inventory contains duplicate index paths".into(),
+                ));
+            }
+            reserve_pending_path(
+                prefix.len() + path.len(),
+                &mut index_paths_left,
+                &mut index_bytes_left,
+            )?;
+            index.insert(
+                path.to_vec(),
+                IndexEntry {
+                    mode: mode.to_vec(),
+                    oid: oid.to_vec(),
+                },
+            );
+        }
+
+        if record_root {
+            state.reserve_path(prefix.len())?;
+            let metadata =
+                std::fs::File::from(root.try_clone().map_err(|source| GitError::Io {
+                    op: "source_inventory",
+                    source,
+                })?)
+                .metadata()
+                .map_err(|source| GitError::Io {
+                    op: "source_inventory",
+                    source,
+                })?;
+            inventory_entry(&prefix, b"directory", metadata.permissions().mode(), state);
+        }
+        inventory_directory(
+            wt,
+            root,
+            Vec::new(),
+            prefix.clone(),
+            InventoryDepth {
+                directory: 0,
+                submodule: submodule_depth,
+            },
+            &mut index,
+            state,
+        )
+        .await?;
+
+        for (path, entry) in index {
+            state.reserve_path(prefix.len() + path.len())?;
+            let inventory_path = prefixed_path(&prefix, &path);
+            if entry.mode == b"160000" {
+                inventory_entry(&inventory_path, b"gitlink-missing", 0, state);
+                state.digest.update(&entry.oid);
+                state.digest.update(b"\0");
+            } else {
+                inventory_entry(&inventory_path, b"deleted", 0, state);
+                state.digest.update(&entry.mode);
+                state.digest.update(b"\0");
+            }
+        }
+        Ok(())
+    })
+}
+
+fn inventory_directory<'a>(
+    wt: &'a Path,
+    directory: OwnedFd,
+    relative: Vec<u8>,
+    prefix: Vec<u8>,
+    depth: InventoryDepth,
+    index: &'a mut BTreeMap<Vec<u8>, IndexEntry>,
+    state: &'a mut InventoryState,
+) -> InventoryFuture<'a> {
+    Box::pin(async move {
+        if depth.directory >= MAX_SOURCE_INVENTORY_DIRECTORY_DEPTH {
+            return Err(inventory_invalid(format!(
+                "source inventory exceeds directory depth {MAX_SOURCE_INVENTORY_DIRECTORY_DEPTH}"
+            )));
+        }
+        let path_prefix_len = prefix.len() + relative.len() + usize::from(!relative.is_empty());
+        let names =
+            inventory_directory_names(&directory, relative.is_empty(), path_prefix_len, state)?;
+        for name in names {
+            let path = joined_path(&relative, &name);
+            let inventory_path = prefixed_path(&prefix, &path);
+            let opened = open_inventory_entry(directory.as_fd(), &name);
+            match opened {
+                Ok((file, metadata)) if metadata.is_file() => {
+                    if index
+                        .get(&path)
+                        .is_some_and(|entry| entry.mode == b"160000")
+                    {
+                        return Err(inventory_invalid(format!(
+                            "tracked gitlink {:?} is not a directory",
+                            String::from_utf8_lossy(&path)
+                        )));
+                    }
+                    index.remove(&path);
+                    if metadata.len() > MAX_SOURCE_INVENTORY_FILE_BYTES as u64 {
+                        return Err(inventory_invalid(format!(
+                            "source file {:?} exceeds {MAX_SOURCE_INVENTORY_FILE_BYTES} bytes",
+                            String::from_utf8_lossy(&path)
+                        )));
+                    }
+                    inventory_entry(
+                        &inventory_path,
+                        b"file",
+                        metadata.permissions().mode(),
+                        state,
+                    );
+                    let (bytes, truncated) = read_capped(file, MAX_SOURCE_INVENTORY_FILE_BYTES)
+                        .await
+                        .map_err(|source| GitError::Io {
+                            op: "source_inventory",
+                            source,
+                        })?;
+                    if truncated {
+                        return Err(inventory_too_large());
+                    }
+                    inventory_bytes(&bytes, state)?;
+                }
+                Ok((file, metadata)) if metadata.is_dir() => {
+                    let child = OwnedFd::from(file);
+                    if let Some(entry) = index.remove(&path) {
+                        if entry.mode != b"160000" {
+                            return Err(inventory_invalid(format!(
+                                "tracked file {:?} became a directory",
+                                String::from_utf8_lossy(&path)
+                            )));
+                        }
+                        if depth.submodule >= MAX_SOURCE_INVENTORY_SUBMODULE_DEPTH {
+                            return Err(inventory_invalid(format!(
+                                "source inventory exceeds submodule depth {MAX_SOURCE_INVENTORY_SUBMODULE_DEPTH}"
+                            )));
+                        }
+                        let subroot = tokio::fs::canonicalize(wt.join(OsStr::from_bytes(&path)))
+                            .await
+                            .map_err(|source| GitError::Io {
+                                op: "source_inventory",
+                                source,
+                            })?;
+                        if !subroot.starts_with(&state.top)
+                            || !state.visited.insert(subroot.clone())
+                        {
+                            return Err(inventory_invalid(format!(
+                                "tracked submodule {:?} escapes or cycles within the source root",
+                                String::from_utf8_lossy(&path)
+                            )));
+                        }
+                        let repository_root = git(
+                            "source_inventory",
+                            &subroot,
+                            [tok("rev-parse"), tok("--show-toplevel")],
+                        )
+                        .await
+                        .map_err(|_| {
+                            inventory_invalid(format!(
+                                "tracked submodule {:?} is present but uninitialized",
+                                String::from_utf8_lossy(&path)
+                            ))
+                        })?;
+                        let repository_root =
+                            tokio::fs::canonicalize(repository_root.stdout().trim())
+                                .await
+                                .map_err(|_| {
+                                    inventory_invalid(format!(
+                                        "tracked submodule {:?} is present but uninitialized",
+                                        String::from_utf8_lossy(&path)
+                                    ))
+                                })?;
+                        if repository_root != subroot {
+                            return Err(inventory_invalid(format!(
+                                "tracked submodule {:?} is present but uninitialized",
+                                String::from_utf8_lossy(&path)
+                            )));
+                        }
+                        let checked_out = head_sha(&subroot).await.map_err(|_| {
+                            inventory_invalid(format!(
+                                "tracked submodule {:?} is present but uninitialized",
+                                String::from_utf8_lossy(&path)
+                            ))
+                        })?;
+                        inventory_entry(
+                            &inventory_path,
+                            b"gitlink",
+                            metadata.permissions().mode(),
+                            state,
+                        );
+                        state.digest.update(&entry.oid);
+                        state.digest.update(b"\0");
+                        state.digest.update(checked_out.as_bytes());
+                        state.digest.update(b"\0");
+                        let mut subprefix = inventory_path;
+                        subprefix.push(b'/');
+                        inventory_repository(
+                            &subroot,
+                            child,
+                            subprefix,
+                            depth.submodule + 1,
+                            false,
+                            state,
+                        )
+                        .await?;
+                    } else {
+                        inventory_entry(
+                            &inventory_path,
+                            b"directory",
+                            metadata.permissions().mode(),
+                            state,
+                        );
+                        inventory_directory(
+                            wt,
+                            child,
+                            path,
+                            prefix.clone(),
+                            InventoryDepth {
+                                directory: depth.directory + 1,
+                                ..depth
+                            },
+                            index,
+                            state,
+                        )
+                        .await?;
+                    }
+                }
+                Ok((_file, _metadata)) => {
+                    return Err(inventory_invalid(format!(
+                        "source inventory refuses special file {:?}",
+                        String::from_utf8_lossy(&path)
+                    )));
+                }
+                Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
+                    if index
+                        .get(&path)
+                        .is_some_and(|entry| entry.mode == b"160000")
+                    {
+                        return Err(inventory_invalid(format!(
+                            "tracked gitlink {:?} is a symlink",
+                            String::from_utf8_lossy(&path)
+                        )));
+                    }
+                    index.remove(&path);
+                    let target = readlink_at_name(directory.as_fd(), &name).map_err(|source| {
+                        GitError::Io {
+                            op: "source_inventory",
+                            source,
+                        }
+                    })?;
+                    inventory_entry(&inventory_path, b"symlink", 0o777, state);
+                    inventory_bytes(&target, state)?;
+                }
+                Err(source) => {
+                    return Err(GitError::Io {
+                        op: "source_inventory",
+                        source,
+                    })
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn inventory_directory_names(
+    directory: &OwnedFd,
+    repository_root: bool,
+    path_prefix_len: usize,
+    state: &mut InventoryState,
+) -> Result<Vec<Vec<u8>>, GitError> {
+    let descriptor = directory.try_clone().map_err(|source| GitError::Io {
+        op: "source_inventory",
+        source,
+    })?;
+    let entries =
+        nix::dir::Dir::from(std::fs::File::from(descriptor)).map_err(|source| GitError::Io {
+            op: "source_inventory",
+            source: source.into(),
+        })?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| GitError::Io {
+            op: "source_inventory",
+            source: source.into(),
+        })?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." || (repository_root && name == b".git") {
+            continue;
+        }
+        if name == b".git" {
+            return Err(inventory_invalid(
+                "unsupported nested repository metadata".into(),
+            ));
+        }
+        // Charge each complete path before retaining its name. Siblings still waiting
+        // for sorting or traversal share the same budget as nested and submodule entries.
+        state.reserve_path(path_prefix_len + name.len())?;
+        names.push(name.to_vec());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn open_inventory_entry(
+    directory: BorrowedFd<'_>,
+    name: &[u8],
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let name = CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    Ok((file, metadata))
+}
+
+fn readlink_at_name(directory: BorrowedFd<'_>, name: &[u8]) -> std::io::Result<Vec<u8>> {
+    let name = CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut bytes = vec![0u8; MAX_SOURCE_INVENTORY_FILE_BYTES + 1];
+    let length = unsafe {
+        libc::readlinkat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if length < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let length =
+        usize::try_from(length).map_err(|_| std::io::Error::other("negative link length"))?;
+    if length > MAX_SOURCE_INVENTORY_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "symlink target exceeds inventory bound",
+        ));
+    }
+    bytes.truncate(length);
+    Ok(bytes)
+}
+
+fn joined_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut path = parent.to_vec();
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path
+}
+
+fn prefixed_path(prefix: &[u8], path: &[u8]) -> Vec<u8> {
+    let mut full = prefix.to_vec();
+    full.extend_from_slice(path);
+    full
+}
+
+fn inventory_entry(path: &[u8], kind: &[u8], mode: u32, state: &mut InventoryState) {
+    state.digest.update((path.len() as u64).to_be_bytes());
+    state.digest.update(path);
+    state.digest.update(kind);
+    state.digest.update(b"\0");
+    state
+        .digest
+        .update(format!("{:03o}", mode & 0o777).as_bytes());
+    state.digest.update(b"\0");
+}
+
+fn inventory_bytes(bytes: &[u8], state: &mut InventoryState) -> Result<(), GitError> {
+    state.reserve_bytes(bytes.len())?;
+    state.digest.update((bytes.len() as u64).to_be_bytes());
+    state.digest.update(bytes);
+    Ok(())
+}
+
+/// Reserve an index path before retaining any bytes from its record. This guard mirrors the
+/// inventory ceilings but deliberately does not mutate [`InventoryState`]: the descriptor walk
+/// accounts paths present in the checkout, and the remaining map accounts deletions exactly once.
+fn reserve_pending_path(
+    bytes: usize,
+    paths_left: &mut usize,
+    bytes_left: &mut usize,
+) -> Result<(), GitError> {
+    *paths_left = paths_left.checked_sub(1).ok_or_else(|| {
+        inventory_invalid("source inventory exceeds the path count limit".into())
+    })?;
+    *bytes_left = bytes_left.checked_sub(bytes).ok_or_else(inventory_too_large)?;
+    Ok(())
+}
+
+impl InventoryState {
+    fn reserve_path(&mut self, bytes: usize) -> Result<(), GitError> {
+        self.paths_left = self.paths_left.checked_sub(1).ok_or_else(|| {
+            inventory_invalid("source inventory exceeds the path count limit".into())
+        })?;
+        self.reserve_bytes(bytes)
+    }
+
+    fn reserve_bytes(&mut self, bytes: usize) -> Result<(), GitError> {
+        self.bytes_left = self
+            .bytes_left
+            .checked_sub(bytes)
+            .ok_or_else(inventory_too_large)?;
+        Ok(())
+    }
+}
+
+fn inventory_too_large() -> GitError {
+    GitError::Io {
+        op: "source_inventory",
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("source inventory exceeds {MAX_SOURCE_INVENTORY_BYTES} bytes"),
+        ),
+    }
+}
+
+fn inventory_invalid(message: String) -> GitError {
+    GitError::Io {
+        op: "source_inventory",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+    }
 }
 
 /// Every path that differs from HEAD in `wt`, including untracked ones.
@@ -584,7 +2689,11 @@ async fn index_section(wt: &Path, rel: &str) -> Result<(String, bool), GitError>
 
     // The mode git actually recorded when the path was staged — including whether it kept the
     // executable bit, which is `core.fileMode`'s decision and not this module's to second-guess.
-    let mode = if mode == MODE_EXEC { MODE_EXEC } else { MODE_FILE };
+    let mode = if mode == MODE_EXEC {
+        MODE_EXEC
+    } else {
+        MODE_FILE
+    };
     Ok(render_new_file(
         rel,
         NewContent::Regular {
@@ -666,12 +2775,10 @@ async fn write_diff(out: &Path, bytes: &[u8]) -> Result<String, GitError> {
         })?;
     let mut hasher = Sha256::new();
     for chunk in bytes.chunks(64 * 1024) {
-        file.write_all(chunk)
-            .await
-            .map_err(|source| GitError::Io {
-                op: "frozen_diff",
-                source,
-            })?;
+        file.write_all(chunk).await.map_err(|source| GitError::Io {
+            op: "frozen_diff",
+            source,
+        })?;
         hasher.update(chunk);
     }
     file.flush().await.map_err(|source| GitError::Io {
@@ -968,7 +3075,10 @@ async fn verify_commit(
     )
     .await?;
     let listed_stdout = listed.stdout();
-    let mut committed: Vec<&str> = listed_stdout.split('\0').filter(|p| !p.is_empty()).collect();
+    let mut committed: Vec<&str> = listed_stdout
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .collect();
     committed.sort_unstable();
     let mut reviewed: Vec<&str> = files.iter().map(String::as_str).collect();
     reviewed.sort_unstable();
@@ -1353,10 +3463,15 @@ async fn untracked_section(
     exec_bit: bool,
 ) -> (String, bool) {
     match classify_untracked(wt, root, rel).await {
-        Untracked::Symlink { at, target } => render_new_file(rel, NewContent::Symlink { at, target }),
-        Untracked::Rejected { reason } => {
-            render_new_file(rel, NewContent::Rejected { reason: reason.to_string() })
+        Untracked::Symlink { at, target } => {
+            render_new_file(rel, NewContent::Symlink { at, target })
         }
+        Untracked::Rejected { reason } => render_new_file(
+            rel,
+            NewContent::Rejected {
+                reason: reason.to_string(),
+            },
+        ),
         Untracked::Regular => {
             // The read route. If anything changed under us since classification — a parent replaced
             // by a symlink, the leaf replaced by one, the file replaced by a fifo — this fails
@@ -1460,8 +3575,13 @@ async fn cleaned_bytes(wt: &Path, rel: &str, bytes: Vec<u8>) -> Vec<u8> {
 /// texts were produced by the same rules, down to the truncation marker and the missing final
 /// newline — so there is exactly one place those rules live.
 enum NewContent {
-    Symlink { at: String, target: String },
-    Rejected { reason: String },
+    Symlink {
+        at: String,
+        target: String,
+    },
+    Rejected {
+        reason: String,
+    },
     /// The bytes exist but could not be read back.
     Unreadable,
     Regular {
@@ -1934,7 +4054,10 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = git_command(op, cwd)?;
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped());
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
 
     let child = command
         .spawn()
@@ -1983,6 +4106,10 @@ impl CappedGitOut {
         };
         (stdout, truncated)
     }
+
+    fn into_raw(self) -> (Vec<u8>, bool) {
+        (self.raw, self.truncated)
+    }
 }
 
 /// Reads a stream to EOF while retaining at most `max + 1` bytes.
@@ -2028,7 +4155,10 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = git_command(op, cwd)?;
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped());
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
 
     git_command_capped(op, command, max).await
 }
@@ -2039,7 +4169,6 @@ async fn git_command_capped(
     mut command: Command,
     max: usize,
 ) -> Result<CappedGitOut, GitError> {
-
     let mut child = command
         .spawn()
         .map_err(|source| GitError::Io { op, source })?;
@@ -2118,7 +4247,10 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = git_command(op, cwd)?;
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped());
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
 
     let mut child = command
         .spawn()
@@ -2192,10 +4324,10 @@ where
     let mut child = command
         .spawn()
         .map_err(|source| GitError::Io { op, source })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitError::Io { op, source: std::io::Error::other("no stdin pipe") })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| GitError::Io {
+        op,
+        source: std::io::Error::other("no stdin pipe"),
+    })?;
 
     let limit = git_op_timeout();
     let bytes = input.to_vec();
@@ -2277,6 +4409,783 @@ fn trim_eol(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn retirement_repo() -> (tempfile::TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(dir.path().join("state")).expect("mkdir state");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        command(&repo, &["init"]);
+        command(&repo, &["config", "user.name", "ACP Test"]);
+        command(&repo, &["config", "user.email", "acp@example.invalid"]);
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").expect("gitignore");
+        std::fs::write(repo.join("tracked.txt"), "recorded\n").expect("tracked");
+        command(&repo, &["add", ".gitignore", "tracked.txt"]);
+        command(&repo, &["commit", "-m", "base"]);
+        let sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .expect("rev-parse");
+        (
+            dir,
+            repo,
+            String::from_utf8(sha.stdout).expect("utf8").trim().into(),
+        )
+    }
+
+    fn add_retirement_worktree(repo: &Path, path: &Path, branch: &str, sha: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("worktree parent");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", branch])
+            .arg(path)
+            .arg(sha)
+            .current_dir(repo)
+            .output()
+            .expect("add worktree");
+        assert!(
+            output.status.success(),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_accepts_repository_aliases_but_refuses_interior_redirects() {
+        let (fixture, repo, sha) = retirement_repo();
+        let store = fixture.path().join("state");
+        let branch = "acp/run/alias";
+        let suffix = Path::new(".acp/worktrees/run/alias");
+        let worktree = repo.join(suffix);
+        add_retirement_worktree(&repo, &worktree, branch, &sha);
+        let alias = fixture.path().join("repo-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        prepare_retirement(
+            &repo,
+            &alias.join(suffix),
+            &sha,
+            branch,
+            &store,
+            "run",
+            "alias",
+        )
+        .await
+        .expect("alternate spelling of the same repository root");
+        let redirect = repo.join(".acp/worktrees/run/redirect");
+        std::os::unix::fs::symlink(&worktree, &redirect).unwrap();
+        assert!(
+            prepare_retirement(&repo, &redirect, &sha, branch, &store, "run", "alias")
+                .await
+                .is_err()
+        );
+        assert!(worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn retirement_refuses_overlapping_state_and_untrusted_registration_receipts() {
+        let (fixture, repo, sha) = retirement_repo();
+        let store = fixture.path().join("state");
+        let worktree = repo.join(".acp/worktrees/run/owned");
+        let branch = "acp/run/owned";
+        add_retirement_worktree(&repo, &worktree, branch, &sha);
+        let overlapping = repo.join(".acp/state");
+        std::fs::create_dir_all(&overlapping).expect("overlapping state fixture");
+        let error =
+            prepare_retirement(&repo, &worktree, &sha, branch, &overlapping, "run", "owned")
+                .await
+                .expect_err("repository-controlled retirement metadata is refused");
+        assert!(
+            error.to_string().contains("overlaps repository-controlled"),
+            "{error}"
+        );
+
+        let mut ticket = prepare_retirement(&repo, &worktree, &sha, branch, &store, "run", "owned")
+            .await
+            .expect("trusted ticket");
+        ticket.git_admin_name = "../another-registration".into();
+        ticket.trash_path = Some(fixture.path().join("fixture-trash/owned"));
+        ticket.git_quarantine_path =
+            Some(retirement_identity(&store, "run", "owned").with_file_name("owned.git-admin"));
+        save_retirement_identity(&store, "run", "owned", &ticket)
+            .await
+            .expect("tampered receipt fixture");
+        let error = retirement_handoff_planned(&store, &repo, "run", "owned")
+            .expect_err("receipt cannot redirect the Git registration");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Git registration identity"),
+            "{error}"
+        );
+        assert!(
+            worktree.exists(),
+            "the registered tree and lock-bearing admin directory survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_moves_to_fixture_trash_preserves_fd_and_only_deregisters_target() {
+        let (dir, repo, sha) = retirement_repo();
+        let store = dir.path().join("state");
+        let branch = "acp/run/lineage";
+        let worktree = repo.join(".acp/worktrees/run/lineage");
+        add_retirement_worktree(&repo, &worktree, branch, &sha);
+        let offline = repo.join(".acp/worktrees/run/offline");
+        add_retirement_worktree(&repo, &offline, "acp/run/offline", &sha);
+        let offline_saved = dir.path().join("offline-saved");
+        std::fs::rename(&offline, &offline_saved).expect("make unrelated registration offline");
+        let open =
+            std::fs::File::open(worktree.join("tracked.txt")).expect("open before Trash handoff");
+        let trash = dir.path().join("fixture-trash");
+        std::fs::create_dir(&trash).expect("fixture Trash");
+        let destination = trash.join("lineage");
+        let ticket = prepare_retirement(&repo, &worktree, &sha, branch, &store, "run", "lineage")
+            .await
+            .expect("prepare");
+        let result = quarantine_and_remove_worktree(
+            &repo,
+            &worktree,
+            &sha,
+            &store,
+            branch,
+            RetirementTarget {
+                run: "run",
+                lineage: "lineage",
+                fixture_trash: Some(&destination),
+            },
+            Some(ticket),
+        )
+        .await
+        .expect("move to fixture Trash");
+        assert_eq!(result.preserved_ref, "refs/acp/retained/run/lineage");
+        assert_eq!(result.restore_path, destination);
+        assert!(!result.disk_space_reclaimed);
+        assert!(!worktree.exists());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("tracked.txt")).unwrap(),
+            "recorded\n"
+        );
+        let mut from_fd = String::new();
+        use std::io::Read as _;
+        (&open)
+            .read_to_string(&mut from_fd)
+            .expect("open descriptor survives rename");
+        assert_eq!(from_fd, "recorded\n");
+        let listed = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .expect("list registrations");
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(!listed.contains(&worktree.to_string_lossy().to_string()));
+        assert!(
+            listed.contains(&offline.to_string_lossy().to_string()),
+            "unrelated offline registration survives"
+        );
+        assert!(retirement_complete(&store, &repo, "run", "lineage"));
+        let repeated = quarantine_and_remove_worktree(
+            &repo,
+            &worktree,
+            &sha,
+            &store,
+            branch,
+            RetirementTarget {
+                run: "run",
+                lineage: "lineage",
+                fixture_trash: Some(&destination),
+            },
+            None,
+        )
+        .await
+        .expect("repeat verifies the retained item");
+        assert_eq!(repeated.restore_path, destination);
+        std::fs::create_dir_all(&worktree).expect("reuse old path");
+        std::fs::write(worktree.join("new-owner-data"), "keep\n").expect("new path data");
+        let error = prepare_retirement(&repo, &worktree, &sha, branch, &store, "run", "lineage")
+            .await
+            .expect_err("a repeat cannot mistake a reused path for the retired tree");
+        assert!(error.to_string().contains("reused"), "{error}");
+        assert!(worktree.join("new-owner-data").exists());
+    }
+
+    #[tokio::test]
+    async fn retirement_restart_recovers_each_irreversible_handoff_boundary() {
+        let (fixture, repo, sha) = retirement_repo();
+        let store = fixture.path().join("state");
+        let trash = fixture.path().join("fixture-trash");
+        std::fs::create_dir(&trash).expect("fixture Trash");
+
+        for (name, registration_already_moved) in
+            [("after-tree-move", false), ("after-admin-move", true)]
+        {
+            let branch = format!("acp/run/{name}");
+            let worktree = repo.join(".acp/worktrees/run").join(name);
+            add_retirement_worktree(&repo, &worktree, &branch, &sha);
+            let destination = trash.join(name);
+            let mut ticket =
+                prepare_retirement(&repo, &worktree, &sha, &branch, &store, "run", name)
+                    .await
+                    .expect("prepare restart fixture");
+            let quarantine = registration_recovery_path(&ticket.common_dir, "run", name);
+            assert!(
+                !quarantine.starts_with(ticket.common_dir.join("worktrees")),
+                "registration recovery is outside Git's registered-worktrees directory",
+            );
+            ticket.trash_path = Some(destination.clone());
+            ticket.git_quarantine_path = Some(quarantine.clone());
+            save_retirement_identity(&store, "run", name, &ticket)
+                .await
+                .expect("persist plan before move");
+            move_to_fixture_trash(&worktree, &destination, ticket.root_dev, ticket.root_ino)
+                .expect("simulate process death after tree move");
+            if registration_already_moved {
+                let journal = registration_run_dir(&ticket.common_dir, "run", true)
+                    .await
+                    .expect("bound journal");
+                let git_dir =
+                    derived_git_dir(&ticket.common_dir, &ticket).expect("derived registration");
+                move_registration_to_journal(
+                    &git_dir,
+                    journal.as_fd(),
+                    quarantine.parent().unwrap(),
+                    quarantine.file_name().unwrap(),
+                    ticket.git_dir_dev,
+                    ticket.git_dir_ino,
+                )
+                .expect("simulate process death after registration move");
+            }
+
+            let recovered = quarantine_and_remove_worktree(
+                &repo,
+                &worktree,
+                &sha,
+                &store,
+                &branch,
+                RetirementTarget {
+                    run: "run",
+                    lineage: name,
+                    fixture_trash: Some(&destination),
+                },
+                None,
+            )
+            .await
+            .expect("restart completes from durable locations");
+            assert_eq!(recovered.restore_path, destination);
+            assert_eq!(
+                std::fs::metadata(quarantine.parent().unwrap())
+                    .expect("Git-common recovery journal")
+                    .dev(),
+                std::fs::metadata(&ticket.common_dir)
+                    .expect("Git common directory")
+                    .dev(),
+                "registration recovery stays on Git's filesystem",
+            );
+            assert!(retirement_complete(&store, &repo, "run", name));
+            assert!(
+                !derived_git_dir(&ticket.common_dir, &ticket)
+                    .unwrap()
+                    .exists(),
+                "selected registration no longer exists"
+            );
+        }
+
+        let completed = trash.join("after-tree-move");
+        std::fs::remove_dir_all(&completed).expect("simulate a human emptying completed Trash");
+        let repeated = quarantine_and_remove_worktree(
+            &repo,
+            &repo.join(".acp/worktrees/run/after-tree-move"),
+            &sha,
+            &store,
+            "acp/run/after-tree-move",
+            RetirementTarget {
+                run: "run",
+                lineage: "after-tree-move",
+                fixture_trash: Some(&completed),
+            },
+            None,
+        )
+        .await
+        .expect("completed handoff distinguishes an emptied Trash item");
+        assert!(repeated.disk_space_reclaimed);
+    }
+
+    #[tokio::test]
+    async fn legacy_interrupted_receipt_fails_closed_without_moving_registration() {
+        let (fixture, repo, sha) = retirement_repo();
+        let store = fixture.path().join("state");
+        let trash = fixture.path().join("fixture-trash");
+        std::fs::create_dir(&trash).expect("fixture Trash");
+
+        let migratable = repo.join(".acp/worktrees/run/legacy-planned");
+        let migratable_branch = "acp/run/legacy-planned";
+        add_retirement_worktree(&repo, &migratable, migratable_branch, &sha);
+        let mut old_plan = prepare_retirement(
+            &repo,
+            &migratable,
+            &sha,
+            migratable_branch,
+            &store,
+            "run",
+            "legacy-planned",
+        )
+        .await
+        .expect("prepare old planned receipt");
+        old_plan.version = 1;
+        old_plan.trash_path = Some(trash.join("obsolete-plan"));
+        old_plan.git_quarantine_path = Some(
+            retirement_identity(&store, "run", "legacy-planned")
+                .with_file_name("legacy-planned.git-admin"),
+        );
+        save_retirement_identity(&store, "run", "legacy-planned", &old_plan)
+            .await
+            .expect("persist old pre-move plan");
+        let migrated = prepare_retirement(
+            &repo,
+            &migratable,
+            &sha,
+            migratable_branch,
+            &store,
+            "run",
+            "legacy-planned",
+        )
+        .await
+        .expect("registered identity safely migrates the plan");
+        assert_eq!(migrated.version, RETIREMENT_RECEIPT_VERSION);
+        assert!(migrated.trash_path.is_none());
+        assert!(migrated.git_quarantine_path.is_none());
+        let migrated_destination = trash.join("migrated");
+        quarantine_and_remove_worktree(
+            &repo,
+            &migratable,
+            &sha,
+            &store,
+            migratable_branch,
+            RetirementTarget {
+                run: "run",
+                lineage: "legacy-planned",
+                fixture_trash: Some(&migrated_destination),
+            },
+            Some(migrated),
+        )
+        .await
+        .expect("migrated pre-move plan completes");
+        assert!(migrated_destination.join("tracked.txt").exists());
+
+        let worktree = repo.join(".acp/worktrees/run/legacy");
+        let branch = "acp/run/legacy";
+        add_retirement_worktree(&repo, &worktree, branch, &sha);
+        let destination = trash.join("legacy");
+        let mut ticket =
+            prepare_retirement(&repo, &worktree, &sha, branch, &store, "run", "legacy")
+                .await
+                .expect("prepare legacy fixture");
+        let git_dir = derived_git_dir(&ticket.common_dir, &ticket).expect("registration");
+        ticket.version = 1;
+        ticket.trash_path = Some(destination.clone());
+        ticket.git_quarantine_path =
+            Some(retirement_identity(&store, "run", "legacy").with_file_name("legacy.git-admin"));
+        save_retirement_identity(&store, "run", "legacy", &ticket)
+            .await
+            .expect("persist old receipt");
+        move_to_fixture_trash(&worktree, &destination, ticket.root_dev, ticket.root_ino)
+            .expect("simulate old interruption after tree move");
+
+        let error = quarantine_and_remove_worktree(
+            &repo,
+            &worktree,
+            &sha,
+            &store,
+            branch,
+            RetirementTarget {
+                run: "run",
+                lineage: "legacy",
+                fixture_trash: Some(&destination),
+            },
+            None,
+        )
+        .await
+        .expect_err("an old receipt cannot authorize registration movement");
+        assert!(error.to_string().contains("legacy"), "{error}");
+        assert!(destination.join("tracked.txt").exists());
+        assert!(git_dir.is_dir(), "the Git registration remains untouched");
+    }
+
+    #[tokio::test]
+    async fn retirement_preserves_ignored_content_and_a_substituted_worktree() {
+        let (dir, repo, sha) = retirement_repo();
+        let store = dir.path().join("state");
+        let dirty = repo.join(".acp/worktrees/run/dirty");
+        add_retirement_worktree(&repo, &dirty, "acp/run/dirty", &sha);
+        std::fs::write(dirty.join("ignored.txt"), "user data\n").expect("ignored user data");
+        let error =
+            prepare_retirement(&repo, &dirty, &sha, "acp/run/dirty", &store, "run", "dirty")
+                .await
+                .expect_err("ignored content refuses retirement");
+        assert!(error.to_string().contains("ignored content"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dirty.join("ignored.txt")).expect("preserved"),
+            "user data\n"
+        );
+
+        let modified = repo.join(".acp/worktrees/run/modified");
+        add_retirement_worktree(&repo, &modified, "acp/run/modified", &sha);
+        std::fs::write(modified.join("tracked.txt"), "human edit\n").expect("modified user data");
+        let error = prepare_retirement(
+            &repo,
+            &modified,
+            &sha,
+            "acp/run/modified",
+            &store,
+            "run",
+            "modified",
+        )
+        .await
+        .expect_err("modified content refuses retirement");
+        assert!(error.to_string().contains("modified"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(modified.join("tracked.txt")).expect("preserved"),
+            "human edit\n"
+        );
+
+        let original = repo.join(".acp/worktrees/run/original");
+        let substitute = repo.join(".acp/worktrees/run/substitute");
+        add_retirement_worktree(&repo, &original, "acp/run/original", &sha);
+        add_retirement_worktree(&repo, &substitute, "acp/run/substitute", &sha);
+        let ticket = prepare_retirement(
+            &repo,
+            &original,
+            &sha,
+            "acp/run/original",
+            &store,
+            "run",
+            "original",
+        )
+        .await
+        .expect("prepare original");
+        let moved = repo.join(".acp/worktrees/run/moved-original");
+        tokio::fs::rename(&original, &moved)
+            .await
+            .expect("move original away");
+        tokio::fs::rename(&substitute, &original)
+            .await
+            .expect("substitute recorded path");
+        let error = quarantine_and_remove_worktree(
+            &repo,
+            &original,
+            &sha,
+            &store,
+            "acp/run/original",
+            RetirementTarget::new("run", "original"),
+            Some(ticket),
+        )
+        .await
+        .expect_err("substitution is rejected");
+        assert!(error.to_string().contains("substituted"), "{error}");
+        assert!(
+            original.join("tracked.txt").exists(),
+            "the substituted host tree was not deleted"
+        );
+        assert!(
+            moved.join("tracked.txt").exists(),
+            "the original ACP tree was not deleted either"
+        );
+    }
+
+    #[test]
+    fn retirement_bound_move_refuses_a_mismatched_durable_identity() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let source_parent = fixture.path().join("source");
+        let destination_parent_path = fixture.path().join("destination");
+        let source = source_parent.join("tree");
+        let other = source_parent.join("other");
+        std::fs::create_dir_all(&source).expect("source tree");
+        std::fs::create_dir(&other).expect("other tree");
+        std::fs::create_dir(&destination_parent_path).expect("destination parent");
+        std::fs::write(source.join("user-data"), "preserve\n").expect("source data");
+        let other_metadata = std::fs::metadata(&other).expect("other identity");
+        let destination_parent = open_bound_directory(&destination_parent_path, "retirement_test")
+            .expect("bound destination");
+
+        let error = move_directory_no_replace(
+            &source,
+            destination_parent.as_fd(),
+            &destination_parent_path,
+            OsStr::new("retired-tree"),
+            other_metadata.dev(),
+            other_metadata.ino(),
+            "retirement_test",
+        )
+        .expect_err("a ticket for another inode cannot move the source leaf");
+
+        assert!(error.to_string().contains("wrong identity"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(source.join("user-data")).expect("preserved source data"),
+            "preserve\n",
+        );
+        assert!(!destination_parent_path.join("retired-tree").exists());
+    }
+
+    #[tokio::test]
+    async fn retirement_refuses_redirected_journals_and_preserves_post_validation_edits() {
+        let (fixture, repo, sha) = retirement_repo();
+        let store = fixture.path().join("state");
+        let redirected = repo.join(".acp/worktrees/run/redirected-journal");
+        let branch = "acp/run/redirected-journal";
+        add_retirement_worktree(&repo, &redirected, branch, &sha);
+        let ticket = prepare_retirement(
+            &repo,
+            &redirected,
+            &sha,
+            branch,
+            &store,
+            "run",
+            "redirected-journal",
+        )
+        .await
+        .expect("prepare redirected journal fixture");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside directory");
+        let sentinel = outside.join("sentinel");
+        std::fs::write(&sentinel, "do not overwrite\n").expect("outside sentinel");
+        let bound_retired = store.join("retired-bound");
+        std::fs::rename(store.join("retired"), &bound_retired)
+            .expect("move the durable fixture journal aside");
+        std::os::unix::fs::symlink(&outside, store.join("retired")).expect("hostile retired link");
+        let error = quarantine_and_remove_worktree(
+            &repo,
+            &redirected,
+            &sha,
+            &store,
+            branch,
+            RetirementTarget::new("run", "redirected-journal"),
+            Some(ticket),
+        )
+        .await
+        .expect_err("a redirected retirement directory is refused");
+        assert!(
+            error.to_string().contains("retirement_directory"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel survives"),
+            "do not overwrite\n"
+        );
+        assert!(
+            redirected.exists(),
+            "the worktree survives a redirected journal"
+        );
+        std::fs::remove_file(store.join("retired")).expect("remove fixture link");
+        std::fs::rename(bound_retired, store.join("retired"))
+            .expect("restore the durable fixture journal");
+
+        let changed = repo.join(".acp/worktrees/run/changed-after-check");
+        let changed_branch = "acp/run/changed-after-check";
+        add_retirement_worktree(&repo, &changed, changed_branch, &sha);
+        let ticket = prepare_retirement(
+            &repo,
+            &changed,
+            &sha,
+            changed_branch,
+            &store,
+            "run",
+            "changed-after-check",
+        )
+        .await
+        .expect("prepare changed fixture");
+        std::fs::write(changed.join("tracked.txt"), "late user edit\n").expect("late edit");
+        let trash = fixture.path().join("fixture-trash");
+        std::fs::create_dir(&trash).expect("fixture Trash");
+        let destination = trash.join("changed");
+        let error = quarantine_and_remove_worktree(
+            &repo,
+            &changed,
+            &sha,
+            &store,
+            changed_branch,
+            RetirementTarget {
+                run: "run",
+                lineage: "changed-after-check",
+                fixture_trash: Some(&destination),
+            },
+            Some(ticket),
+        )
+        .await
+        .expect_err("a post-validation edit is preserved");
+        assert!(error.to_string().contains("content changed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(changed.join("tracked.txt")).expect("late edit survives"),
+            "late user edit\n"
+        );
+        assert!(!destination.exists());
+
+        let collision = repo.join(".acp/worktrees/run/collision");
+        let collision_branch = "acp/run/collision";
+        add_retirement_worktree(&repo, &collision, collision_branch, &sha);
+        let ticket = prepare_retirement(
+            &repo,
+            &collision,
+            &sha,
+            collision_branch,
+            &store,
+            "run",
+            "collision",
+        )
+        .await
+        .expect("prepare collision fixture");
+        let occupied = trash.join("occupied");
+        std::fs::create_dir(&occupied).expect("occupied fixture Trash name");
+        std::fs::write(occupied.join("sentinel"), "existing\n").expect("collision sentinel");
+        let _error = quarantine_and_remove_worktree(
+            &repo,
+            &collision,
+            &sha,
+            &store,
+            collision_branch,
+            RetirementTarget {
+                run: "run",
+                lineage: "collision",
+                fixture_trash: Some(&occupied),
+            },
+            Some(ticket),
+        )
+        .await
+        .expect_err("Trash handoff never replaces an existing item");
+        assert!(collision.join("tracked.txt").is_file());
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("sentinel")).unwrap(),
+            "existing\n"
+        );
+    }
+
+    #[test]
+    fn source_inventory_limits_names_during_directory_read() {
+        let repo = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(repo.path().join(name), []).unwrap();
+        }
+        let read = |paths_left, bytes_left| {
+            let root = open_root_dir(repo.path()).unwrap();
+            let mut state = InventoryState {
+                digest: Sha256::new(),
+                bytes_left,
+                paths_left,
+                top: repo.path().into(),
+                visited: HashSet::new(),
+            };
+            inventory_directory_names(&root, true, 0, &mut state)
+        };
+        assert_eq!(read(2, 2).unwrap(), [b"a", b"b"]);
+        assert!(read(1, 2).unwrap_err().to_string().contains("path count"));
+        assert!(read(2, 1).unwrap_err().to_string().contains("bytes"));
+    }
+
+    #[tokio::test]
+    async fn source_inventory_bounds_index_paths_before_checkout_accounting() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("a"), []).unwrap();
+        std::fs::write(repo.path().join("b"), []).unwrap();
+        git(&["add", "a", "b"]);
+
+        // Both limits reject while ingesting the index, before the root or checkout walk can
+        // consume either budget. In particular, retaining the second key is never necessary.
+        let count = source_inventory_hash_with_limits(repo.path(), 1, 2)
+            .await
+            .unwrap_err();
+        assert!(count.to_string().contains("path count limit"));
+        let bytes = source_inventory_hash_with_limits(repo.path(), 2, 1)
+            .await
+            .unwrap_err();
+        assert!(bytes.to_string().contains("bytes"));
+    }
+
+    #[tokio::test]
+    async fn source_inventory_charges_tracked_paths_once_and_keeps_deletions() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("a"), []).unwrap();
+        std::fs::write(repo.path().join("b"), []).unwrap();
+        git(&["add", "a", "b"]);
+
+        // Root + two tracked files, with one byte per file name. Charging index ingestion as
+        // inventory accounting as well as the walk would exceed both exact limits.
+        let present = source_inventory_hash_with_limits(repo.path(), 3, 2)
+            .await
+            .expect("tracked checkout paths are charged once");
+        std::fs::remove_file(repo.path().join("b")).unwrap();
+        let deleted = source_inventory_hash_with_limits(repo.path(), 3, 2)
+            .await
+            .expect("the leftover index entry is charged once as a deletion");
+        assert_ne!(present, deleted, "the deletion marker remains inventory data");
+    }
+
+    #[tokio::test]
+    async fn source_inventory_charges_pending_names_across_directories_and_deletions() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir(repo.path().join("a")).unwrap();
+        std::fs::write(repo.path().join("a/b"), []).unwrap();
+        std::fs::write(repo.path().join("z"), []).unwrap();
+        std::fs::write(repo.path().join("gone"), []).unwrap();
+        git(&["add", "gone"]);
+        std::fs::remove_file(repo.path().join("gone")).unwrap();
+        // Root, a, a/b, z and the tracked deletion. The raw path lengths total nine.
+        let exact = source_inventory_hash_with_limits(repo.path(), 5, 9)
+            .await
+            .unwrap();
+        assert_eq!(exact, source_inventory_hash(repo.path()).await.unwrap());
+        let count = source_inventory_hash_with_limits(repo.path(), 4, 9)
+            .await
+            .unwrap_err();
+        assert!(count.to_string().contains("path count limit"));
+        let bytes = source_inventory_hash_with_limits(repo.path(), 5, 8)
+            .await
+            .unwrap_err();
+        assert!(bytes.to_string().contains("bytes"));
+    }
 
     #[test]
     fn sha_validation_is_strict() {

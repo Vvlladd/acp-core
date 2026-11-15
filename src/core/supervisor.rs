@@ -1376,7 +1376,7 @@ pub struct Supervisor {
     /// attempt is still `running` in the projection and the events that end it exist nowhere but
     /// here, so dropping one would strand the attempt forever.
     pending_finalize: HashMap<AttemptId, PendingFinalize>,
-    finalizing: HashSet<AttemptId>,
+    finalizing: HashMap<AttemptId, RunId>,
     /// One mutex per recorded worktree path. Both attempt contexts and integrate helpers obtain
     /// their `Arc` here, including after restart, so there is no second invisible lock pool.
     worktree_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
@@ -1396,7 +1396,7 @@ impl Supervisor {
             running: HashMap::new(),
             finalized: HashSet::new(),
             pending_finalize: HashMap::new(),
-            finalizing: HashSet::new(),
+            finalizing: HashMap::new(),
             worktree_locks: HashMap::new(),
         }
     }
@@ -1423,6 +1423,13 @@ impl Supervisor {
     #[must_use]
     pub fn is_running(&self, id: &AttemptId) -> bool {
         self.running.contains_key(id)
+    }
+
+    /// Includes finalization helpers whose process has already left the running table.
+    pub(super) fn owns_work_for_run(&self, run: RunId) -> bool {
+        self.running.values().any(|worker| worker.ctx.run == run)
+            || self.finalizing.values().any(|owner| *owner == run)
+            || self.pending_finalize.values().any(|pending| pending.report.run == run)
     }
 
     /// Live ownership is authoritative even if `attempt.started` could not be appended.
@@ -1677,7 +1684,7 @@ impl Supervisor {
     /// fail-closed `escalate` — because an attempt whose workspace could not be read is precisely
     /// the case the design blocks the run for, and silently leaving it `running` would strand it.
     fn spawn_finalize(&mut self, mut run: Running, exit: ExitInfo) {
-        self.finalizing.insert(run.ctx.attempt);
+        self.finalizing.insert(run.ctx.attempt, run.ctx.run);
         if let Some(ladder) = run.ladder.take() {
             // The pid is reaped by now; a ladder that fired after this would name a free pid.
             ladder.abort();
@@ -1955,7 +1962,7 @@ impl Supervisor {
     /// arrives; that whole interval remains activity even if attempt.started was not projected.
     #[must_use]
     pub fn pending_finalize_count(&self) -> usize {
-        self.finalizing.len() + self.pending_finalize.keys().filter(|id| !self.finalizing.contains(id)).count()
+        self.finalizing.len() + self.pending_finalize.keys().filter(|id| !self.finalizing.contains_key(id)).count()
     }
 
     /// The timeout half of the ladder, as a detached task: sleep to the deadline, flag it, wake the
@@ -2909,8 +2916,15 @@ async fn finalize_prepare(
         });
     // Rev 25: a builder that claimed task success and changed nothing has nothing to review.
     let mut frozen = None;
+    let mut frozen_source_inventory = None;
     if status == AttemptStatus::Succeeded && run.ctx.writes {
         let path = diff_path(&run.ctx.dir, &attempt_id);
+        // Optional host-evidence capability: failure to inventory never relabels verification
+        // as passing or changes ordinary builder/reviewer behavior. Missing identity fails closed
+        // only at external-evidence admission. All capture happens under the finalizer's lock.
+        let inventory_before = tokio::time::timeout(
+            git::GIT_OP_TIMEOUT, git::source_inventory_hash(&run.ctx.worktree),
+        ).await.ok().and_then(Result::ok);
         match git::frozen_diff(&run.ctx.worktree, &path).await {
             Ok(stat) if stat.files.is_empty() && !builder_reported_failure => {
                 status = AttemptStatus::InvalidOutput;
@@ -2923,6 +2937,13 @@ async fn finalize_prepare(
                 // `frozen_diff` hashes the exact bounded bytes as it writes them, so there is no
                 // second whole-file read and the event is bound to the artifact produced above.
                 let diff_hash = stat.diff_hash.clone();
+                if let Some(before) = inventory_before {
+                    if let Ok(Ok(after)) = tokio::time::timeout(
+                        git::GIT_OP_TIMEOUT, git::source_inventory_hash(&run.ctx.worktree),
+                    ).await {
+                        if before == after { frozen_source_inventory = Some(after); }
+                    }
+                }
                 frozen = Some((stat, diff_hash, path));
             }
             Err(err) => {
@@ -2999,6 +3020,7 @@ async fn finalize_prepare(
     // one — the loop keys the review off `diff.frozen`.
     if let Some((stat, diff_hash, path)) = frozen.filter(|_| status == AttemptStatus::Succeeded) {
         events.push(EventPayload::DiffFrozen {
+            source_inventory_hash: frozen_source_inventory,
             attempt_id,
             diff_path: path,
             diff_hash,
@@ -3792,6 +3814,7 @@ mod tests {
                     error: None,
                 },
                 EventPayload::DiffFrozen {
+                    source_inventory_hash: None,
                     attempt_id: attempt,
                     diff_path: dir.join("d.patch"),
                     diff_hash: "abc".into(),

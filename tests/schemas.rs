@@ -301,6 +301,7 @@ fn verify_report_schema_accepts_a_minimal_pass_and_rejects_drift() {
         "summary": "cargo test: 12 passed",
         "commands": ["cargo test"],
         "failures": [],
+        "blockers": [],
         "diffHash": A_DIFF_HASH
     });
     if let Err(err) = validator.validate(&good) {
@@ -313,14 +314,14 @@ fn verify_report_schema_accepts_a_minimal_pass_and_rejects_drift() {
     // Closed at the root (deny_unknown_fields + additionalProperties:false).
     assert!(
         !validator.is_valid(&json!({
-            "status": "pass", "summary": "ok", "commands": [], "failures": [],
+            "status": "pass", "summary": "ok", "commands": [], "failures": [], "blockers": [],
             "diffHash": A_DIFF_HASH, "note": "smuggled"
         })),
         "an unknown key must not validate"
     );
     assert!(
         serde_json::from_value::<VerifyReport>(json!({
-            "status": "pass", "summary": "ok", "commands": [], "failures": [],
+            "status": "pass", "summary": "ok", "commands": [], "failures": [], "blockers": [],
             "diffHash": A_DIFF_HASH, "note": "smuggled"
         }))
         .is_err(),
@@ -329,18 +330,18 @@ fn verify_report_schema_accepts_a_minimal_pass_and_rejects_drift() {
 
     // The status set is closed and kebab-case; the hash echo is required and hex-bound.
     assert!(!validator.is_valid(&json!({
-        "status": "PASS", "summary": "ok", "commands": [], "failures": [], "diffHash": A_DIFF_HASH
+        "status": "PASS", "summary": "ok", "commands": [], "failures": [], "blockers": [], "diffHash": A_DIFF_HASH
     })));
     assert!(validator.is_valid(&json!({
         "status": "nothing-to-run", "summary": "no build or test command found",
-        "commands": [], "failures": [], "diffHash": A_DIFF_HASH
+        "commands": [], "failures": [], "blockers": [], "diffHash": A_DIFF_HASH
     })));
     assert!(!validator.is_valid(&json!({
-        "status": "pass", "summary": "ok", "commands": [], "failures": [], "diffHash": "beef"
+        "status": "pass", "summary": "ok", "commands": [], "failures": [], "blockers": [], "diffHash": "beef"
     })));
     assert!(!validator.is_valid(&json!({
         "status": "fail", "summary": "x", "commands": [],
-        "failures": ["y".repeat(1001)], "diffHash": A_DIFF_HASH
+        "failures": ["y".repeat(1001)], "blockers": [], "diffHash": A_DIFF_HASH
     })));
 }
 

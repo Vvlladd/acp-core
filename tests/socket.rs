@@ -1392,6 +1392,13 @@ async fn resolve_gate_over_the_socket_can_only_deny() {
         .expect("a denial is allowed");
     assert_eq!(denied["status"], json!("denied"));
 
+    assert!(fake.seen().contains(&Seen::ResolveGate {
+        gate,
+        approve: false,
+        feedback: Some("no".into()),
+        by: Actor::Mcp,
+    }), "the agent RPC retains its provenance when forwarded through the socket");
+
     door.stop().await.expect("the door stopped");
     fake.stop().await;
 }

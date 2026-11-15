@@ -19,7 +19,7 @@
 //!
 //! This module must not know about providers, git or processes (design, § `src/core/registry.rs`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::core::types::{
+    GateRepairBinding,
     AgentHandle, AgentId, AgentStatus, Attempt, AttemptId, AttemptStatus, Event, EventBase,
     EventPayload, Gate, GateId, GateStatus, LineageId, LineageState, LoopState, MessageRole,
     NewEvent, Run, RunId, RunStatus,
@@ -207,6 +208,19 @@ impl Default for PlanItemState {
     }
 }
 
+fn close_lineage(lineage: &mut LineageState, agents: &mut HashMap<AgentId, AgentHandle>, reason: &str) {
+    if !lineage.closed {
+        lineage.closed = true;
+        lineage.closed_reason = Some(reason.to_owned());
+    }
+    for id in &lineage.agent_ids {
+        if let Some(agent) = agents.get_mut(id) {
+            agent.resumable = false;
+            agent.status = AgentStatus::Closed;
+        }
+    }
+}
+
 /// Folds one event into the projection. Pure, total and **idempotent for terminal attempts** (C2):
 /// re-applying an already-folded `attempt.finished` / `attempt.usage` / `attempt.result` leaves
 /// `State` unchanged, so a duplicated tail line replayed after a restart cannot regress a status or
@@ -329,11 +343,11 @@ pub fn reduce(s: &mut State, e: &Event) {
         // that is somehow still open.
         EventPayload::WorktreeRetired { path, reason, .. } => {
             if let Some(run) = s.runs.get_mut(&run_id) {
-                if let Some(lineage) = run.lineages.iter_mut().find(|l| l.worktree == *path) {
-                    if !lineage.closed {
-                        lineage.closed = true;
-                        lineage.closed_reason = Some(reason.clone());
-                    }
+                // An explicit lineage.closed already selected its owner. A legacy path-only
+                // record can select a lineage only when that path has one recorded owner.
+                let mut owners = run.lineages.iter_mut().filter(|lineage| lineage.worktree == *path);
+                if let (Some(owner), None) = (owners.next(), owners.next()) {
+                    close_lineage(owner, &mut s.agents, reason);
                 }
             }
         }
@@ -375,14 +389,14 @@ pub fn reduce(s: &mut State, e: &Event) {
                     run.agent_ids.push(*agent_id);
                 }
                 if let Some(lineage_id) = lineage_id {
-                    if let Some(lineage) = run
-                        .lineages
-                        .iter_mut()
-                        .find(|l| l.lineage_id == *lineage_id)
-                    {
-                        if !lineage.agent_ids.contains(agent_id) {
-                            lineage.agent_ids.push(*agent_id);
+                    let lineage = lineage_mut(run, *lineage_id);
+                    if lineage.worktree.as_os_str().is_empty() {
+                        if let Some(worktree) = worktree {
+                            lineage.worktree.clone_from(worktree);
                         }
+                    }
+                    if !lineage.agent_ids.contains(agent_id) {
+                        lineage.agent_ids.push(*agent_id);
                     }
                 }
             }
@@ -396,7 +410,7 @@ pub fn reduce(s: &mut State, e: &Event) {
         } => {
             if let Some(agent) = s.agents.get_mut(agent_id) {
                 agent.session_id = Some(session_id.clone());
-                agent.resumable = true;
+                agent.resumable = agent.status != AgentStatus::Closed;
             }
             bump_src_line(s, attempt_id, *src_line);
         }
@@ -405,7 +419,12 @@ pub fn reduce(s: &mut State, e: &Event) {
             agent_id, status, ..
         } => {
             if let Some(agent) = s.agents.get_mut(agent_id) {
-                agent.status = *status;
+                if agent.status != AgentStatus::Closed {
+                    agent.status = *status;
+                }
+                if agent.status == AgentStatus::Closed {
+                    agent.resumable = false;
+                }
             }
         }
 
@@ -627,8 +646,7 @@ pub fn reduce(s: &mut State, e: &Event) {
                     .iter_mut()
                     .find(|l| l.lineage_id == *lineage_id)
                 {
-                    lineage.closed = true;
-                    lineage.closed_reason = Some(reason.clone());
+                    close_lineage(lineage, &mut s.agents, reason);
                 }
             }
         }
@@ -639,6 +657,7 @@ pub fn reduce(s: &mut State, e: &Event) {
             summary,
             payload_path,
             requested_by,
+            ..
         } => {
             s.gates.entry(*gate_id).or_insert_with(|| Gate {
                 gate_id: *gate_id,
@@ -669,6 +688,7 @@ pub fn reduce(s: &mut State, e: &Event) {
             feedback,
             by,
             commit,
+            ..
         } => {
             if let Some(gate) = s.gates.get_mut(gate_id) {
                 // Only a pending gate enters the in-flight window; a resolved one stays resolved.
@@ -726,7 +746,9 @@ pub fn reduce(s: &mut State, e: &Event) {
         // T84: a linkage on the *lead's* run to a run its delegation caused. Nothing the
         // projection tracks describes a run from the outside looking in; the delegated run's own
         // events are what drive its own state.
-        EventPayload::RunDelegated { .. } | EventPayload::SecurityVerdict { .. } => {}
+        EventPayload::RunDelegated { .. }
+        | EventPayload::SecurityVerdict { .. }
+        | EventPayload::ExternalVerificationPrepared { .. } => {}
     }
 }
 
@@ -768,12 +790,61 @@ pub struct Registry {
     logs: HashMap<RunId, File>,
     /// Every event, in `seq` order per run — what `events(run, since, limit)` backfills from.
     events: HashMap<RunId, Vec<Arc<Event>>>,
+    /// Sparse replay-built indexes for reconstructing repair prompts. Keeping only the three
+    /// event families that participate in that decision avoids cloning a run's complete event
+    /// history (or rereading its log) on the actor thread.
+    repair_history: HashMap<RunId, RepairHistoryIndex>,
+    /// Sparse worktree facts used by retention. The ordered map gives the global page its stable
+    /// run/lineage order without materializing and sorting every run at request time.
+    retention_lineages: HashMap<(RunId, LineageId), RetentionLineage>,
+    retention_by_run: HashMap<RunId, BTreeMap<u64, LineageId>>,
+    retention_by_lineage: HashMap<LineageId, RunId>,
+    retention_order: BTreeMap<(String, String, u64), (RunId, LineageId)>,
+    retired_worktrees: HashMap<RunId, HashSet<PathBuf>>,
+    integrated_worktrees: HashMap<RunId, HashSet<(PathBuf, String)>>,
+    retention_live_agents: HashSet<AgentId>,
+    retention_live_by_lineage: HashMap<(RunId, LineageId), usize>,
+    retention_resolving_gates: HashSet<GateId>,
+    retention_resolving_by_run: HashMap<RunId, usize>,
+    retention_running_attempts: HashSet<AttemptId>,
+    retention_running_by_run: HashMap<RunId, usize>,
     audit: Option<File>,
     tx: broadcast::Sender<Arc<Event>>,
     inspection_only: bool,
     skipped_event_lines: usize,
     incompatible_event_lines: usize,
     compatibility: CompatibilitySummary,
+}
+
+#[derive(Default)]
+struct RepairHistoryIndex {
+    attempt_started: HashMap<AttemptId, u64>,
+    human_integration_denials: Vec<IndexedDenial>,
+    frozen: HashMap<(PathBuf, String), AttemptId>,
+    frozen_events: usize,
+    integration_gate_targets: HashMap<GateId, IntegrationRepairTarget>,
+}
+
+#[derive(Clone)]
+pub(crate) struct IntegrationRepairTarget {
+    pub builder_attempt_id: AttemptId,
+    pub lineage_id: LineageId,
+    pub diff_hash: String,
+}
+
+struct IndexedDenial {
+    seq: u64,
+    gate_id: GateId,
+    feedback: Option<String>,
+    target: Option<IntegrationRepairTarget>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetentionLineage {
+    pub run_id: RunId,
+    pub lineage_id: LineageId,
+    pub worktree: PathBuf,
+    pub branch: Option<String>,
 }
 
 impl Registry {
@@ -803,6 +874,19 @@ impl Registry {
             state: State::default(),
             logs: HashMap::new(),
             events: HashMap::new(),
+            repair_history: HashMap::new(),
+            retention_lineages: HashMap::new(),
+            retention_by_run: HashMap::new(),
+            retention_by_lineage: HashMap::new(),
+            retention_order: BTreeMap::new(),
+            retired_worktrees: HashMap::new(),
+            integrated_worktrees: HashMap::new(),
+            retention_live_agents: HashSet::new(),
+            retention_live_by_lineage: HashMap::new(),
+            retention_resolving_gates: HashSet::new(),
+            retention_resolving_by_run: HashMap::new(),
+            retention_running_attempts: HashSet::new(),
+            retention_running_by_run: HashMap::new(),
             audit: None,
             tx,
             inspection_only,
@@ -882,6 +966,8 @@ impl Registry {
 
         let event = Arc::new(event);
         reduce(&mut self.state, event.as_ref());
+        self.index_repair_event(event.as_ref(), false);
+        self.index_retention_event(event.as_ref());
         self.events
             .entry(*run)
             .or_default()
@@ -982,6 +1068,118 @@ impl Registry {
             .take(limit)
             .map(Arc::clone)
             .collect()
+    }
+
+    /// A stable, bounded page of lineages which have an actual recorded worktree identity.
+    /// Narrowed lookups use keyed indexes and therefore remain independent of the global page.
+    pub(crate) fn retention_lineages(
+        &self,
+        run_id: Option<RunId>,
+        lineage_id: Option<LineageId>,
+        limit: usize,
+    ) -> (Vec<&RetentionLineage>, bool) {
+        let mut values = Vec::with_capacity(limit.min(128));
+        if let Some(lineage_id) = lineage_id {
+            if let Some(run_id) = run_id {
+                if let Some(value) = self.retention_lineages.get(&(run_id, lineage_id)) {
+                    values.push(value);
+                }
+            } else if let Some(run_id) = self.retention_by_lineage.get(&lineage_id) {
+                if let Some(value) = self.retention_lineages.get(&(*run_id, lineage_id)) {
+                    values.push(value);
+                }
+            }
+        } else if let Some(run_id) = run_id {
+            for lineage_id in self
+                .retention_by_run
+                .get(&run_id)
+                .into_iter()
+                .flat_map(|lineages| lineages.values())
+            {
+                if let Some(value) = self.retention_lineages.get(&(run_id, *lineage_id)) {
+                    values.push(value);
+                    if values.len() > limit {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for key in self.retention_order.values().take(limit.saturating_add(1)) {
+                if let Some(value) = self.retention_lineages.get(key) {
+                    values.push(value);
+                }
+            }
+        }
+        let truncated = values.len() > limit;
+        values.truncate(limit);
+        (values, truncated)
+    }
+
+    #[must_use]
+    pub(crate) fn retention_retired(&self, run: &RunId, path: &Path) -> bool {
+        self.retired_worktrees
+            .get(run)
+            .is_some_and(|paths| paths.contains(path))
+    }
+
+    #[must_use]
+    pub(crate) fn retention_integrated(&self, run: &RunId, path: &Path, sha: &str) -> bool {
+        self.integrated_worktrees
+            .get(run)
+            .is_some_and(|commits| commits.contains(&(path.to_path_buf(), sha.to_owned())))
+    }
+
+    #[must_use]
+    pub(crate) fn retention_lineage_is_live(&self, run: &RunId, lineage: &LineageId) -> bool {
+        self.retention_live_by_lineage
+            .get(&(*run, *lineage))
+            .is_some_and(|count| *count > 0)
+    }
+
+    #[must_use]
+    pub(crate) fn retention_gate_is_resolving(&self, run: &RunId) -> bool {
+        self.retention_resolving_by_run
+            .get(run)
+            .is_some_and(|count| *count > 0)
+    }
+
+    #[must_use]
+    pub(crate) fn retention_run_has_running_attempt(&self, run: &RunId) -> bool {
+        self.retention_running_by_run
+            .get(run)
+            .is_some_and(|count| *count > 0)
+    }
+
+    /// Sequence at which an attempt began, from the sparse history index rebuilt during replay.
+    #[must_use]
+    pub(crate) fn attempt_started_seq(&self, run: &RunId, attempt: &AttemptId) -> Option<u64> {
+        self.repair_history.get(run)?.attempt_started.get(attempt).copied()
+    }
+
+    /// Newest human/socket integration denial strictly before `before_seq`.
+    ///
+    /// MCP resolutions are deliberately absent from this index, so direct and proxied MCP
+    /// feedback cannot replace a human repair criterion. The vector is append ordered, making
+    /// lookup logarithmic even after a long run.
+    pub(crate) fn human_integration_denial_before(
+        &self,
+        run: &RunId,
+        before_seq: u64,
+    ) -> Option<(
+        u64,
+        GateId,
+        Option<&str>,
+        Option<&IntegrationRepairTarget>,
+    )> {
+        let denials = &self.repair_history.get(run)?.human_integration_denials;
+        let index = denials.partition_point(|denial| denial.seq < before_seq);
+        let denial = denials.get(index.checked_sub(1)?)?;
+        Some((
+            denial.seq,
+            denial.gate_id,
+            denial.feedback.as_deref(),
+            denial.target.as_ref(),
+        ))
     }
 
     /// Number of already-durable **assistant** `agent.message` events for one attempt, stopping
@@ -1120,6 +1318,8 @@ impl Registry {
                 Ok(event) => {
                     let event = Arc::new(event);
                     reduce(&mut self.state, event.as_ref());
+                    self.index_repair_event(event.as_ref(), true);
+                    self.index_retention_event(event.as_ref());
                     self.events
                         .entry(event.base.run_id)
                         .or_default()
@@ -1135,6 +1335,284 @@ impl Registry {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn gate_repair_binding(
+        &self, run: &RunId, path: Option<&Path>, hash: Option<&str>,
+    ) -> GateRepairBinding {
+        let (Some(path), Some(hash)) = (path, hash) else { return GateRepairBinding::Unbound; };
+        let Some(attempt) = self.repair_history.get(run)
+            .and_then(|h| h.frozen.get(&(path.to_owned(), hash.to_owned()))) else {
+            return GateRepairBinding::Unbound;
+        };
+        GateRepairBinding::Frozen { builder_attempt_id: *attempt, diff_hash: hash.to_owned() }
+    }
+
+    // Historical gates did not record their exact draft. The old payload can corroborate a
+    // unique candidate only. When history is ambiguous, a mutable file cannot supply authority.
+    fn legacy_gate_binding(&self, run: &RunId, gate: &GateId, path: &Path) -> Option<GateRepairBinding> {
+        if self.repair_history.get(run)?.frozen_events != 1
+            || path != super::gates::payload_path(&self.state_dir, run, gate) {
+            return None;
+        }
+        const LIMIT: u64 = 1024 * 1024;
+        let file = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > LIMIT { return None; }
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > LIMIT { return None; }
+        let payload: super::gates::GatePayload = serde_json::from_slice(&bytes).ok()?;
+        Some(self.gate_repair_binding(run, payload.diff_path.as_deref(), payload.diff_hash.as_deref()))
+    }
+
+    fn index_repair_event(&mut self, event: &Event, replay: bool) {
+        let run = event.base.run_id;
+        match &event.payload {
+            EventPayload::AttemptStarted { attempt_id, .. } => {
+                self.repair_history
+                    .entry(run)
+                    .or_default()
+                    .attempt_started
+                    .entry(*attempt_id)
+                    .or_insert(event.base.seq);
+            }
+            EventPayload::DiffFrozen { attempt_id, diff_path, diff_hash, .. } => {
+                let history = self.repair_history.entry(run).or_default();
+                history.frozen_events = history.frozen_events.saturating_add(1);
+                history.frozen.insert((diff_path.clone(), diff_hash.clone()), *attempt_id);
+            }
+            EventPayload::GateCreated {
+                gate_id, gate_kind: crate::core::types::GateKind::Integrate, payload_path,
+                repair_binding, ..
+            } => {
+                let binding = repair_binding.clone().or_else(|| {
+                    if replay { self.legacy_gate_binding(&run, gate_id, payload_path) } else { None }
+                });
+                if let Some(GateRepairBinding::Frozen { builder_attempt_id, diff_hash }) = binding {
+                    let Some(agent) = self.state.attempts.get(&builder_attempt_id)
+                        .and_then(|a| self.state.agents.get(&a.agent_id)) else { return; };
+                    if agent.run_id != run || agent.role != crate::core::types::RoleName::Builder { return; }
+                    if let Some(lineage_id) = agent.lineage_id {
+                        self.repair_history.entry(run).or_default().integration_gate_targets.insert(
+                            *gate_id, IntegrationRepairTarget { builder_attempt_id, lineage_id, diff_hash });
+                    }
+                }
+            }
+            EventPayload::GateResolving {
+                gate_id,
+                approve: false,
+                feedback,
+                ..
+            } if self.state.gates.get(gate_id).is_some_and(|gate| {
+                gate.kind == crate::core::types::GateKind::Integrate
+                    && matches!(gate.resolved_by, Some(crate::core::types::Actor::Socket { .. }))
+            }) => {
+                let target = self.repair_history.get(&run).and_then(|history| {
+                    history.integration_gate_targets.get(gate_id).cloned()
+                });
+                self.repair_history
+                    .entry(run)
+                    .or_default()
+                    .human_integration_denials
+                    .push(IndexedDenial {
+                        seq: event.base.seq,
+                        gate_id: *gate_id,
+                        feedback: feedback.clone(),
+                        target,
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    fn index_retention_event(&mut self, event: &Event) {
+        let run_id = event.base.run_id;
+        match &event.payload {
+            EventPayload::AgentCreated {
+                agent_id,
+                lineage_id: Some(lineage_id),
+                worktree: Some(worktree),
+                ..
+            } => {
+                self.ensure_retention_lineage(run_id, *lineage_id, worktree);
+                self.sync_retention_agent(*agent_id);
+            }
+            EventPayload::AgentCreated { agent_id, .. }
+            | EventPayload::AgentStatusChanged { agent_id, .. } => {
+                self.sync_retention_agent(*agent_id);
+            }
+            EventPayload::WorktreeCreated {
+                lineage_id,
+                path,
+                branch,
+                ..
+            } => {
+                self.ensure_retention_lineage(run_id, *lineage_id, path);
+                if let Some(lineage) = self.retention_lineages.get_mut(&(run_id, *lineage_id)) {
+                    lineage.worktree.clone_from(path);
+                    lineage.branch = Some(branch.clone());
+                }
+            }
+            EventPayload::WorktreeRetired { path, .. } => {
+                self.retired_worktrees
+                    .entry(run_id)
+                    .or_default()
+                    .insert(path.clone());
+                let agents = self
+                    .state
+                    .runs
+                    .get(&run_id)
+                    .map(|run| run.agent_ids.clone())
+                    .unwrap_or_default();
+                for agent_id in agents {
+                    self.sync_retention_agent(agent_id);
+                }
+            }
+            EventPayload::IntegrateCommitted { worktree, sha, .. } => {
+                self.integrated_worktrees
+                    .entry(run_id)
+                    .or_default()
+                    .insert((worktree.clone(), sha.clone()));
+            }
+            EventPayload::LineageClosed { .. } => {
+                let agents = self
+                    .state
+                    .runs
+                    .get(&run_id)
+                    .map(|run| run.agent_ids.clone())
+                    .unwrap_or_default();
+                for agent_id in agents {
+                    self.sync_retention_agent(agent_id);
+                }
+            }
+            EventPayload::GateResolving { gate_id, .. }
+            | EventPayload::GateResolved { gate_id, .. } => {
+                self.sync_retention_gate(*gate_id);
+            }
+            EventPayload::AttemptStarted { attempt_id, .. }
+            | EventPayload::AttemptFinished { attempt_id, .. } => {
+                self.sync_retention_attempt(*attempt_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_retention_agent(&mut self, agent_id: AgentId) {
+        let Some(agent) = self.state.agents.get(&agent_id) else {
+            return;
+        };
+        let Some(lineage_id) = agent.lineage_id else {
+            return;
+        };
+        let key = (agent.run_id, lineage_id);
+        let live = matches!(agent.status, AgentStatus::Starting | AgentStatus::Running);
+        let was_live = self.retention_live_agents.contains(&agent_id);
+        match (was_live, live) {
+            (false, true) => {
+                self.retention_live_agents.insert(agent_id);
+                *self.retention_live_by_lineage.entry(key).or_default() += 1;
+            }
+            (true, false) => {
+                self.retention_live_agents.remove(&agent_id);
+                if let Some(count) = self.retention_live_by_lineage.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.retention_live_by_lineage.remove(&key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_retention_gate(&mut self, gate_id: GateId) {
+        let Some(gate) = self.state.gates.get(&gate_id) else {
+            return;
+        };
+        let run_id = gate.run_id;
+        let resolving = gate.status == GateStatus::Resolving;
+        let was_resolving = self.retention_resolving_gates.contains(&gate_id);
+        match (was_resolving, resolving) {
+            (false, true) => {
+                self.retention_resolving_gates.insert(gate_id);
+                *self.retention_resolving_by_run.entry(run_id).or_default() += 1;
+            }
+            (true, false) => {
+                self.retention_resolving_gates.remove(&gate_id);
+                if let Some(count) = self.retention_resolving_by_run.get_mut(&run_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.retention_resolving_by_run.remove(&run_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_retention_attempt(&mut self, attempt_id: AttemptId) {
+        let Some(attempt) = self.state.attempts.get(&attempt_id) else {
+            return;
+        };
+        let run_id = attempt.run_id;
+        let running = attempt.status == AttemptStatus::Running;
+        let was_running = self.retention_running_attempts.contains(&attempt_id);
+        match (was_running, running) {
+            (false, true) => {
+                self.retention_running_attempts.insert(attempt_id);
+                *self.retention_running_by_run.entry(run_id).or_default() += 1;
+            }
+            (true, false) => {
+                self.retention_running_attempts.remove(&attempt_id);
+                if let Some(count) = self.retention_running_by_run.get_mut(&run_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.retention_running_by_run.remove(&run_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ensure_retention_lineage(
+        &mut self,
+        run_id: RunId,
+        lineage_id: LineageId,
+        worktree: &Path,
+    ) {
+        let key = (run_id, lineage_id);
+        if self.retention_lineages.contains_key(&key) {
+            return;
+        }
+        let Some(run) = self.state.runs.get(&run_id) else {
+            return;
+        };
+        let ordinal = run
+            .lineages
+            .iter()
+            .position(|lineage| lineage.lineage_id == lineage_id)
+            .unwrap_or(run.lineages.len()) as u64;
+        self.retention_by_run
+            .entry(run_id)
+            .or_default()
+            .insert(ordinal, lineage_id);
+        self.retention_by_lineage.insert(lineage_id, run_id);
+        self.retention_order.insert(
+            (run.created_at.clone(), run_id.to_string(), ordinal),
+            key,
+        );
+        self.retention_lineages.insert(
+            key,
+            RetentionLineage {
+                run_id,
+                lineage_id,
+                worktree: worktree.to_path_buf(),
+                branch: None,
+            },
+        );
     }
 
     /// Extract only identifiers from the two historical field families known to affect status.
@@ -1480,6 +1958,37 @@ mod tests {
         let replayed = Registry::open(dir.path()).expect("reopen");
         assert_eq!(replayed.run(&legacy).expect("legacy").run_budget_usd, Some(15.0));
         assert_eq!(replayed.run(&unlimited).expect("unlimited").run_budget_usd, None);
+    }
+
+    #[test]
+    fn legacy_gate_payload_cannot_disambiguate_repeated_frozen_artifacts() {
+        let dir = TempDir::new().expect("tempdir");
+        let run = RunId::new_v4();
+        let gate = GateId::new_v4();
+        let diff_path = dir.path().join("same.patch");
+        let diff_hash = "a".repeat(64);
+        let mut registry = Registry::open(dir.path()).expect("registry");
+        registry.append(&run, created(dir.path())).expect("run");
+        for _ in 0..2 {
+            registry.append(&run, EventPayload::DiffFrozen {
+                attempt_id: AttemptId::new_v4(),
+                diff_path: diff_path.clone(),
+                diff_hash: diff_hash.clone(),
+                source_inventory_hash: None,
+                files: vec![],
+                added: 0,
+                deleted: 0,
+            }).expect("frozen artifact");
+        }
+        let payload_path = super::super::gates::payload_path(dir.path(), &run, &gate);
+        std::fs::create_dir_all(payload_path.parent().expect("gate directory")).unwrap();
+        std::fs::write(&payload_path, serde_json::to_vec(&super::super::gates::GatePayload {
+            diff_path: Some(diff_path),
+            diff_hash: Some(diff_hash),
+            ..Default::default()
+        }).unwrap()).unwrap();
+
+        assert_eq!(registry.legacy_gate_binding(&run, &gate, &payload_path), None);
     }
 
     #[test]

@@ -358,6 +358,7 @@ fn accepted_intent_replays_once_from_retired_draft_and_answers_only_escalations(
                 gate_id: gate,
                 gate_kind: GateKind::Escalate,
                 summary: "Provider unavailable".into(),
+                repair_binding: None,
                 requested_by: Origin::Lead,
                 payload_path: world.state_dir().join("unused-gate.json"),
             },
@@ -757,6 +758,7 @@ fn terminal_tasks_pending_decisions_budget_and_modes_refuse_without_mutation() {
                     gate_id: gate,
                     gate_kind: kind,
                     summary: "Decision waiting".into(),
+                    repair_binding: None,
                     requested_by: Origin::Lead,
                     payload_path: world.state_dir().join("unused.json"),
                 },
@@ -771,6 +773,7 @@ fn terminal_tasks_pending_decisions_budget_and_modes_refuse_without_mutation() {
                         feedback: None,
                         by: human(),
                         commit: None,
+                        external_verification: None,
                     },
                 )
                 .unwrap();

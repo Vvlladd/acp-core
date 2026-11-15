@@ -484,7 +484,9 @@ async fn serve_connection(
     identity: Arc<ServerIdentity>,
     shutdown: CancellationToken,
 ) {
-    let Some(_connection) = core.ingress().connection() else { return; };
+    let Some(_connection) = core.ingress().connection() else {
+        return;
+    };
     let (reader, writer) = stream.into_split();
     let (out_tx, out_rx) = mpsc::channel::<String>(OUTBOX_CAPACITY);
     let mut writer_task = tokio::spawn(write_lines(writer, out_rx));
@@ -616,7 +618,9 @@ impl Connection {
 
 /// Parses one line, calls the method, writes the answer.
 async fn handle_line(
-    conn: Arc<Connection>, line: String, _admission: crate::core::lifecycle::ActivityGuard,
+    conn: Arc<Connection>,
+    line: String,
+    _admission: crate::core::lifecycle::ActivityGuard,
 ) {
     let request = match parse_request(&line) {
         Ok(request) => request,
@@ -651,15 +655,31 @@ impl Connection {
         match method {
             "checks.start" => {
                 let request: crate::checks::Request = parse_params(params)?;
-                Ok(serde_json::to_value(self.core.check_start(request).await.map_err(RpcError::from_core)?).expect("serializable review"))
+                Ok(serde_json::to_value(
+                    self.core
+                        .check_start(request)
+                        .await
+                        .map_err(RpcError::from_core)?,
+                )
+                .expect("serializable review"))
             }
             "checks.cancel" => {
                 let p: CheckIdParams = parse_params(params)?;
-                Ok(serde_json::to_value(self.core.check_cancel(p.id).await.map_err(RpcError::from_core)?).expect("serializable review"))
+                Ok(serde_json::to_value(
+                    self.core
+                        .check_cancel(p.id)
+                        .await
+                        .map_err(RpcError::from_core)?,
+                )
+                .expect("serializable review"))
             }
             "checks.list" => {
                 let p: CheckHistoryParams = parse_params(params)?;
-                Ok(self.core.check_list(p.offset).await.map_err(RpcError::from_core)?)
+                Ok(self
+                    .core
+                    .check_list(p.offset)
+                    .await
+                    .map_err(RpcError::from_core)?)
             }
             "checks.result" => {
                 let p: CheckPageParams = parse_params(params)?;
@@ -667,34 +687,47 @@ impl Connection {
                 tokio::task::spawn_blocking(move || {
                     let summary = crate::checks::read_summary(&state, p.id)?;
                     crate::checks::page(&state, &summary, p.offset)
-                }).await.map_err(|e| RpcError::new(-32000,e.to_string()))?
-                    .map_err(|e| RpcError::new(-32000,e))
+                })
+                .await
+                .map_err(|e| RpcError::new(-32000, e.to_string()))?
+                .map_err(|e| RpcError::new(-32000, e))
             }
             "checks.source" => {
                 let p: CheckSourceParams = parse_params(params)?;
-                if p.file.len()>1024 {return Err(RpcError::new(-32602,"Source path is too long".into()));}
+                if p.file.len() > 1024 {
+                    return Err(RpcError::new(-32602, "Source path is too long".into()));
+                }
                 let state = self.identity.state_dir.clone();
                 tokio::task::spawn_blocking(move || {
                     let summary = crate::checks::read_summary(&state, p.id)?;
                     crate::checks::source(&state, &summary, &p.file, p.line)
-                }).await.map_err(|e| RpcError::new(-32000,e.to_string()))?
-                    .map_err(|e| RpcError::new(-32000,e))
+                })
+                .await
+                .map_err(|e| RpcError::new(-32000, e.to_string()))?
+                .map_err(|e| RpcError::new(-32000, e))
             }
             "checks.catalog" => {
                 let _: NoParams = parse_params(params)?;
                 let availability = crate::checks::runner::helper();
-                Ok(json!({"version":1,"available":availability.is_ok(),"reason":availability.err(),"rules":crate::checks::rules::RULES}))
+                Ok(
+                    json!({"version":1,"available":availability.is_ok(),"reason":availability.err(),"rules":crate::checks::rules::RULES}),
+                )
             }
             "checks.prepareFix" => {
                 let p: CheckFixParams = parse_params(params)?;
                 let state = self.identity.state_dir.clone();
                 let repo = self.identity.repo_root.clone();
-                tokio::task::spawn_blocking(move || crate::checks::prepare_fix(&state, &repo, p.id, &p.indices))
-                    .await.map_err(|e| RpcError::new(-32000,e.to_string()))?.map_err(|e| RpcError::new(-32000,e))
+                tokio::task::spawn_blocking(move || {
+                    crate::checks::prepare_fix(&state, &repo, p.id, &p.indices)
+                })
+                .await
+                .map_err(|e| RpcError::new(-32000, e.to_string()))?
+                .map_err(|e| RpcError::new(-32000, e))
             }
             "daemon.status" => {
                 let _: NoParams = parse_params(params)?;
-                self.lifecycle(crate::core::lifecycle::Request::Status).await
+                self.lifecycle(crate::core::lifecycle::Request::Status)
+                    .await
             }
             "session.acquire" => {
                 let p: SessionAcquireParams = parse_params(params)?;
@@ -705,7 +738,10 @@ impl Connection {
                         let owner = crate::workspace::session::identify_owner(pid)
                             .await
                             .ok_or_else(|| RpcError::invalid_params(format!("ownerPid {pid} is not a running process a session can be bound to")))?;
-                        crate::core::lifecycle::Request::AcquireOwned { label: p.label, owner }
+                        crate::core::lifecycle::Request::AcquireOwned {
+                            label: p.label,
+                            owner,
+                        }
                     }
                 };
                 self.lifecycle(request).await
@@ -713,15 +749,23 @@ impl Connection {
             "session.renew" | "session.release" => {
                 let p: SessionHandleParams = parse_params(params)?;
                 let request = if method == "session.renew" {
-                    crate::core::lifecycle::Request::Renew { instance: p.instance_id, session: p.session_id }
+                    crate::core::lifecycle::Request::Renew {
+                        instance: p.instance_id,
+                        session: p.session_id,
+                    }
                 } else {
-                    crate::core::lifecycle::Request::Release { instance: p.instance_id, session: p.session_id, stop_if_unneeded: p.stop_if_unneeded }
+                    crate::core::lifecycle::Request::Release {
+                        instance: p.instance_id,
+                        session: p.session_id,
+                        stop_if_unneeded: p.stop_if_unneeded,
+                    }
                 };
                 self.lifecycle(request).await
             }
             "daemon.stop" => {
                 let p: DaemonStopParams = parse_params(params)?;
-                self.lifecycle(crate::core::lifecycle::Request::Stop { mode: p.mode }).await
+                self.lifecycle(crate::core::lifecycle::Request::Stop { mode: p.mode })
+                    .await
             }
             "hello" => self.hello(parse_params(params)?),
             "subscribe" => self.subscribe(parse_params(params)?).await,
@@ -744,13 +788,48 @@ impl Connection {
             "resolve_gate" => self.resolve_gate(parse_params(params)?).await,
             "gate.approve" => self.gate_approve(parse_params(params)?).await,
             "gate.deny" => self.gate_deny(parse_params(params)?).await,
+            // Socket-only human evidence. It is deliberately absent from MCP and proxy tools.
+            "verification.external" => self.external_verification(parse_params(params)?).await,
+            "verification.source_inventory" => self.source_inventory(parse_params(params)?).await,
             "run.recovery" => {
                 let p: RecoveryPreviewParams = parse_params(params)?;
-                to_value(&self.core.recovery_preview(p.run_id).await.map_err(RpcError::from_core)?)
+                to_value(
+                    &self
+                        .core
+                        .recovery_preview(p.run_id)
+                        .await
+                        .map_err(RpcError::from_core)?,
+                )
             }
             "run.recover" => {
                 let p: crate::core::recovery::Request = parse_params(params)?;
-                to_value(&self.core.recover_run(p, self.actor()).await.map_err(RpcError::from_core)?)
+                to_value(
+                    &self
+                        .core
+                        .recover_run(p, self.actor())
+                        .await
+                        .map_err(RpcError::from_core)?,
+                )
+            }
+            "retention.inventory" => {
+                let query: crate::core::retention::InventoryQuery = parse_params(params)?;
+                to_value(
+                    &self
+                        .core
+                        .retention_inventory(query)
+                        .await
+                        .map_err(RpcError::from_core)?,
+                )
+            }
+            "retention.retire" => {
+                let request: crate::core::retention::Request = parse_params(params)?;
+                to_value(
+                    &self
+                        .core
+                        .retire_worktree(request, self.actor())
+                        .await
+                        .map_err(RpcError::from_core)?,
+                )
             }
             // The three socket-only team methods (design Rev 26, § Team layer). They are **not**
             // MCP tools and must never become any: an agent that could re-team itself mid-run
@@ -763,7 +842,11 @@ impl Connection {
     }
 
     async fn lifecycle(&self, request: crate::core::lifecycle::Request) -> Result<Value, RpcError> {
-        let out = self.core.lifecycle(request).await.map_err(RpcError::from_core)?;
+        let out = self
+            .core
+            .lifecycle(request)
+            .await
+            .map_err(RpcError::from_core)?;
         to_value(&out)
     }
 
@@ -844,8 +927,11 @@ impl Connection {
 
     async fn audit_start(&self, params: AuditStartParams) -> Result<Value, RpcError> {
         check_task(&params.task)?;
-        let out = self.core.start_audit(params.task, params.selection, params.caller_run_id)
-            .await.map_err(RpcError::from_core)?;
+        let out = self
+            .core
+            .start_audit(params.task, params.selection, params.caller_run_id)
+            .await
+            .map_err(RpcError::from_core)?;
         to_value(&out)
     }
 
@@ -874,9 +960,14 @@ impl Connection {
         };
         let out = self
             .core
-            .start_lead_with_setup(task, params.message, crate::core::LeadSetup {
-                audit_selection: params.audit_selection, expected_team: params.expected_team,
-            })
+            .start_lead_with_setup(
+                task,
+                params.message,
+                crate::core::LeadSetup {
+                    audit_selection: params.audit_selection,
+                    expected_team: params.expected_team,
+                },
+            )
             .await
             .map_err(RpcError::from_core)?;
         to_value(&out)
@@ -1048,7 +1139,8 @@ impl Connection {
                     .to_string(),
             ));
         }
-        self.deny(params.gate_id, params.feedback, params.caller_run_id).await
+        self.deny(params.gate_id, params.feedback, params.caller_run_id, Actor::Mcp)
+            .await
     }
 
     /// `gate.approve` — **the only approving door**, reachable over this socket and nowhere else.
@@ -1066,18 +1158,35 @@ impl Connection {
     }
 
     async fn gate_deny(&self, params: GateDenyParams) -> Result<Value, RpcError> {
-        self.deny(params.gate_id, params.feedback, None).await
+        self.deny(params.gate_id, params.feedback, None, self.actor()).await
+    }
+
+    async fn external_verification(&self, params: ExternalVerificationParams) -> Result<Value, RpcError> {
+        validate_external_evidence(&params.evidence)?;
+        let out = self.core.prepare_external_verification(params.run_id, params.evidence, self.actor())
+            .await.map_err(RpcError::from_core)?;
+        Ok(json!({ "gateId": out.gate_id, "resolution": out.resolution }))
+    }
+
+    async fn source_inventory(&self, request: crate::core::types::SourceInventoryRequest) -> Result<Value, RpcError> {
+        to_value(&self.core.source_inventory(request).await.map_err(RpcError::from_core)?)
     }
 
     /// The denial both `resolve_gate` and `gate.deny` perform.
-    async fn deny(&self, gate: GateId, feedback: Option<String>, caller: Option<RunId>) -> Result<Value, RpcError> {
+    async fn deny(
+        &self,
+        gate: GateId,
+        feedback: Option<String>,
+        caller: Option<RunId>,
+        by: Actor,
+    ) -> Result<Value, RpcError> {
         if let Some(feedback) = &feedback {
             check_chars("feedback", feedback, 0, MAX_FEEDBACK_CHARS)?;
         }
         let resolution = self
             .core
             .with_caller(caller)
-            .resolve_gate(gate, false, feedback, self.actor())
+            .resolve_gate(gate, false, feedback, by)
             .await
             .map_err(RpcError::from_core)?;
         to_value(&resolution)
@@ -1439,7 +1548,9 @@ struct GateApproveParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RecoveryPreviewParams { run_id: RunId }
+struct RecoveryPreviewParams {
+    run_id: RunId,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1447,6 +1558,38 @@ struct GateDenyParams {
     gate_id: GateId,
     #[serde(default)]
     feedback: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExternalVerificationParams {
+    run_id: RunId,
+    evidence: crate::core::types::ExternalVerificationEvidence,
+}
+
+fn validate_external_evidence(
+    evidence: &crate::core::types::ExternalVerificationEvidence,
+) -> Result<(), RpcError> {
+    evidence.validate_attestation().map_err(RpcError::invalid_params)?;
+    if evidence.commands.is_empty() || evidence.commands.len() > 20 {
+        return Err(RpcError::invalid_params("evidence.commands must contain 1..=20 entries".into()));
+    }
+    for (index, command) in evidence.commands.iter().enumerate() {
+        check_chars("evidence command workerCommand", &command.worker_command, 1, 500)?;
+        if command.argv.is_empty() || command.argv.len() > 64 {
+            return Err(RpcError::invalid_params(format!("evidence.commands[{index}].argv must contain 1..=64 arguments")));
+        }
+        for arg in &command.argv {
+            check_chars("evidence command argument", arg, 1, 500)?;
+        }
+    }
+    if evidence.limitations.len() > 20 {
+        return Err(RpcError::invalid_params("evidence.limitations has more than 20 entries".into()));
+    }
+    for limitation in &evidence.limitations {
+        check_chars("evidence limitation", limitation, 1, 1000)?;
+    }
+    Ok(())
 }
 
 /// The params of a method that takes none — `roles.list` and `team.get`.
@@ -1461,19 +1604,35 @@ struct NoParams {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckIdParams { id: uuid::Uuid }
+struct CheckIdParams {
+    id: uuid::Uuid,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CheckHistoryParams { #[serde(default)] offset: usize }
+struct CheckHistoryParams {
+    #[serde(default)]
+    offset: usize,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckPageParams { id: uuid::Uuid, #[serde(default)] offset: usize }
+struct CheckPageParams {
+    id: uuid::Uuid,
+    #[serde(default)]
+    offset: usize,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckSourceParams { id: uuid::Uuid, file: String, line: usize }
+struct CheckSourceParams {
+    id: uuid::Uuid,
+    file: String,
+    line: usize,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckFixParams { id: uuid::Uuid, indices: Vec<usize> }
+struct CheckFixParams {
+    id: uuid::Uuid,
+    indices: Vec<usize>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1497,7 +1656,9 @@ struct SessionHandleParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DaemonStopParams { mode: crate::core::lifecycle::StopMode }
+struct DaemonStopParams {
+    mode: crate::core::lifecycle::StopMode,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

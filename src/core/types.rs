@@ -341,6 +341,9 @@ pub enum GateKind {
     Integrate,
     Escalate,
     Plan,
+    /// A human supplied host-side verification record for an environment-blocked verifier.
+    #[serde(rename = "external-verification")]
+    ExternalVerification,
 }
 
 /// Lifecycle of a gate. `Resolving` is the in-flight window while the commit helper runs.
@@ -701,7 +704,7 @@ pub struct AuditRecord {
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
-pub enum AuditOutcome { Pass, Fail, NothingToRun }
+pub enum AuditOutcome { Pass, Fail, Blocked, NothingToRun }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -869,6 +872,20 @@ pub struct CommitTarget {
     /// than over it, so the artifact a human reads is never rewritten by an approval.
     #[serde(default)]
     pub diff_path: Option<PathBuf>,
+}
+
+/// The frozen draft explicitly named by an integration gate. An unbound gate may still
+/// be denied, but its feedback cannot be attributed to a particular builder attempt.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum GateRepairBinding {
+    Unbound,
+    Frozen {
+        #[serde(rename = "builderAttemptId")]
+        builder_attempt_id: AttemptId,
+        #[serde(rename = "diffHash")]
+        diff_hash: String,
+    },
 }
 
 /// A human gate. Only an approval over the local socket can flip `status` to `Approved`.
@@ -1151,6 +1168,8 @@ pub struct ReviewVerdict {
 pub enum VerifyStatus {
     Pass,
     Fail,
+    /// The selected checks could not run because the worker environment lacked a capability.
+    Blocked,
     NothingToRun,
 }
 
@@ -1163,16 +1182,112 @@ pub struct VerifyReport {
     pub status: VerifyStatus,
     #[schemars(length(min = 1, max = 4000))]
     pub summary: String,
-    /// The build/test commands actually run, for the human and the reviewer — never re-executed.
+    /// The build/test commands run or concretely attempted, for the human and reviewer — never
+    /// re-executed by ACP.
     #[schemars(length(max = 20), inner(length(min = 1, max = 500)))]
     pub commands: Vec<String>,
     /// Failing test names / the top build error. Empty unless `status` is `fail`.
     #[schemars(length(max = 50), inner(length(min = 1, max = 1000)))]
     pub failures: Vec<String>,
+    /// Bounded environment capability reasons. Non-empty exactly for `status: blocked`.
+    // Stored pre-feature results omit this field; new worker schemas still require it.
+    #[serde(default)]
+    #[schemars(!default)]
+    #[schemars(length(max = 20), inner(length(min = 1, max = 1000)))]
+    pub blockers: Vec<String>,
     /// Copy the `diffHash` from your task prompt verbatim. A report that does not echo it is
     /// discarded: it cannot be shown to be about the state you were asked to verify.
     #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
     pub diff_hash: String,
+}
+
+/// Whether one host-side command actually ran and what it established.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalCommandStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+/// One deliberately recorded host-side verification command. `argv` is data and is never run by
+/// ACP; preserving argument boundaries avoids turning the record into an ambiguous shell string.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalCommandResult {
+    /// The corresponding command string from the blocked worker report.
+    #[schemars(length(min = 1, max = 500))]
+    pub worker_command: String,
+    #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 500)))]
+    pub argv: Vec<String>,
+    pub status: ExternalCommandStatus,
+    pub exit_status: Option<i32>,
+}
+
+/// Human-attested host evidence for a verifier that was blocked in its worker environment.
+/// This is a durable assertion about the named commands, not cryptographic proof they ran.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalVerificationEvidence {
+    pub builder_attempt_id: AttemptId,
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub diff_hash: String,
+    /// Optimistic concurrency token copied from the run immediately before submission.
+    pub expected_run_seq: u64,
+    #[schemars(length(min = 1, max = 20))]
+    pub commands: Vec<ExternalCommandResult>,
+    #[schemars(length(min = 1, max = 500))]
+    pub toolchain_identity: String,
+    #[schemars(length(min = 1, max = 1000))]
+    pub provenance: String,
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub source_inventory_before_hash: String,
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub source_inventory_after_hash: String,
+    #[schemars(length(min = 1, max = 2000))]
+    pub attestation: String,
+    #[schemars(length(max = 20), inner(length(min = 1, max = 1000)))]
+    pub limitations: Vec<String>,
+}
+
+impl ExternalVerificationEvidence {
+    pub(crate) fn validate_attestation(&self) -> Result<(), String> {
+        for (field, value, max_chars) in [
+            ("toolchainIdentity", &self.toolchain_identity, 500),
+            ("provenance", &self.provenance, 1000),
+            ("attestation", &self.attestation, 2000),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control)
+                || value.chars().count() > max_chars
+            {
+                return Err(format!(
+                    "evidence.{field} requires nonblank text without control characters, at most {max_chars} characters"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact run/frozen-builder identity used when the daemon captures a host-verification inventory.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceInventoryRequest {
+    pub run_id: RunId,
+    pub builder_attempt_id: AttemptId,
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub diff_hash: String,
+    pub expected_run_seq: u64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceInventorySnapshot {
+    pub run_id: RunId,
+    pub builder_attempt_id: AttemptId,
+    pub diff_hash: String,
+    pub run_seq: u64,
+    pub hash: String,
 }
 
 /// Removes the top-level `$schema` key from a generated schema document, leaving `$defs`/`$ref`
@@ -1273,6 +1388,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "run.budget_blocked",
     "task.evidence_updated",
     "run.recovered",
+    "verification.external.prepared",
 ];
 
 /// The exact work whose admission was refused by a finite run cap.  Keeping this in the log is
@@ -1520,6 +1636,11 @@ pub enum EventPayload {
         /// sha256 hex of the frozen diff file — stated in the reviewer's prompt, echoed back in
         /// `review.verdict.diffHash`, and compared before a PASS may open a gate (Rev 25).
         diff_hash: String,
+        /// Complete bounded source identity captured on both sides of this freeze under the
+        /// existing worktree lock. Absent in legacy logs or when capture could not be established;
+        /// those diffs cannot accept external verification evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_inventory_hash: Option<String>,
         files: Vec<String>,
         added: u64,
         deleted: u64,
@@ -1555,6 +1676,18 @@ pub enum EventPayload {
         summary: String,
         payload_path: PathBuf,
         requested_by: Origin,
+        /// Absent on historical records. New integration gates always record their binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repair_binding: Option<GateRepairBinding>,
+    },
+    /// Immutable copy of host evidence validated when an external-verification gate was created.
+    /// The following `gate.created` names the same gate. Keeping the complete record in the
+    /// append-only log makes the mutable gate payload a presentation copy, not an authority.
+    #[serde(rename = "verification.external.prepared")]
+    ExternalVerificationPrepared {
+        gate_id: GateId,
+        evidence: ExternalVerificationEvidence,
+        daemon_captured_inventory_hash: String,
     },
     #[serde(rename = "gate.resolving")]
     GateResolving {
@@ -1566,6 +1699,10 @@ pub enum EventPayload {
         /// the gate's payload file so that finalization and crash reconciliation never depend on a
         /// file that may be gone by the time the commit lands (see [`CommitTarget`]).
         commit: Option<CommitTarget>,
+        /// Immutable accepted evidence for a commit-less external-verification approval. Keeping
+        /// it in the append-only event prevents later payload-file edits from changing prompts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_verification: Option<ExternalVerificationEvidence>,
     },
     #[serde(rename = "gate.resolved")]
     GateResolved {
@@ -1618,7 +1755,11 @@ pub enum EventPayload {
         builder_attempt_id: AttemptId,
         status: VerifyStatus,
         summary: String,
+        #[serde(default)]
+        commands: Vec<String>,
         failures: Vec<String>,
+        #[serde(default)]
+        blockers: Vec<String>,
     },
     /// B3: the validated plan document, verbatim, on the container run's log — the durable
     /// original every later `plan.item` is read against.
@@ -1709,6 +1850,7 @@ mod tests {
             EventPayload::LineageStrike { .. } => "lineage.strike",
             EventPayload::LineageClosed { .. } => "lineage.closed",
             EventPayload::GateCreated { .. } => "gate.created",
+            EventPayload::ExternalVerificationPrepared { .. } => "verification.external.prepared",
             EventPayload::GateResolving { .. } => "gate.resolving",
             EventPayload::GateResolved { .. } => "gate.resolved",
             EventPayload::IntegrateCommitted { .. } => "integrate.committed",
@@ -1847,6 +1989,7 @@ mod tests {
                 },
             },
             EventPayload::DiffFrozen {
+                source_inventory_hash: None,
                 attempt_id: attempt,
                 diff_path: PathBuf::from("/state/runs/r/diffs/x.patch"),
                 diff_hash: "d".repeat(64),
@@ -1882,6 +2025,7 @@ mod tests {
                 gate_kind: GateKind::Integrate,
                 summary: "integrate T07".into(),
                 payload_path: PathBuf::from("/state/runs/r/gates/g.payload.json"),
+                repair_binding: None,
                 requested_by: Origin::ControlPlane,
             },
             EventPayload::GateResolving {
@@ -1899,6 +2043,7 @@ mod tests {
                     pre_sha: Some("a".repeat(40)),
                     diff_path: Some(PathBuf::from("/state/runs/r/diffs/a.patch")),
                 }),
+                external_verification: None,
             },
             EventPayload::GateResolved {
                 gate_id: gate,
@@ -1930,7 +2075,9 @@ mod tests {
                 builder_attempt_id: attempt,
                 status: VerifyStatus::Fail,
                 summary: "cargo test: 1 failing".into(),
+                commands: vec!["cargo test".into()],
                 failures: vec!["types::round_trip".into()],
+                blockers: vec![],
             },
             EventPayload::PlanCreated {
                 plan: crate::core::plan::Plan {
@@ -1978,6 +2125,19 @@ mod tests {
                     feedback: "Continue from this draft".into() }, agent_id: AgentId::new_v4(),
                 by: Actor::Socket { client_name: "acp-mac".into() }, gate_ids: vec![gate],
             } },
+            EventPayload::ExternalVerificationPrepared {
+                gate_id: gate,
+                evidence: ExternalVerificationEvidence {
+                    builder_attempt_id: attempt, diff_hash: "d".repeat(64), expected_run_seq: 10,
+                    commands: vec![ExternalCommandResult { worker_command: "cargo test".into(),
+                        argv: vec!["cargo".into(), "test".into()], status: ExternalCommandStatus::Passed,
+                        exit_status: Some(0) }],
+                    toolchain_identity: "rustc".into(), provenance: "host shell".into(),
+                    source_inventory_before_hash: "e".repeat(64), source_inventory_after_hash: "e".repeat(64),
+                    attestation: "I ran it".into(), limitations: vec![],
+                },
+                daemon_captured_inventory_hash: "e".repeat(64),
+            },
         ]
     }
 
@@ -2030,8 +2190,8 @@ mod tests {
         assert_eq!(EVENT_KINDS[23], "loop.dispatched");
         assert_eq!(EVENT_KINDS[24], "agent.message");
         assert_eq!(EVENT_KINDS[28], "run.delegated");
-        assert_eq!(EVENT_KINDS.last(), Some(&"run.recovered"));
-        assert_eq!(EVENT_KINDS.len(), 36);
+        assert_eq!(EVENT_KINDS.last(), Some(&"verification.external.prepared"));
+        assert_eq!(EVENT_KINDS.len(), 37);
     }
 
     #[test]

@@ -317,6 +317,14 @@ impl Core {
             );
             return;
         }
+        if audit.checks.iter().any(|check| check.outcome == AuditOutcome::Blocked) {
+            self.finish_audit(
+                run,
+                RunStatus::Blocked,
+                "A selected audit check was environment-blocked; no changes were integrated",
+            );
+            return;
+        }
         let next = [
             (RoleName::Verifier, steps.verify),
             (RoleName::Reviewer, steps.review),
@@ -606,10 +614,11 @@ impl Core {
         match (role, a.structured.clone()) {
             (RoleName::Verifier, Some(value)) => {
                 if let Ok(report) = serde_json::from_value::<VerifyReport>(value) {
-                    if report.diff_hash == hash {
+                    if report.diff_hash == hash && super::valid_verify_report_shape(&report) {
                         check.outcome = match report.status {
                             VerifyStatus::Pass => AuditOutcome::Pass,
                             VerifyStatus::Fail => AuditOutcome::Fail,
+                            VerifyStatus::Blocked => AuditOutcome::Blocked,
                             VerifyStatus::NothingToRun => AuditOutcome::NothingToRun,
                         };
                         check.summary = clamp_untrusted(&report.summary, 4000);

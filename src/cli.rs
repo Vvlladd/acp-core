@@ -22,7 +22,7 @@
 //! and the tests link, and none of them want the CLI's argument parser or its `anyhow` chain.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Seek as _, Write as _};
+use std::io::{self, Read as _, Seek as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::io::AsRawFd as _;
@@ -42,7 +42,7 @@ use agent_control_plane::core::{
     channel, human_action, run_actor, spawn_signal_forwarder, spawn_tick_task, Core, DEFAULT_TICK,
 };
 use agent_control_plane::ipc::socket::{
-    serve_socket, ServerIdentity, MAX_SOCKET_PATH_BYTES, PROTOCOL_VERSION,
+    serve_socket, ServerIdentity, MAX_LINE_BYTES, MAX_SOCKET_PATH_BYTES, PROTOCOL_VERSION,
 };
 use agent_control_plane::mcp;
 use agent_control_plane::providers::codex::SANDBOX_VERIFIED_VERSION;
@@ -177,12 +177,25 @@ pub enum Cmd {
     /// Approve or deny a human gate. Approving is only ever done here (S2).
     #[command(subcommand)]
     Gate(GateCmd),
+    /// Record human-attested host verification for an environment-blocked verifier.
+    ExternalVerify {
+        /// JSON document `{runId, evidence}`; the daemon validates fresh state and exact hashes.
+        file: PathBuf,
+    },
+    /// Capture all checkout inputs before/after host checks; write generated output outside it.
+    ExternalInventory {
+        /// JSON `{runId,builderAttemptId,diffHash,expectedRunSeq}` for the exact frozen builder state.
+        file: PathBuf,
+    },
     /// Read or update the daemon's team, or show the role/provider catalog.
     #[command(subcommand)]
     Team(TeamCmd),
     /// Inspect or change one run's cumulative spending cap through the human socket.
     #[command(subcommand)]
     Budget(BudgetCmd),
+    /// Explain retained ACP worktrees or deliberately retire one completed lineage.
+    #[command(subcommand)]
+    Worktree(WorktreeCmd),
     /// Report — and with `--closed`, remove — the worktrees of closed lineages.
     Gc {
         /// Actually remove them.
@@ -263,7 +276,10 @@ pub enum Cmd {
         file: PathBuf,
     },
     /// Local Swift/SwiftUI review. Requires a running daemon and no provider account.
-    Review { #[command(subcommand)] action: ReviewAction },
+    Review {
+        #[command(subcommand)]
+        action: ReviewAction,
+    },
     /// Wait for an agent's next result (socket `await_result`; one bounded call, no loop).
     Await {
         agent_id: String,
@@ -295,14 +311,30 @@ pub enum GateCmd {
 #[derive(clap::Subcommand, Debug)]
 pub enum ReviewAction {
     Start {
-        #[arg(long, default_value="project", value_parser=["project","changes","revision"])] scope: String,
-        #[arg(long, default_value="HEAD")] base: String,
-        #[arg(long)] revision: Option<String>,
+        #[arg(long, default_value="project", value_parser=["project","changes","revision"])]
+        scope: String,
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        #[arg(long)]
+        revision: Option<String>,
     },
-    List { #[arg(long,default_value_t=0)] offset: usize },
-    Show { id: uuid::Uuid, #[arg(long,default_value_t=0)] offset: usize },
-    Source { id: uuid::Uuid, file: String, line: usize },
-    Cancel { id: uuid::Uuid },
+    List {
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    Show {
+        id: uuid::Uuid,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    Source {
+        id: uuid::Uuid,
+        file: String,
+        line: usize,
+    },
+    Cancel {
+        id: uuid::Uuid,
+    },
     Catalog,
 }
 
@@ -338,6 +370,29 @@ pub enum BudgetCmd {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum WorktreeCmd {
+    /// Show the bounded actor-owned inventory and why every tree is retained or eligible.
+    List {
+        /// Narrow before applying the inventory bound.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Narrow before applying the inventory bound.
+        #[arg(long)]
+        lineage_id: Option<String>,
+    },
+    /// Preview one integrated lineage; pass its exact --confirm token to retire resumability.
+    Retire {
+        run_id: String,
+        /// Required only when a run has more than one eligible lineage.
+        #[arg(long)]
+        lineage_id: Option<String>,
+        /// Exact confirmation value printed by the earlier preview.
+        #[arg(long, value_name = "PREVIEW_TOKEN")]
+        confirm: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum SessionCmd {
     Status,
     Acquire {
@@ -351,7 +406,10 @@ pub enum SessionCmd {
         #[arg(long)]
         owner_pid: Option<i32>,
     },
-    Renew { instance_id: uuid::Uuid, session_id: uuid::Uuid },
+    Renew {
+        instance_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+    },
     Release {
         instance_id: uuid::Uuid,
         session_id: uuid::Uuid,
@@ -399,8 +457,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             }
         }
         Cmd::Gate(gate) => resolve_gate(repo, gate).await,
+        Cmd::ExternalVerify { file } => external_verify(repo, &file).await,
+        Cmd::ExternalInventory { file } => external_inventory(repo, &file).await,
         Cmd::Team(team) => manage_team(repo, team).await,
         Cmd::Budget(budget) => manage_budget(repo, budget).await,
+        Cmd::Worktree(command) => manage_worktree(repo, command).await,
         Cmd::Gc { closed } => gc(repo, closed).await,
         Cmd::Doctor => doctor(repo).await,
         Cmd::Delegate {
@@ -443,8 +504,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
         Cmd::Up { managed } => up(repo, managed).await,
         Cmd::Down => stop_serve(repo).await,
         Cmd::Session(command) => manage_session(repo, command).await,
-        Cmd::Stop { daemon_only, keep_running, cancel_work } => {
-            let mode = if keep_running { "keep_running" } else if daemon_only { "daemon_only" } else if cancel_work { "cancel_work" } else { "when_idle" };
+        Cmd::Stop {
+            daemon_only,
+            keep_running,
+            cancel_work,
+        } => {
+            let mode = if keep_running {
+                "keep_running"
+            } else if daemon_only {
+                "daemon_only"
+            } else if cancel_work {
+                "cancel_work"
+            } else {
+                "when_idle"
+            };
             call_socket(repo, "daemon.stop", serde_json::json!({"mode": mode})).await
         }
         Cmd::Plan { file } => {
@@ -455,19 +528,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             call_socket(repo, "plan.start", json!({ "plan": plan })).await
         }
         Cmd::Review { action } => {
-            let (method,params)=match action {
-                ReviewAction::Start{scope,base,revision}=> ("checks.start",json!({"id":uuid::Uuid::new_v4(),"scope":scope,"baseRef":base,"revision":revision})),
-                ReviewAction::List{offset}=>("checks.list",json!({"offset":offset})),
-                ReviewAction::Show{id,offset}=>("checks.result",json!({"id":id,"offset":offset})),
-                ReviewAction::Cancel{id}=>("checks.cancel",json!({"id":id})),
-                ReviewAction::Source{id,file,line}=>("checks.source",json!({"id":id,"file":file,"line":line})),
-                ReviewAction::Catalog=>("checks.catalog",json!({})),
+            let (method, params) = match action {
+                ReviewAction::Start {
+                    scope,
+                    base,
+                    revision,
+                } => (
+                    "checks.start",
+                    json!({"id":uuid::Uuid::new_v4(),"scope":scope,"baseRef":base,"revision":revision}),
+                ),
+                ReviewAction::List { offset } => ("checks.list", json!({"offset":offset})),
+                ReviewAction::Show { id, offset } => {
+                    ("checks.result", json!({"id":id,"offset":offset}))
+                }
+                ReviewAction::Cancel { id } => ("checks.cancel", json!({"id":id})),
+                ReviewAction::Source { id, file, line } => {
+                    ("checks.source", json!({"id":id,"file":file,"line":line}))
+                }
+                ReviewAction::Catalog => ("checks.catalog", json!({})),
             };
-            call_socket(repo,method,params).await
+            call_socket(repo, method, params).await
         }
         Cmd::Audit { file } => {
-            let bytes = fs::read(&file).with_context(|| format!("reading audit setup {}", file.display()))?;
-            let args: mcp::server::AuditArgs = serde_json::from_slice(&bytes).context("parsing audit setup")?;
+            let bytes = fs::read(&file)
+                .with_context(|| format!("reading audit setup {}", file.display()))?;
+            let args: mcp::server::AuditArgs =
+                serde_json::from_slice(&bytes).context("parsing audit setup")?;
             call_socket(repo, "audit.start", serde_json::to_value(args)?).await
         }
         Cmd::Await {
@@ -535,22 +621,35 @@ async fn start(repo: Option<&Path>) -> anyhow::Result<i32> {
     let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
     let lifetime = client.call("daemon.status", json!({})).await?;
     let actual_managed = lifetime["managed"].as_bool().unwrap_or(false);
-    let catalog: team::RolesListResult = serde_json::from_value(client.call("roles.list", json!({})).await?)?;
+    let catalog: team::RolesListResult =
+        serde_json::from_value(client.call("roles.list", json!({})).await?)?;
     let saved = client.call("team.get", json!({})).await?;
-    let previous: Option<team::Team> = saved.get("team").filter(|v| !v.is_null())
-        .map(|v| serde_json::from_value(v.clone())).transpose()?;
+    let previous: Option<team::Team> = saved
+        .get("team")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()?;
     let setup = entry::collect(&catalog, previous.as_ref())?;
-    println!("Daemon lifetime: {}", if actual_managed {
-        "automatic cleanup after sessions, clients, work and approvals finish"
-    } else { "keep running — manual/shared owner" });
-    if actual_managed != managed { println!("The existing owner's lifetime is preserved; your requested policy applies only to a new daemon."); }
+    println!(
+        "Daemon lifetime: {}",
+        if actual_managed {
+            "automatic cleanup after sessions, clients, work and approvals finish"
+        } else {
+            "keep running — manual/shared owner"
+        }
+    );
+    if actual_managed != managed {
+        println!("The existing owner's lifetime is preserved; your requested policy applies only to a new daemon.");
+    }
     if !ask_entry_yes_no("Save these choices and start the task?", false)? {
         println!("Setup cancelled. No task started.");
         return Ok(EXIT_OK);
     }
     client.call("team.set", json!({"team": setup.team})).await?;
     let mut params = json!({"message": prompt, "expectedTeam": setup.team});
-    if let Some(selection) = setup.audit_selection { params["auditSelection"] = json!(selection); }
+    if let Some(selection) = setup.audit_selection {
+        params["auditSelection"] = json!(selection);
+    }
     let result = client.call("lead.start", params).await?;
     print_json(&result)?;
     println!("Watch progress with acp status --follow. Human approval remains in acp-mac or acp gate approve.");
@@ -559,7 +658,10 @@ async fn start(repo: Option<&Path>) -> anyhow::Result<i32> {
 
 fn ask_entry_yes_no(label: &str, default: bool) -> anyhow::Result<bool> {
     loop {
-        match ask_entry(label, Some(if default { "yes" } else { "no" }))?.to_ascii_lowercase().as_str() {
+        match ask_entry(label, Some(if default { "yes" } else { "no" }))?
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "yes" | "y" => return Ok(true),
             "no" | "n" => return Ok(false),
             _ => println!("Choose yes or no."),
@@ -568,12 +670,21 @@ fn ask_entry_yes_no(label: &str, default: bool) -> anyhow::Result<bool> {
 }
 
 fn ask_entry(label: &str, default: Option<&str>) -> anyhow::Result<String> {
-    match default { Some(value) => print!("{label} [{value}]: "), None => print!("{label}: ") }
+    match default {
+        Some(value) => print!("{label} [{value}]: "),
+        None => print!("{label}: "),
+    }
     io::stdout().flush()?;
     let mut answer = String::new();
-    if io::stdin().read_line(&mut answer)? == 0 { bail!("setup ended before confirmation"); }
+    if io::stdin().read_line(&mut answer)? == 0 {
+        bail!("setup ended before confirmation");
+    }
     let answer = answer.trim();
-    Ok(if answer.is_empty() { default.unwrap_or("").to_string() } else { answer.to_string() })
+    Ok(if answer.is_empty() {
+        default.unwrap_or("").to_string()
+    } else {
+        answer.to_string()
+    })
 }
 
 /// Walks past transient shells and execution wrappers to a recognized host process.
@@ -586,9 +697,14 @@ fn host_owner(start: i32, parent_of: impl Fn(i32) -> Option<(i32, String)>) -> O
             return None;
         }
         let (parent, command) = parent_of(pid)?;
-        let name = command.rsplit('/').next().unwrap_or(&command).trim_start_matches('-');
+        let name = command
+            .rsplit('/')
+            .next()
+            .unwrap_or(&command)
+            .trim_start_matches('-');
         if matches!(name, "codex" | "Codex" | "claude" | "Claude")
-            || command.contains("/claude/versions/") {
+            || command.contains("/claude/versions/")
+        {
             return Some(pid);
         }
         pid = parent;
@@ -601,12 +717,16 @@ async fn bound_host_owner(start: i32) -> Option<i32> {
     let mut entries = std::collections::HashMap::new();
     let mut pid = start;
     for _ in 0..16 {
-        if pid <= 1 { break; }
+        if pid <= 1 {
+            break;
+        }
         let fields = agent_control_plane::workspace::session::process_fields(pid, true).await?;
         let (parent, command) = fields.split_once(char::is_whitespace)?;
         let parent = parent.trim().parse::<i32>().ok()?;
         entries.insert(pid, (parent, command.trim().to_string()));
-        if let Some(host) = host_owner(start, |id| entries.get(&id).cloned()) { return Some(host); }
+        if let Some(host) = host_owner(start, |id| entries.get(&id).cloned()) {
+            return Some(host);
+        }
         pid = parent;
     }
     None
@@ -621,13 +741,20 @@ mod host_owner_tests {
         let table = |pid: i32| match pid {
             40 => Some((30, "/bin/zsh".to_string())),
             30 => Some((20, "-bash".to_string())),
-            20 => Some((1, "/Users/me/.local/share/claude/versions/2.1.0".to_string())),
+            20 => Some((
+                1,
+                "/Users/me/.local/share/claude/versions/2.1.0".to_string(),
+            )),
             _ => None,
         };
         assert_eq!(host_owner(40, table), Some(20));
         assert_eq!(host_owner(20, table), Some(20));
         let only_shells = |pid: i32| Some((pid - 1, "sh".to_string()));
-        assert_eq!(host_owner(5, only_shells), None, "never binds to launchd/init");
+        assert_eq!(
+            host_owner(5, only_shells),
+            None,
+            "never binds to launchd/init"
+        );
         assert_eq!(host_owner(99, table), None);
     }
 }
@@ -635,7 +762,11 @@ mod host_owner_tests {
 async fn manage_session(repo: Option<&Path>, command: SessionCmd) -> anyhow::Result<i32> {
     let (method, params) = match command {
         SessionCmd::Status => ("daemon.status", json!({})),
-        SessionCmd::Acquire { label, bind_host, owner_pid } => {
+        SessionCmd::Acquire {
+            label,
+            bind_host,
+            owner_pid,
+        } => {
             let owner = if bind_host {
                 let start = i32::try_from(std::os::unix::process::parent_id())?;
                 Some(bound_host_owner(start).await.context("no Claude/Codex host process found; pass --owner-pid with the actual session process id")?)
@@ -648,8 +779,18 @@ async fn manage_session(repo: Option<&Path>, command: SessionCmd) -> anyhow::Res
             }
             ("session.acquire", params)
         }
-        SessionCmd::Renew { instance_id, session_id } => ("session.renew", json!({"instanceId": instance_id, "sessionId": session_id})),
-        SessionCmd::Release { instance_id, session_id, stop_if_unneeded } => (
+        SessionCmd::Renew {
+            instance_id,
+            session_id,
+        } => (
+            "session.renew",
+            json!({"instanceId": instance_id, "sessionId": session_id}),
+        ),
+        SessionCmd::Release {
+            instance_id,
+            session_id,
+            stop_if_unneeded,
+        } => (
             "session.release",
             if stop_if_unneeded {
                 json!({"instanceId": instance_id, "sessionId": session_id, "stopIfUnneeded": true})
@@ -729,7 +870,15 @@ struct SocketBackend {
 /// Kept as a
 /// closed list rather than an `is_delegate_like(&str)` predicate so a new attributable method is
 /// a one-line addition here, not a heuristic to get right at each call site.
-const CALLER_ATTRIBUTED_METHODS: [&str; 7] = ["delegate", "plan.start", "audit.start", "send_message", "cancel", "request_human_gate", "resolve_gate"];
+const CALLER_ATTRIBUTED_METHODS: [&str; 7] = [
+    "delegate",
+    "plan.start",
+    "audit.start",
+    "send_message",
+    "cancel",
+    "request_human_gate",
+    "resolve_gate",
+];
 
 impl SocketBackend {
     async fn call<T: DeserializeOwned>(
@@ -801,7 +950,10 @@ impl SocketBackend {
 }
 
 impl mcp::server::Backend for SocketBackend {
-    async fn audit_existing(&self, args: mcp::server::AuditArgs) -> Result<agent_control_plane::core::PlanStartOut, CallToolResult> {
+    async fn audit_existing(
+        &self,
+        args: mcp::server::AuditArgs,
+    ) -> Result<agent_control_plane::core::PlanStartOut, CallToolResult> {
         self.call_attributed("audit.start", args).await
     }
     async fn check_connection(&self) -> Result<(), String> {
@@ -1274,10 +1426,15 @@ async fn up(repo: Option<&Path>, managed: bool) -> anyhow::Result<i32> {
         return match read_lock(&lock) {
             Some(holder) => {
                 if holder.repo_root != repo_root {
-                    bail!("the state directory belongs to {}, not {}", holder.repo_root.display(), repo_root.display());
+                    bail!(
+                        "the state directory belongs to {}, not {}",
+                        holder.repo_root.display(),
+                        repo_root.display()
+                    );
                 }
                 tokio::time::timeout(UP_READINESS_LIMIT, Client::connect(&socket))
-                    .await.context("the existing daemon did not answer hello in time")??;
+                    .await
+                    .context("the existing daemon did not answer hello in time")??;
                 println!("already running (pid {})", holder.pid);
                 Ok(EXIT_OK)
             }
@@ -1304,7 +1461,9 @@ async fn up(repo: Option<&Path>, managed: bool) -> anyhow::Result<i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    if managed { command.arg("--managed"); }
+    if managed {
+        command.arg("--managed");
+    }
     // Its own process group: the daemon's lifetime is the lock's, never this command's — the
     // honest answer to D13's "a GUI crash must never be the daemon's crash".
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
@@ -1899,6 +2058,53 @@ fn parse_gate(gate_id: &str) -> anyhow::Result<GateId> {
         .with_context(|| format!("{gate_id:?} is not a gate id"))
 }
 
+async fn external_verify(repo: Option<&Path>, file: &Path) -> anyhow::Result<i32> {
+    let places = Places::locate(repo).await?;
+    let length = fs::metadata(file)
+        .with_context(|| format!("reading external verification evidence metadata {}", file.display()))?
+        .len();
+    if length > MAX_LINE_BYTES as u64 {
+        bail!("external verification evidence is {length} bytes; maximum is {MAX_LINE_BYTES}");
+    }
+    let input = fs::File::open(file)
+        .with_context(|| format!("opening external verification evidence {}", file.display()))?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(input, MAX_LINE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading external verification evidence {}", file.display()))?;
+    if bytes.len() > MAX_LINE_BYTES {
+        bail!("external verification evidence exceeds {MAX_LINE_BYTES} bytes");
+    }
+    let params: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing external verification evidence {}", file.display()))?;
+    let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
+    let result = client.call("verification.external", params).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(EXIT_OK)
+}
+
+async fn external_inventory(repo: Option<&Path>, file: &Path) -> anyhow::Result<i32> {
+    let places = Places::locate(repo).await?;
+    let bytes = read_external_json(file)?;
+    let params: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing source inventory request {}", file.display()))?;
+    let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
+    let result = client.call("verification.source_inventory", params).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(EXIT_OK)
+}
+
+fn read_external_json(file: &Path) -> anyhow::Result<Vec<u8>> {
+    let length = fs::metadata(file).with_context(|| format!("reading JSON metadata {}", file.display()))?.len();
+    if length > MAX_LINE_BYTES as u64 { bail!("JSON input is {length} bytes; maximum is {MAX_LINE_BYTES}"); }
+    let input = fs::File::open(file).with_context(|| format!("opening JSON input {}", file.display()))?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(input, MAX_LINE_BYTES as u64 + 1).read_to_end(&mut bytes)
+        .with_context(|| format!("reading JSON input {}", file.display()))?;
+    if bytes.len() > MAX_LINE_BYTES { bail!("JSON input exceeds {MAX_LINE_BYTES} bytes"); }
+    Ok(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // team
 // ---------------------------------------------------------------------------
@@ -1977,6 +2183,105 @@ async fn manage_budget(repo: Option<&Path>, cmd: BudgetCmd) -> anyhow::Result<i3
     Ok(EXIT_OK)
 }
 
+async fn manage_worktree(repo: Option<&Path>, command: WorktreeCmd) -> anyhow::Result<i32> {
+    let places = Places::locate(repo).await?;
+    let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
+    let (run_text, lineage_text) = match &command {
+        WorktreeCmd::List { run_id, lineage_id } => (run_id.as_deref(), lineage_id.as_deref()),
+        WorktreeCmd::Retire {
+            run_id, lineage_id, ..
+        } => (Some(run_id.as_str()), lineage_id.as_deref()),
+    };
+    let scoped_run = run_text
+        .map(|value| {
+            value
+                .parse::<RunId>()
+                .with_context(|| format!("{value:?} is not a run id"))
+        })
+        .transpose()?;
+    let scoped_lineage = lineage_text
+        .map(|value| {
+            value
+                .parse::<agent_control_plane::core::types::LineageId>()
+                .with_context(|| format!("{value:?} is not a lineage id"))
+        })
+        .transpose()?;
+    let inventory = client
+        .call(
+            "retention.inventory",
+            json!({
+                "runId": scoped_run,
+                "lineageId": scoped_lineage,
+            }),
+        )
+        .await?;
+    if matches!(command, WorktreeCmd::List { .. }) {
+        print_json(&inventory)?;
+        return Ok(EXIT_OK);
+    }
+    let WorktreeCmd::Retire { confirm, .. } = command else {
+        unreachable!()
+    };
+    let run = scoped_run.expect("retire always scopes a run");
+    let lineage = scoped_lineage;
+    let items = inventory
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("retention.inventory returned no `items` array"))?;
+    let matches: Vec<_> = items
+        .iter()
+        .filter(|item| {
+            item.get("runId") == Some(&json!(run))
+                && lineage.is_none_or(|id| item.get("lineageId") == Some(&json!(id)))
+                && item.get("disposition") == Some(&json!("eligible"))
+        })
+        .collect();
+    if lineage.is_none() && inventory.get("truncated") == Some(&Value::Bool(true)) {
+        bail!("that run has more than 128 registered lineages; repeat with --lineage-id");
+    }
+    if matches.is_empty() {
+        bail!("no eligible worktree matches that completed run; inspect `acp worktree list`");
+    }
+    if matches.len() != 1 {
+        bail!(
+            "more than one lineage is eligible; repeat with --lineage-id from `acp worktree list`"
+        );
+    }
+    let item = matches[0];
+    if confirm.is_none() {
+        print_json(item)?;
+        println!("preview only; repeat with --confirm <confirmationToken> to retire resumability and move this exact clean registered tree to recoverable Trash");
+        return Ok(EXIT_OK);
+    }
+    let preview_token = confirm.expect("checked confirmation token");
+    let expected_seq = preview_token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| {
+            anyhow!("invalid preview token; request a fresh `acp worktree retire` preview")
+        })?
+        .parse::<u64>()
+        .context("invalid preview token sequence; request a fresh preview")?;
+    let request_id = uuid::Uuid::new_v4();
+    let result = client
+        .call(
+            "retention.retire",
+            json!({
+                "requestId": request_id,
+                "runId": item["runId"],
+                "lineageId": item["lineageId"],
+                "expectedSeq": expected_seq,
+                "worktree": item["worktree"],
+                "branch": item["branch"],
+                "integratedSha": item["integratedSha"],
+                "previewToken": preview_token,
+            }),
+        )
+        .await?;
+    print_json(&result)?;
+    Ok(EXIT_OK)
+}
+
 fn print_json(value: &Value) -> anyhow::Result<()> {
     let mut out = io::stdout().lock();
     serde_json::to_writer_pretty(&mut out, value).context("encoding the daemon response")?;
@@ -1993,6 +2298,10 @@ struct Prunable {
     repo_root: PathBuf,
     path: PathBuf,
     reason: String,
+    run_id: RunId,
+    lineage_id: agent_control_plane::core::types::LineageId,
+    branch: String,
+    integrated_sha: String,
 }
 
 /// `acp gc [--closed]`.
@@ -2008,7 +2317,7 @@ async fn gc(repo: Option<&Path>, closed: bool) -> anyhow::Result<i32> {
     let places = Places::locate(repo).await?;
     let registry = Registry::open(&places.state_dir)
         .with_context(|| format!("reading the event log in {}", places.state_dir.display()))?;
-    let candidates = prunable(&registry);
+    let candidates = prunable(&registry, &places.state_dir).await;
 
     if candidates.is_empty() {
         println!(
@@ -2034,7 +2343,39 @@ async fn gc(repo: Option<&Path>, closed: bool) -> anyhow::Result<i32> {
 
     let mut failures = 0;
     for candidate in &candidates {
-        match git::remove_worktree(&candidate.repo_root, &candidate.path, true).await {
+        let result = async {
+            let ticket = if tokio::fs::symlink_metadata(&candidate.path).await.is_ok() {
+                Some(
+                    git::prepare_closed_retirement(
+                        &candidate.repo_root,
+                        &candidate.path,
+                        &candidate.integrated_sha,
+                        &candidate.branch,
+                        &places.state_dir,
+                        git::RetirementTarget::new(&candidate.run_id.to_string(), &candidate.lineage_id.to_string()),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            git::quarantine_and_remove_worktree(
+                &candidate.repo_root,
+                &candidate.path,
+                &candidate.integrated_sha,
+                &places.state_dir,
+                &candidate.branch,
+                git::RetirementTarget::new(
+                    &candidate.run_id.to_string(),
+                    &candidate.lineage_id.to_string(),
+                ),
+                ticket,
+            )
+            .await
+            .map(|_| ())
+        }
+        .await;
+        match result {
             Ok(()) => println!("pruned {}", candidate.path.display()),
             Err(err) => {
                 failures += 1;
@@ -2050,31 +2391,116 @@ async fn gc(repo: Option<&Path>, closed: bool) -> anyhow::Result<i32> {
     Ok(if failures == 0 { EXIT_OK } else { EXIT_FAILED })
 }
 
-fn prunable(registry: &Registry) -> Vec<Prunable> {
+async fn prunable(registry: &Registry, state_dir: &Path) -> Vec<Prunable> {
     let mut out = Vec::new();
     for run in registry.runs() {
-        let retired: Vec<PathBuf> = registry
-            .events(&run.run_id, None, usize::MAX)
+        let events = registry.events(&run.run_id, None, usize::MAX);
+        let retired: Vec<(PathBuf, u64)> = events
             .iter()
             .filter_map(|event| match &event.payload {
                 agent_control_plane::core::types::EventPayload::WorktreeRetired {
                     path, ..
-                } => Some(path.clone()),
+                } => Some((path.clone(), event.base.seq)),
+                _ => None,
+            })
+            .collect();
+        let created: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                agent_control_plane::core::types::EventPayload::WorktreeCreated {
+                    lineage_id,
+                    path,
+                    branch,
+                    ..
+                } => Some((*lineage_id, path.clone(), branch.clone())),
                 _ => None,
             })
             .collect();
         let worktrees = run.repo_root.join(".acp").join("worktrees");
         for lineage in run.lineages.iter().filter(|l| l.closed) {
-            if !retired.contains(&lineage.worktree)
-                || !lineage.worktree.starts_with(&worktrees)
-                || !lineage.worktree.exists()
+            let Some((_, _, branch)) = created
+                .iter()
+                .find(|(id, path, _)| id == &lineage.lineage_id && path == &lineage.worktree)
+            else {
+                continue;
+            };
+            let Some(retired_seq) = retired
+                .iter()
+                .filter_map(|(path, seq)| (path == &lineage.worktree).then_some(*seq))
+                .max()
+            else {
+                continue;
+            };
+            // Integrated cleanup uses integrate.committed. A lineage retired after exhausting its
+            // strikes was never integrated; bind that route to its immutable worktree.created
+            // base commit. prepare_retirement rechecks the branch, registration and bytes before
+            // anything moves, so an advanced or reused worktree remains preserved.
+            let integrated_for_lineage = events.iter().any(|event| matches!(
+                &event.payload,
+                agent_control_plane::core::types::EventPayload::IntegrateCommitted {
+                    worktree, ..
+                } if worktree == &lineage.worktree
+            ));
+            let recorded_sha = events.iter().rev().find_map(|event| {
+                if event.base.seq >= retired_seq {
+                    return None;
+                }
+                match &event.payload {
+                    agent_control_plane::core::types::EventPayload::IntegrateCommitted {
+                        worktree,
+                        sha,
+                        ..
+                    } if worktree == &lineage.worktree => Some(sha.clone()),
+                    _ => None,
+                }
+            }).or_else(|| (!integrated_for_lineage).then(|| events.iter().find_map(|event| match &event.payload {
+                agent_control_plane::core::types::EventPayload::WorktreeCreated {
+                    lineage_id,
+                    path,
+                    base_sha,
+                    ..
+                } if lineage_id == &lineage.lineage_id && path == &lineage.worktree => {
+                    Some(base_sha.clone())
+                }
+                _ => None,
+            })).flatten());
+            let Some(integrated_sha) = recorded_sha else { continue; };
+            let identity = git::retirement_identity_path(
+                state_dir,
+                &run.run_id.to_string(),
+                &lineage.lineage_id.to_string(),
+            );
+            let complete = git::retirement_complete(
+                state_dir,
+                &run.repo_root,
+                &run.run_id.to_string(),
+                &lineage.lineage_id.to_string(),
+            );
+            if !lineage.worktree.starts_with(&worktrees)
+                || (!lineage.worktree.exists() && !identity.exists())
+                || (!lineage.worktree.exists() && complete)
                 || !registry.live_writers(&lineage.worktree).is_empty()
             {
                 continue;
             }
+            if lineage.worktree.exists() {
+                if !identity.exists() {
+                    eprintln!("gc: retained {} because its original worktree identity was never recorded; inspect the checkout manually", lineage.worktree.display());
+                    continue;
+                }
+                if let Err(error) = git::verify_closed_worktree(&run.repo_root, &lineage.worktree,
+                    state_dir, &run.run_id.to_string(), &lineage.lineage_id.to_string()).await {
+                    eprintln!("gc: retained {}: {error}", lineage.worktree.display());
+                    continue;
+                }
+            }
             out.push(Prunable {
                 repo_root: run.repo_root.clone(),
                 path: lineage.worktree.clone(),
+                run_id: run.run_id,
+                lineage_id: lineage.lineage_id,
+                branch: branch.clone(),
+                integrated_sha,
                 reason: lineage
                     .closed_reason
                     .clone()
@@ -2809,9 +3235,7 @@ mod tests {
 
         // `doctor` only looks: it reports the missing entry and writes nothing.
         fs::write(&exclude, "# comment\n").expect("write");
-        let (reported, excluded) = exclude_status(repo.path())
-            .await
-            .expect("status");
+        let (reported, excluded) = exclude_status(repo.path()).await.expect("status");
         assert_eq!(reported, exclude, "the status names the file git reads");
         assert!(!excluded, "not excluded yet");
         assert_eq!(fs::read_to_string(&exclude).expect("read"), "# comment\n");
@@ -2842,8 +3266,7 @@ mod tests {
 
         let text = format!("{err:#}");
         assert!(
-            text.contains(&exclude.display().to_string())
-                && text.contains("printf '.acp/\\n' >>"),
+            text.contains(&exclude.display().to_string()) && text.contains("printf '.acp/\\n' >>"),
             "the refusal names the file and the by-hand remedy: {text}"
         );
         assert!(!exclude.exists(), "nothing was written");

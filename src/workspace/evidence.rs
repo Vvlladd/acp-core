@@ -1738,6 +1738,7 @@ mod tests {
             summary: huge.clone(),
             commands: vec![],
             failures: vec![],
+            blockers: vec![],
             diff_hash: "f".repeat(64),
         };
         let prompts = [

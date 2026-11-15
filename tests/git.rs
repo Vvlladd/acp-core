@@ -1366,3 +1366,139 @@ fn a_repository_that_ignores_the_exec_bit_renders_one_mode_on_both_sides() {
         );
     });
 }
+
+#[test]
+fn source_inventory_binds_tracked_untracked_ignored_deletions_and_symlink_itself() {
+    with_real_git(|| async {
+        let repo = init_repo();
+        fs::write(repo.path().join("tracked.txt"), "one\n").expect("tracked");
+        fs::write(repo.path().join(".gitignore"), "ignored.txt\nignored/\n").expect("ignore");
+        run_git(repo.path(), &["add", "tracked.txt", ".gitignore"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "sources"]);
+
+        let original = git::source_inventory_hash(repo.path()).await.expect("original inventory");
+        fs::write(repo.path().join("tracked.txt"), "two\n").expect("modify tracked");
+        let modified = git::source_inventory_hash(repo.path()).await.expect("modified inventory");
+        assert_ne!(original, modified, "an unchanged-patch tracked edit must change identity");
+
+        fs::write(repo.path().join("new.txt"), "new\n").expect("untracked");
+        fs::set_permissions(repo.path().join("new.txt"), fs::Permissions::from_mode(0o644))
+            .expect("stable initial ordinary file permissions");
+        let added = git::source_inventory_hash(repo.path()).await.expect("added inventory");
+        assert_ne!(modified, added);
+        fs::set_permissions(repo.path().join("new.txt"), fs::Permissions::from_mode(0o600))
+            .expect("change ordinary file permissions");
+        let permission_changed = git::source_inventory_hash(repo.path()).await
+            .expect("ordinary file permission inventory");
+        assert_ne!(added, permission_changed, "ordinary file permission changes must be bound");
+        fs::remove_file(repo.path().join("new.txt")).expect("remove untracked");
+        assert_eq!(git::source_inventory_hash(repo.path()).await.unwrap(), modified);
+
+        fs::remove_file(repo.path().join("tracked.txt")).expect("delete tracked");
+        let deleted = git::source_inventory_hash(repo.path()).await.expect("deleted inventory");
+        assert_ne!(modified, deleted);
+
+        fs::write(repo.path().join("ignored.txt"), "irrelevant\n").expect("ignored");
+        let ignored = git::source_inventory_hash(repo.path()).await.expect("ignored inventory");
+        assert_ne!(ignored, deleted, "ignored host-check inputs must be bound");
+        fs::write(repo.path().join("ignored.txt"), "changed\n").expect("change ignored");
+        let ignored_changed = git::source_inventory_hash(repo.path()).await.expect("changed ignored inventory");
+        assert_ne!(ignored, ignored_changed, "changes to ignored inputs must be bound");
+
+        fs::create_dir(repo.path().join("ignored")).expect("empty ignored directory");
+        fs::set_permissions(repo.path().join("ignored"), fs::Permissions::from_mode(0o755))
+            .expect("stable initial directory mode");
+        let ignored_empty = git::source_inventory_hash(repo.path()).await
+            .expect("empty ignored directory inventory");
+        assert_ne!(ignored_changed, ignored_empty, "empty ignored directories are host-check inputs");
+        fs::set_permissions(repo.path().join("ignored"), fs::Permissions::from_mode(0o700))
+            .expect("change ignored directory mode");
+        let ignored_mode = git::source_inventory_hash(repo.path()).await
+            .expect("ignored directory mode inventory");
+        assert_ne!(ignored_empty, ignored_mode, "directory permission changes must be bound");
+        fs::remove_dir(repo.path().join("ignored")).expect("remove empty ignored directory");
+        assert_eq!(git::source_inventory_hash(repo.path()).await.unwrap(), ignored_changed,
+            "removing the empty directory restores the prior identity");
+
+        fs::create_dir_all(repo.path().join("ignored/nested")).expect("nested ignored directory");
+        fs::write(repo.path().join("ignored/nested/input.txt"), "nested\n").expect("nested ignored");
+        let ignored_nested = git::source_inventory_hash(repo.path()).await.expect("nested ignored inventory");
+        assert_ne!(ignored_changed, ignored_nested, "nested ignored inputs must be bound");
+        fs::remove_dir_all(repo.path().join("ignored")).expect("remove nested ignored");
+        assert_eq!(
+            git::source_inventory_hash(repo.path()).await.unwrap(),
+            ignored_changed,
+            "removing nested ignored inputs restores the prior identity"
+        );
+
+        std::os::unix::fs::symlink("/outside/secret", repo.path().join("link")).expect("symlink");
+        let link_one = git::source_inventory_hash(repo.path()).await.expect("safe link inventory");
+        fs::remove_file(repo.path().join("link")).expect("unlink");
+        std::os::unix::fs::symlink("/another/outside", repo.path().join("link")).expect("symlink");
+        let link_two = git::source_inventory_hash(repo.path()).await.expect("safe link inventory");
+        assert_ne!(link_one, link_two, "hash the target bytes without following them");
+        fs::remove_file(repo.path().join("link")).expect("remove second link");
+
+        let fifo = std::ffi::CString::new(
+            repo.path().join("pipe").as_os_str().as_encoded_bytes(),
+        ).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let special = git::source_inventory_hash(repo.path()).await.expect_err("fifo must be refused");
+        assert!(special.to_string().contains("special file"), "{special}");
+        fs::remove_file(repo.path().join("pipe")).expect("remove fifo");
+
+        fs::create_dir_all(repo.path().join("nested/.git")).expect("nested repository marker");
+        let nested = git::source_inventory_hash(repo.path()).await
+            .expect_err("unsupported nested repository must be refused");
+        assert!(nested.to_string().contains("nested repository"), "{nested}");
+    });
+}
+
+#[test]
+fn source_inventory_binds_initialized_submodule_head_and_dirty_sources() {
+    with_real_git(|| async {
+        let child = init_repo();
+        fs::write(child.path().join("source.txt"), "one\n").expect("child source");
+        run_git(child.path(), &["add", "source.txt"]);
+        run_git(child.path(), &["commit", "--quiet", "-m", "source"]);
+        let repo = init_repo();
+        fs::create_dir(repo.path().join("vendor")).expect("vendor directory");
+        let checkout = repo.path().join("vendor/child");
+        let checkout_arg = checkout.to_str().expect("UTF-8 temp path");
+        run_git(child.path(), &["worktree", "add", "--quiet", "--detach", checkout_arg, "HEAD"]);
+        let child_head = run_git(child.path(), &["rev-parse", "HEAD"]);
+        let cacheinfo = format!("160000,{},vendor/child", child_head.trim());
+        run_git(repo.path(), &["update-index", "--add", "--cacheinfo", &cacheinfo]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "submodule"]);
+
+        let original = git::source_inventory_hash(repo.path()).await.expect("initialized submodule");
+        fs::write(repo.path().join("vendor/child/source.txt"), "two\n").expect("dirty tracked");
+        let dirty = git::source_inventory_hash(repo.path()).await.expect("dirty tracked submodule");
+        assert_ne!(original, dirty);
+        fs::write(repo.path().join("vendor/child/untracked.txt"), "visible\n").expect("dirty untracked");
+        let untracked = git::source_inventory_hash(repo.path()).await.expect("untracked submodule source");
+        assert_ne!(dirty, untracked);
+
+        fs::write(repo.path().join("vendor/child/.gitignore"), "generated/\n").expect("child ignore");
+        fs::create_dir(repo.path().join("vendor/child/generated")).expect("ignored child directory");
+        fs::write(repo.path().join("vendor/child/generated/input.txt"), "ignored input\n").expect("ignored child input");
+        let ignored = git::source_inventory_hash(repo.path()).await.expect("ignored submodule source");
+        assert_ne!(untracked, ignored, "ignored inputs in populated submodules must be bound");
+        fs::write(repo.path().join("vendor/child/generated/input.txt"), "changed input\n").expect("change ignored child input");
+        let ignored_changed = git::source_inventory_hash(repo.path()).await.expect("changed ignored submodule source");
+        assert_ne!(ignored, ignored_changed);
+
+        fs::remove_file(repo.path().join("vendor/child/untracked.txt")).unwrap();
+        run_git(repo.path().join("vendor/child").as_path(), &["add", "source.txt"]);
+        run_git(repo.path().join("vendor/child").as_path(), &["commit", "--quiet", "-m", "changed head"]);
+        let changed_head = git::source_inventory_hash(repo.path()).await.expect("changed checked-out head");
+        assert_ne!(dirty, changed_head);
+
+        fs::remove_dir_all(repo.path().join("vendor/child")).expect("remove checkout");
+        let missing = git::source_inventory_hash(repo.path()).await.expect("missing submodule is explicit");
+        assert_ne!(changed_head, missing);
+        fs::create_dir_all(repo.path().join("vendor/child")).expect("uninitialized directory");
+        let error = git::source_inventory_hash(repo.path()).await.expect_err("present uninitialized submodule is refused");
+        assert!(error.to_string().contains("uninitialized"), "{error}");
+    });
+}

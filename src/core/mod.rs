@@ -15,16 +15,17 @@
 //! T35 filled in the dispatch: every arm that decides something now calls into [`r#loop`], which
 //! owns the branch table and is the only thing that turns a finished attempt into the next step.
 
-mod cancellation;
 mod caller_scope;
-mod local_checks;
+mod cancellation;
 pub mod gates;
 pub mod handoff;
 pub mod lifecycle;
-pub mod recovery;
+mod local_checks;
 pub mod plan;
 pub mod policy;
+pub mod recovery;
 pub mod registry;
+pub mod retention;
 pub mod supervisor;
 pub mod team;
 pub mod types;
@@ -39,7 +40,7 @@ use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -51,8 +52,9 @@ use crate::core::supervisor::{
 };
 use crate::core::types::{
     AgentHandle, AgentId, AgentStatus, Attempt, AttemptError, AttemptId, AttemptStatus, CancelBy,
-    Event, EventPayload, Gate, GateId, GateStatus, HandoffEnvelope, LineageId, LoopBranch,
+    Event, EventPayload, ExternalVerificationEvidence, Gate, GateId, GateStatus, HandoffEnvelope, LineageId, LoopBranch,
     LoopState, ProviderName, RoleName, RolesConfig, Run, RunId, RunStatus, Task, TokenUsage,
+    SourceInventoryRequest, SourceInventorySnapshot,
 };
 use crate::workspace::git::{self, GitError};
 
@@ -131,20 +133,54 @@ pub struct LeadSetup {
 ///   at its own variant.
 #[derive(Debug)]
 pub enum Command {
-    CheckStart { request: crate::checks::Request, reply: Reply<crate::checks::Summary> },
-    CheckCancel { id: uuid::Uuid, reply: Reply<crate::checks::Summary> },
-    CheckFinished { id: uuid::Uuid, result: Result<(crate::checks::Report, String), String> },
-    CheckList { offset: usize, reply: Reply<serde_json::Value> },
+    CheckStart {
+        request: crate::checks::Request,
+        reply: Reply<crate::checks::Summary>,
+    },
+    CheckCancel {
+        id: uuid::Uuid,
+        reply: Reply<crate::checks::Summary>,
+    },
+    CheckFinished {
+        id: uuid::Uuid,
+        result: Result<(crate::checks::Report, String), String>,
+    },
+    CheckList {
+        offset: usize,
+        reply: Reply<serde_json::Value>,
+    },
     /// Keeps admission alive when a caller disconnects after enqueueing its command.
-    Admitted { command: Box<Command>, admission: Arc<lifecycle::ActivityGuard> },
+    Admitted {
+        command: Box<Command>,
+        admission: Arc<lifecycle::ActivityGuard>,
+    },
     /// Proxy-supplied provenance, outside the model's tool arguments. Restricts no-builder leads.
-    CallerScoped { command: Box<Command>, caller_run_id: RunId },
+    CallerScoped {
+        command: Box<Command>,
+        caller_run_id: RunId,
+    },
     Lifecycle {
         request: lifecycle::Request,
         reply: Reply<lifecycle::Status>,
     },
-    RecoveryPreview { run: RunId, reply: Reply<recovery::Preview> },
-    RecoverRun { request: recovery::Request, by: Actor, reply: Reply<recovery::Outcome> },
+    RecoveryPreview {
+        run: RunId,
+        reply: Reply<recovery::Preview>,
+    },
+    RecoverRun {
+        request: recovery::Request,
+        by: Actor,
+        reply: Reply<recovery::Outcome>,
+    },
+    RetentionInventory {
+        query: retention::InventoryQuery,
+        reply: Reply<retention::Inventory>,
+    },
+    RetireWorktree {
+        request: retention::Request,
+        by: Actor,
+        reply: Reply<retention::Outcome>,
+    },
     LeadStart {
         task: Task,
         message: String,
@@ -157,8 +193,14 @@ pub enum Command {
         caller_run_id: Option<RunId>,
         reply: Reply<PlanStartOut>,
     },
-    AuditCaptured { run: RunId, result: Result<git::audit::Snapshot, GitError> },
-    AuditValidated { run: RunId, result: Result<(), GitError> },
+    AuditCaptured {
+        run: RunId,
+        result: Result<git::audit::Snapshot, GitError>,
+    },
+    AuditValidated {
+        run: RunId,
+        result: Result<(), GitError>,
+    },
     /// B3: start a plan (socket `plan.start`, MCP `submit_plan`, CLI `acp plan`).
     StartPlan {
         plan: crate::core::plan::Plan,
@@ -204,6 +246,16 @@ pub enum Command {
         by: Actor,
         reply: Reply<GateResolution>,
     },
+    SourceInventory {
+        request: SourceInventoryRequest,
+        reply: Reply<SourceInventorySnapshot>,
+    },
+    PrepareExternalVerification {
+        run_id: RunId,
+        evidence: ExternalVerificationEvidence,
+        by: Actor,
+        reply: Reply<ExternalVerificationOut>,
+    },
 
     // Completions posted by helper tasks so the mailbox never awaits slow I/O (decision 11).
     WorktreeReady {
@@ -223,6 +275,26 @@ pub enum Command {
     CommitDone {
         gate: GateId,
         result: Result<String, GitError>,
+    },
+    SourceInventoryReady {
+        request_id: uuid::Uuid,
+        result: Result<String, GitError>,
+    },
+    ExternalVerificationReady {
+        request_id: uuid::Uuid,
+        result: Result<String, GitError>,
+        guard: OwnedMutexGuard<()>,
+    },
+    RetirementPrepared {
+        request: retention::Request,
+        already_retired: bool,
+        result: Result<retention::Prepared, GitError>,
+    },
+    RetirementRemoved {
+        request: retention::Request,
+        already_retired: bool,
+        preserved_ref: String,
+        result: Result<git::RetirementResult, GitError>,
     },
     /// `git status --porcelain` of an inherited worktree, read off the actor for 17c's retry prompt
     /// (decision 8).
@@ -479,6 +551,18 @@ pub struct GateOut {
     pub human_action: String,
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub struct ExternalVerificationOut {
+    pub gate_id: GateId,
+    pub resolution: GateResolution,
+}
+
+enum ExternalCapture {
+    Prepare { run_id: RunId, evidence: Box<ExternalVerificationEvidence>, by: Actor,
+        worktree: PathBuf, reply: Reply<ExternalVerificationOut> },
+    ApprovePending { gate: GateId, by: Actor, worktree: PathBuf, reply: Reply<GateResolution> },
+}
+
 /// The one sentence that tells a lead how a gate gets approved (design, § Data Flow step 16).
 #[must_use]
 pub fn human_action(gate: &GateId) -> String {
@@ -551,6 +635,8 @@ pub struct Core {
     tx: mpsc::Sender<Command>,
     waiters: HashMap<AgentId, Vec<Waiter>>,
     gate_waiters: HashMap<GateId, Reply<GateResolution>>,
+    pending_source_inventory: HashMap<uuid::Uuid, (SourceInventoryRequest, PathBuf, Reply<SourceInventorySnapshot>)>,
+    pending_external_verification: HashMap<uuid::Uuid, ExternalCapture>,
     /// Attempts whose branch **completed**: the log holds their `loop.dispatched` marker. Seeded in
     /// [`Core::new`] from the markers in the replayed log, so a restart re-drives exactly the
     /// branches that never finished, and extended only by [`Core::finish_dispatch`] once a marker
@@ -596,6 +682,7 @@ pub struct Core {
     settled: Vec<(GateId, GateResolution)>,
     /// Durable socket continuations recovered before their precise dispatch completed.
     pending_budget_continuations: Vec<(RunId, crate::core::types::BudgetContinuationAction)>,
+    retention_waiters: HashMap<uuid::Uuid, Reply<retention::Outcome>>,
     /// Why the actor must stop, once it must.
     ///
     /// There is one such reason: the event log — "the only durable truth" — could not be written
@@ -643,6 +730,8 @@ impl Core {
             tx,
             waiters: HashMap::new(),
             gate_waiters: HashMap::new(),
+            pending_source_inventory: HashMap::new(),
+            pending_external_verification: HashMap::new(),
             dispatched,
             in_flight: HashSet::new(),
             pending_worktree: HashMap::new(),
@@ -653,6 +742,7 @@ impl Core {
             pending_audit: HashMap::new(),
             settled: Vec::new(),
             pending_budget_continuations: Vec::new(),
+            retention_waiters: HashMap::new(),
             driving_plans: false,
             reconciled: false,
             fatal: None,
@@ -670,7 +760,12 @@ impl Core {
     /// A handle onto this core's mailbox and event stream, for the MCP and socket doors.
     #[must_use]
     pub fn handle(&self) -> CoreHandle {
-        CoreHandle(self.tx.clone(), self.registry.event_sender(), Arc::clone(&self.lifecycle.ingress), None)
+        CoreHandle(
+            self.tx.clone(),
+            self.registry.event_sender(),
+            Arc::clone(&self.lifecycle.ingress),
+            None,
+        )
     }
 
     /// The mailbox sender, for the tick task and the supervisor-signal forwarder.
@@ -718,23 +813,45 @@ impl Core {
     /// the SIGKILL in a detached task rather than sleeping out the grace period.
     pub async fn handle_command(&mut self, cmd: Command) {
         let (cmd, _admission) = cmd.into_unwrapped();
-        let Some(cmd) = self.admit_caller_scope(cmd) else { return; };
-        let Some(cmd) = self.admit_during_cancellation(cmd) else { return; };
+        let Some(cmd) = self.admit_caller_scope(cmd) else {
+            return;
+        };
+        let Some(cmd) = self.admit_during_cancellation(cmd) else {
+            return;
+        };
         match cmd {
-            Command::CheckStart { request, reply } => { let result = self.start_check(request); let _ = reply.send(result); }
-            Command::CheckCancel { id, reply } => { let result = self.cancel_check(id); let _ = reply.send(result); }
+            Command::CheckStart { request, reply } => {
+                let result = self.start_check(request);
+                let _ = reply.send(result);
+            }
+            Command::CheckCancel { id, reply } => {
+                let result = self.cancel_check(id);
+                let _ = reply.send(result);
+            }
             Command::CheckFinished { id, result } => self.finish_check(id, result),
             Command::CheckList { offset, reply } => self.list_checks(offset, reply),
-            Command::Admitted { .. } | Command::CallerScoped { .. } => unreachable!("unwrapped above"),
+            Command::Admitted { .. } | Command::CallerScoped { .. } => {
+                unreachable!("unwrapped above")
+            }
             Command::Lifecycle { request, reply } => {
                 let out = self.lifecycle_request(request).await;
                 let _ = reply.send(out);
             }
-            Command::RecoveryPreview { run, reply } => { let _ = reply.send(self.recovery_preview(run)); }
+            Command::RecoveryPreview { run, reply } => {
+                let _ = reply.send(self.recovery_preview(run));
+            }
             Command::RecoverRun { request, by, reply } => {
                 let out = self.recover_run(request, by);
                 let _ = reply.send(out);
                 self.after_turn().await;
+            }
+            Command::RetentionInventory { query, reply } => {
+                let _ = reply.send(Ok(self.retention_inventory(&query)));
+            }
+            Command::RetireWorktree { request, by, reply } => {
+                if let Err((reply, error)) = self.begin_retirement(request, by, reply) {
+                    let _ = reply.send(Err(error));
+                }
             }
             // -- doors ------------------------------------------------------
             Command::LeadStart {
@@ -749,8 +866,15 @@ impl Core {
                 let _ = reply.send(out);
                 self.after_turn().await;
             }
-            Command::AuditStart { task, selection, caller_run_id, reply } => {
-                let out = self.start_audit(task, selection, caller_run_id).map(|run_id| PlanStartOut { run_id });
+            Command::AuditStart {
+                task,
+                selection,
+                caller_run_id,
+                reply,
+            } => {
+                let out = self
+                    .start_audit(task, selection, caller_run_id)
+                    .map(|run_id| PlanStartOut { run_id });
                 let _ = reply.send(out);
                 self.after_turn().await;
             }
@@ -827,6 +951,14 @@ impl Core {
                 self.begin_resolve(gate, approve, feedback, by, reply);
                 self.after_turn().await;
             }
+            Command::SourceInventory { request, reply } => {
+                self.start_source_inventory(request, reply);
+                self.after_turn().await;
+            }
+            Command::PrepareExternalVerification { run_id, evidence, by, reply } => {
+                self.start_external_verification(run_id, evidence, by, reply);
+                self.after_turn().await;
+            }
 
             // -- helper-task completions (decision 11) ----------------------
             Command::WorktreeReady { lineage, result } => {
@@ -844,6 +976,30 @@ impl Core {
             Command::CommitDone { gate, result } => {
                 self.finish_commit(gate, result);
                 self.after_turn().await;
+            }
+            Command::SourceInventoryReady { request_id, result } => {
+                self.finish_source_inventory(request_id, result);
+                self.after_turn().await;
+            }
+            Command::ExternalVerificationReady { request_id, result, guard } => {
+                self.finish_external_verification(request_id, result, guard);
+                self.after_turn().await;
+            }
+            Command::RetirementPrepared {
+                request,
+                already_retired,
+                result,
+            } => {
+                self.retirement_prepared(request, already_retired, result);
+                self.after_turn().await;
+            }
+            Command::RetirementRemoved {
+                request,
+                already_retired,
+                preserved_ref,
+                result,
+            } => {
+                self.retirement_removed(request, already_retired, preserved_ref, result);
             }
             Command::RetryFreshReady { agent, porcelain } => {
                 self.on_retry_fresh_ready(&agent, porcelain);
@@ -1066,7 +1222,12 @@ impl Core {
             {
                 Ok(()) => cancelled = true,
                 Err(supervisor::SupervisorError::SignalRefused(_)) => {
-                    return Err(CoreError::Lifecycle { code: "cancel_failed", reason: format!("the operating system refused the stop signal for attempt {attempt}") });
+                    return Err(CoreError::Lifecycle {
+                        code: "cancel_failed",
+                        reason: format!(
+                            "the operating system refused the stop signal for attempt {attempt}"
+                        ),
+                    });
                 }
                 Err(err) => tracing::debug!(%attempt, %err, "nothing to cancel"),
             }
@@ -1091,6 +1252,21 @@ impl Core {
         by: Actor,
         reply: Reply<GateResolution>,
     ) {
+        if approve && matches!(&by, Actor::Socket { .. }) && self.registry.gate(&gate).is_some_and(|g|
+            g.kind == types::GateKind::ExternalVerification && g.status == GateStatus::Pending) {
+            if self.pending_external_verification.values().any(|p| matches!(p,
+                ExternalCapture::ApprovePending { gate: existing, .. } if *existing == gate)) {
+                let _ = reply.send(Err(PolicyError::new(PolicyCode::WorktreeBusy,
+                    "external-verification approval is already capturing this checkout").into()));
+                return;
+            }
+            let (worktree, _) = match gates::pending_external_target(&self.registry, gate) {
+                Ok(target) => target,
+                Err(err) => { let _ = reply.send(Err(err)); return; }
+            };
+            self.start_external_capture(worktree.clone(), ExternalCapture::ApprovePending { gate, by, worktree, reply });
+            return;
+        }
         match gates::begin_resolve(
             &mut self.registry,
             &gate,
@@ -1141,6 +1317,167 @@ impl Core {
         }
     }
 
+    fn start_source_inventory(
+        &mut self,
+        request: SourceInventoryRequest,
+        reply: Reply<SourceInventorySnapshot>,
+    ) {
+        let (worktree, _) = match gates::external_inventory_target(&self.registry, &request) {
+            Ok(path) => path,
+            Err(err) => { let _ = reply.send(Err(err)); return; }
+        };
+        let request_id = uuid::Uuid::new_v4();
+        self.pending_source_inventory.insert(request_id, (request, worktree.clone(), reply));
+        let tx = self.tx.clone();
+        let lock = self.supervisor.worktree_lock(&worktree);
+        tokio::spawn(async move {
+            let _serialized = lock.lock_owned().await;
+            let result = match tokio::time::timeout(git::GIT_OP_TIMEOUT, git::source_inventory_hash(&worktree)).await {
+                Ok(result) => result,
+                Err(_) => Err(GitError::Timeout { op: "source_inventory", secs: git::GIT_OP_TIMEOUT.as_secs() }),
+            };
+            let _ = tx.send(Command::SourceInventoryReady { request_id, result }).await;
+        });
+    }
+
+    fn finish_source_inventory(&mut self, request_id: uuid::Uuid, result: Result<String, GitError>) {
+        let Some((request, original_worktree, reply)) = self.pending_source_inventory.remove(&request_id) else { return; };
+        let answer = (|| {
+            let (current_worktree, frozen_inventory) = gates::external_inventory_target(&self.registry, &request)?;
+            if current_worktree != original_worktree {
+                return Err(PolicyError::new(PolicyCode::DelegationNotAllowed, "builder worktree changed while source inventory was captured").into());
+            }
+            let hash = result?;
+            if hash != frozen_inventory {
+                return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
+                    "checkout source differs from the inventory captured with the frozen diff").into());
+            }
+            Ok(SourceInventorySnapshot {
+                run_id: request.run_id,
+                builder_attempt_id: request.builder_attempt_id,
+                diff_hash: request.diff_hash,
+                run_seq: request.expected_run_seq,
+                hash,
+            })
+        })();
+        let _ = reply.send(answer);
+    }
+
+    fn start_external_verification(
+        &mut self,
+        run_id: RunId,
+        evidence: ExternalVerificationEvidence,
+        by: Actor,
+        reply: Reply<ExternalVerificationOut>,
+    ) {
+        if !matches!(&by, Actor::Socket { .. }) {
+            let _ = reply.send(Err(PolicyError::new(PolicyCode::AgentApproveNotAllowed,
+                "external verification is a socket-only human action").into()));
+            return;
+        }
+        let request = SourceInventoryRequest {
+            run_id,
+            builder_attempt_id: evidence.builder_attempt_id,
+            diff_hash: evidence.diff_hash.clone(),
+            expected_run_seq: evidence.expected_run_seq,
+        };
+        let (worktree, _) = match gates::external_inventory_target(&self.registry, &request) {
+            Ok(path) => path,
+            Err(err) => { let _ = reply.send(Err(err)); return; }
+        };
+        self.start_external_capture(worktree.clone(), ExternalCapture::Prepare {
+            run_id, evidence: Box::new(evidence), by, worktree, reply });
+    }
+
+    fn start_external_capture(&mut self, worktree: PathBuf, capture: ExternalCapture) {
+        let request_id = uuid::Uuid::new_v4();
+        self.pending_external_verification.insert(request_id, capture);
+        let tx = self.tx.clone();
+        let lock = self.supervisor.worktree_lock(&worktree);
+        tokio::spawn(async move {
+            let guard = lock.lock_owned().await;
+            let result = match tokio::time::timeout(git::GIT_OP_TIMEOUT, git::source_inventory_hash(&worktree)).await {
+                Ok(result) => result,
+                Err(_) => Err(GitError::Timeout { op: "source_inventory", secs: git::GIT_OP_TIMEOUT.as_secs() }),
+            };
+            let _ = tx.send(Command::ExternalVerificationReady { request_id, result, guard }).await;
+        });
+    }
+
+    fn finish_external_verification(
+        &mut self,
+        request_id: uuid::Uuid,
+        result: Result<String, GitError>,
+        guard: OwnedMutexGuard<()>,
+    ) {
+        let Some(capture) = self.pending_external_verification.remove(&request_id) else { return; };
+        let (run_id, evidence, by, original_worktree, reply) = match capture {
+            ExternalCapture::Prepare { run_id, evidence, by, worktree, reply } => (run_id, *evidence, by, worktree, reply),
+            ExternalCapture::ApprovePending { gate, by, worktree, reply } => {
+                let answer = (|| {
+                    let (current, frozen_inventory) = gates::pending_external_target(&self.registry, gate)?;
+                    let captured = result?;
+                    if current != worktree || captured != frozen_inventory {
+                        return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
+                            "checkout changed after external evidence was prepared; approval refused").into());
+                    }
+                    match gates::approve_external_with_inventory(&mut self.registry, &gate, by,
+                        &self.roles, &captured, &guard)? {
+                        ResolveOutcome::Settled(resolution @ GateResolution::Approved { sha: None }) => {
+                            self.settled.push((gate, resolution.clone()));
+                            Ok(resolution)
+                        }
+                        _ => Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
+                            "pending external evidence did not settle without a commit").into()),
+                    }
+                })();
+                let _ = reply.send(answer);
+                return;
+            }
+        };
+        let request = SourceInventoryRequest {
+            run_id, builder_attempt_id: evidence.builder_attempt_id,
+            diff_hash: evidence.diff_hash.clone(), expected_run_seq: evidence.expected_run_seq,
+        };
+        let answer = (|| {
+            let (current_worktree, frozen_inventory) = gates::external_inventory_target(&self.registry, &request)?;
+            if current_worktree != original_worktree {
+                return Err(PolicyError::new(PolicyCode::DelegationNotAllowed, "builder worktree changed while external evidence was prepared").into());
+            }
+            let captured = result?;
+            if captured != frozen_inventory {
+                return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
+                    "checkout source differs from the inventory captured with the frozen diff").into());
+            }
+            if evidence.source_inventory_before_hash != evidence.source_inventory_after_hash {
+                return Err(PolicyError::new(PolicyCode::DelegationNotAllowed, "source inventory changed while host checks ran").into());
+            }
+            if captured != evidence.source_inventory_after_hash {
+                return Err(PolicyError::new(PolicyCode::DelegationNotAllowed, "submitted source inventory does not match the daemon's current checkout capture").into());
+            }
+            let summary = format!(
+                "Human host verification evidence for builder attempt {} and diff {}. This is an explicit attestation, not cryptographic proof that the commands ran.",
+                evidence.builder_attempt_id, evidence.diff_hash
+            );
+            let gate = gates::create_external_verification_gate(&mut self.registry, &run_id, NewGate {
+                kind: crate::core::types::GateKind::ExternalVerification,
+                summary,
+                requested_by: crate::core::types::Origin::ControlPlane,
+                payload: gates::GatePayload { external_verification: Some(evidence), ..gates::GatePayload::default() },
+            }, &captured)?;
+            let resolution = match gates::approve_external_with_inventory(
+                &mut self.registry, &gate.gate_id, by, &self.roles, &captured, &guard,
+            )? {
+                ResolveOutcome::Settled(resolution @ GateResolution::Approved { .. }) => resolution,
+                _ => return Err(PolicyError::new(PolicyCode::DelegationNotAllowed,
+                    "external verification did not settle as an approved commit-less gate").into()),
+            };
+            self.settled.push((gate.gate_id, resolution.clone()));
+            Ok(ExternalVerificationOut { gate_id: gate.gate_id, resolution })
+        })();
+        let _ = reply.send(answer);
+    }
+
     // -----------------------------------------------------------------------
     // Helper tasks — the only way slow I/O reaches the mailbox (decision 11)
     // -----------------------------------------------------------------------
@@ -1162,8 +1499,14 @@ impl Core {
         base_sha: String,
     ) -> JoinHandle<()> {
         let tx = self.tx.clone();
+        let ownership = self.pending_worktree.get(&lineage)
+            .map(|pending| (self.state_dir.clone(), pending.run()));
         tokio::spawn(async move {
-            let call = git::add_worktree(&repo, &path, &branch, &base_sha);
+            let call = async {
+                git::add_worktree(&repo, &path, &branch, &base_sha).await?;
+                Self::record_new_worktree(&repo, &path, lineage, ownership).await;
+                Ok::<(), GitError>(())
+            };
             let result = match tokio::time::timeout(git::GIT_OP_TIMEOUT, call).await {
                 Ok(Ok(())) => Ok(WorktreeInfo {
                     path,
@@ -1201,10 +1544,13 @@ impl Core {
         base_ref: String,
     ) -> JoinHandle<()> {
         let tx = self.tx.clone();
+        let ownership = self.pending_worktree.get(&lineage)
+            .map(|pending| (self.state_dir.clone(), pending.run()));
         tokio::spawn(async move {
             let call = async {
                 let base_sha = git::resolve_ref(&repo, &base_ref).await?;
                 git::add_worktree(&repo, &path, &branch, &base_sha).await?;
+                Self::record_new_worktree(&repo, &path, lineage, ownership).await;
                 Ok::<String, GitError>(base_sha)
             };
             let result = match tokio::time::timeout(git::GIT_OP_TIMEOUT, call).await {
@@ -1221,6 +1567,20 @@ impl Core {
             };
             let _ = tx.send(Command::WorktreeReady { lineage, result }).await;
         })
+    }
+
+    async fn record_new_worktree(
+        repo: &std::path::Path, path: &std::path::Path, lineage: LineageId,
+        ownership: Option<(PathBuf, RunId)>,
+    ) {
+        if let Some((state, run)) = ownership {
+            // A custom state directory may be unsuitable for durable cleanup proof. Building
+            // remains available; GC will preserve the checkout when that proof is absent.
+            if let Err(error) = git::record_original_worktree(repo, path, &state,
+                &run.to_string(), &lineage.to_string()).await {
+                tracing::warn!(%error, %lineage, "could not record original worktree identity");
+            }
+        }
     }
 
     /// Hash installed evidence off the actor, then return to the actor to recheck cancellation
@@ -1291,8 +1651,11 @@ impl Core {
         });
         tokio::spawn(async move {
             let call = async {
-                if let Some((repo, base)) = recovery { git::recovery_status(&repo, &worktree, &base).await }
-                else { git::status_porcelain(&worktree).await }
+                if let Some((repo, base)) = recovery {
+                    git::recovery_status(&repo, &worktree, &base).await
+                } else {
+                    git::status_porcelain(&worktree).await
+                }
             };
             let porcelain = match tokio::time::timeout(git::GIT_OP_TIMEOUT, call).await {
                 Ok(result) => result,
@@ -1545,6 +1908,7 @@ impl Core {
         }
         self.waiters.clear();
         self.gate_waiters.clear();
+        self.retention_waiters.clear();
     }
 }
 
@@ -1583,7 +1947,11 @@ fn recommended_next(
                 RecommendedNext::DelegateFresh
             }
         }
-        RunStatus::Running | RunStatus::Completed | RunStatus::Integrated | RunStatus::Cancelled | RunStatus::Failed => {}
+        RunStatus::Running
+        | RunStatus::Completed
+        | RunStatus::Integrated
+        | RunStatus::Cancelled
+        | RunStatus::Failed => {}
     }
     match agent.status {
         // Never auto-resumed (decision 4): the lead decides, and `send_message` is the resume door
@@ -1626,11 +1994,20 @@ fn clamp_untrusted(text: &str, max: usize) -> String {
 /// Cheap to clone — one `mpsc::Sender` and one `broadcast::Sender` — so every MCP tool call and
 /// every socket connection holds its own.
 #[derive(Clone)]
-pub struct CoreHandle(mpsc::Sender<Command>, broadcast::Sender<Arc<Event>>, Arc<lifecycle::Ingress>, Option<RunId>);
+pub struct CoreHandle(
+    mpsc::Sender<Command>,
+    broadcast::Sender<Arc<Event>>,
+    Arc<lifecycle::Ingress>,
+    Option<RunId>,
+);
 
 impl CoreHandle {
-    pub async fn check_start(&self, request: crate::checks::Request) -> Result<crate::checks::Summary, CoreError> {
-        self.ask(|reply| Command::CheckStart { request, reply }).await
+    pub async fn check_start(
+        &self,
+        request: crate::checks::Request,
+    ) -> Result<crate::checks::Summary, CoreError> {
+        self.ask(|reply| Command::CheckStart { request, reply })
+            .await
     }
     pub async fn check_cancel(&self, id: uuid::Uuid) -> Result<crate::checks::Summary, CoreError> {
         self.ask(|reply| Command::CheckCancel { id, reply }).await
@@ -1657,11 +2034,17 @@ impl CoreHandle {
         let (tx, rx) = oneshot::channel();
         let command = make(tx);
         let command = match self.3 {
-            Some(caller_run_id) => Command::CallerScoped { command: Box::new(command), caller_run_id },
+            Some(caller_run_id) => Command::CallerScoped {
+                command: Box::new(command),
+                caller_run_id,
+            },
             None => command,
         };
         self.0
-            .send(Command::Admitted { command: Box::new(command), admission: Arc::clone(&_request) })
+            .send(Command::Admitted {
+                command: Box::new(command),
+                admission: Arc::clone(&_request),
+            })
             .await
             .map_err(|_| CoreError::Unavailable)?;
         rx.await.map_err(|_| CoreError::Unavailable)?
@@ -1671,22 +2054,49 @@ impl CoreHandle {
         &self.2
     }
 
-    pub async fn lifecycle(&self, request: lifecycle::Request) -> Result<lifecycle::Status, CoreError> {
-        self.ask(|reply| Command::Lifecycle { request, reply }).await
+    pub async fn lifecycle(
+        &self,
+        request: lifecycle::Request,
+    ) -> Result<lifecycle::Status, CoreError> {
+        self.ask(|reply| Command::Lifecycle { request, reply })
+            .await
     }
 
     /// Starts a lead through the actor without exposing the operation on the MCP door. T58's
     /// socket method is the only external caller.
     pub async fn start_lead(&self, task: Task, message: String) -> Result<LeadStartOut, CoreError> {
-        self.start_lead_with_setup(task, message, LeadSetup::default()).await
+        self.start_lead_with_setup(task, message, LeadSetup::default())
+            .await
     }
 
-    pub async fn start_lead_with_setup(&self, task: Task, message: String, setup: LeadSetup) -> Result<LeadStartOut, CoreError> {
-        self.ask(|reply| Command::LeadStart { task, message, setup, reply }).await
+    pub async fn start_lead_with_setup(
+        &self,
+        task: Task,
+        message: String,
+        setup: LeadSetup,
+    ) -> Result<LeadStartOut, CoreError> {
+        self.ask(|reply| Command::LeadStart {
+            task,
+            message,
+            setup,
+            reply,
+        })
+        .await
     }
 
-    pub async fn start_audit(&self, task: Task, selection: git::audit::Selection, caller_run_id: Option<RunId>) -> Result<PlanStartOut, CoreError> {
-        self.ask(|reply| Command::AuditStart { task, selection, caller_run_id, reply }).await
+    pub async fn start_audit(
+        &self,
+        task: Task,
+        selection: git::audit::Selection,
+        caller_run_id: Option<RunId>,
+    ) -> Result<PlanStartOut, CoreError> {
+        self.ask(|reply| Command::AuditStart {
+            task,
+            selection,
+            caller_run_id,
+            reply,
+        })
+        .await
     }
 
     /// Starts a B3 plan through the actor (socket, MCP `submit_plan`, or the CLI).
@@ -1717,14 +2127,39 @@ impl CoreHandle {
     /// # Errors
     /// [`CoreError::Policy`] if the task is missing; [`CoreError::Unavailable`] if the actor stopped.
     pub async fn recovery_preview(&self, run: RunId) -> Result<recovery::Preview, CoreError> {
-        self.ask(|reply| Command::RecoveryPreview { run, reply }).await
+        self.ask(|reply| Command::RecoveryPreview { run, reply })
+            .await
     }
 
     /// Confirm a preview; duplicate accepted requests return their original replacement.
     /// # Errors
     /// [`CoreError::Policy`] for stale/ineligible choices, or registry/availability errors.
-    pub async fn recover_run(&self, request: recovery::Request, by: Actor) -> Result<recovery::Outcome, CoreError> {
-        self.ask(|reply| Command::RecoverRun { request, by, reply }).await
+    pub async fn recover_run(
+        &self,
+        request: recovery::Request,
+        by: Actor,
+    ) -> Result<recovery::Outcome, CoreError> {
+        self.ask(|reply| Command::RecoverRun { request, by, reply })
+            .await
+    }
+
+    /// Return the actor's bounded explanation of every registered ACP worktree.
+    pub async fn retention_inventory(
+        &self,
+        query: retention::InventoryQuery,
+    ) -> Result<retention::Inventory, CoreError> {
+        self.ask(|reply| Command::RetentionInventory { query, reply })
+            .await
+    }
+
+    /// Confirm one exact inventory item through the human socket.
+    pub async fn retire_worktree(
+        &self,
+        request: retention::Request,
+        by: Actor,
+    ) -> Result<retention::Outcome, CoreError> {
+        self.ask(|reply| Command::RetireWorktree { request, by, reply })
+            .await
     }
 
     /// # Errors
@@ -1758,7 +2193,10 @@ impl CoreHandle {
         let _request = Arc::new(self.2.request().ok_or(CoreError::Unavailable)?);
         let (tx, rx) = oneshot::channel();
         self.0
-            .send(Command::Admitted { command: Box::new(Command::AwaitResult { agent, reply: tx }), admission: Arc::clone(&_request) })
+            .send(Command::Admitted {
+                command: Box::new(Command::AwaitResult { agent, reply: tx }),
+                admission: Arc::clone(&_request),
+            })
             .await
             .map_err(|_| CoreError::Unavailable)?;
         match tokio::time::timeout(timeout, rx).await {
@@ -1805,6 +2243,24 @@ impl CoreHandle {
     /// [`CoreError::UnknownRun`], [`CoreError::GatePayload`], [`CoreError::Unavailable`].
     pub async fn request_gate(&self, req: GateRequest) -> Result<GateOut, CoreError> {
         self.ask(|reply| Command::CreateGate { req, reply }).await
+    }
+
+    /// Capture the complete bounded checkout identity under the supervisor's existing worktree
+    /// mutex. Socket callers use the same method before and after host commands and once more when
+    /// submitting evidence; it is intentionally not exposed through MCP.
+    pub async fn source_inventory(&self, request: SourceInventoryRequest) -> Result<SourceInventorySnapshot, CoreError> {
+        self.ask(|reply| Command::SourceInventory { request, reply }).await
+    }
+
+    /// Atomically captures the current checkout under its worktree lock and durably prepares the
+    /// exact socket-supplied evidence before exposing the resulting human gate.
+    pub async fn prepare_external_verification(
+        &self,
+        run_id: RunId,
+        evidence: ExternalVerificationEvidence,
+        by: Actor,
+    ) -> Result<ExternalVerificationOut, CoreError> {
+        self.ask(|reply| Command::PrepareExternalVerification { run_id, evidence, by, reply }).await
     }
 
     /// Resolves a gate. For an approval the answer arrives only once the commit helper finishes —
@@ -2033,33 +2489,89 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (mut core, _rx) = core(&dir);
         let (run, agent) = seed(&mut core);
-        core.registry.append(&run, EventPayload::PlanCreated { plan: Plan {
-            version: 1, name: "cancel this plan".into(), items: vec![PlanItem {
-                id: "human".into(), kind: PlanItemKind::Human, task: None,
-                summary: Some("Approve this step".into()), after: vec![], verify: None, review: None,
-            }],
-        }}).unwrap();
-        let gate = gates::create_gate(&mut core.registry, &run, NewGate {
-            kind: GateKind::Plan, summary: "waiting".into(), requested_by: Origin::Lead,
-            payload: gates::GatePayload::default(),
-        }).unwrap();
+        core.registry
+            .append(
+                &run,
+                EventPayload::PlanCreated {
+                    plan: Plan {
+                        version: 1,
+                        name: "cancel this plan".into(),
+                        items: vec![PlanItem {
+                            id: "human".into(),
+                            kind: PlanItemKind::Human,
+                            task: None,
+                            summary: Some("Approve this step".into()),
+                            after: vec![],
+                            verify: None,
+                            review: None,
+                        }],
+                    },
+                },
+            )
+            .unwrap();
+        let gate = gates::create_gate(
+            &mut core.registry,
+            &run,
+            NewGate {
+                kind: GateKind::Plan,
+                summary: "waiting".into(),
+                requested_by: Origin::Lead,
+                payload: gates::GatePayload::default(),
+            },
+        )
+        .unwrap();
         let signal = CancellationToken::new();
         core.lifecycle.configure(true, signal.clone());
-        let status = core.lifecycle_request(lifecycle::Request::Stop { mode: lifecycle::StopMode::CancelWork }).await.unwrap();
+        let status = core
+            .lifecycle_request(lifecycle::Request::Stop {
+                mode: lifecycle::StopMode::CancelWork,
+            })
+            .await
+            .unwrap();
         assert_eq!(status.stop_requested, Some(lifecycle::StopMode::CancelWork));
-        assert!(!signal.is_cancelled(), "reply is available before the stopping tick");
-        assert_eq!(core.registry.run(&run).unwrap().status, RunStatus::Cancelled);
-        assert_eq!(core.registry.agent(&agent).unwrap().status, AgentStatus::Cancelled);
-        assert_eq!(core.registry.gate(&gate.gate_id).unwrap().status, GateStatus::Denied);
-        assert_eq!(core.registry.state().plans[&run].items["human"].status, PlanItemStatus::Skipped);
+        assert!(
+            !signal.is_cancelled(),
+            "reply is available before the stopping tick"
+        );
+        assert_eq!(
+            core.registry.run(&run).unwrap().status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            core.registry.agent(&agent).unwrap().status,
+            AgentStatus::Cancelled
+        );
+        assert_eq!(
+            core.registry.gate(&gate.gate_id).unwrap().status,
+            GateStatus::Denied
+        );
+        assert_eq!(
+            core.registry.state().plans[&run].items["human"].status,
+            PlanItemStatus::Skipped
+        );
         let (reply, answered) = oneshot::channel();
-        core.handle_command(Command::LeadStart { task: task(), message: "new work".into(), setup: LeadSetup::default(), reply }).await;
-        assert!(matches!(answered.await.unwrap(), Err(CoreError::Lifecycle { code: "daemon_cancelling", .. })));
+        core.handle_command(Command::LeadStart {
+            task: task(),
+            message: "new work".into(),
+            setup: LeadSetup::default(),
+            reply,
+        })
+        .await;
+        assert!(matches!(
+            answered.await.unwrap(),
+            Err(CoreError::Lifecycle {
+                code: "daemon_cancelling",
+                ..
+            })
+        ));
         core.handle_command(Command::Tick).await;
         assert!(signal.is_cancelled());
         assert!(core.pending_spawn.is_empty());
         assert!(core.registry.state().attempts.is_empty());
-        assert_eq!(core.registry.run(&run).unwrap().status, RunStatus::Cancelled);
+        assert_eq!(
+            core.registry.run(&run).unwrap().status,
+            RunStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -2074,10 +2586,14 @@ mod tests {
         core.registry.append(&run, EventPayload::GateResolving {
             gate_id: gate.gate_id, approve: true, feedback: None,
             by: Actor::Socket { client_name: "human".into() }, commit: None,
+            external_verification: None,
         }).unwrap();
         assert!(core.lifecycle_request(lifecycle::Request::Stop { mode: lifecycle::StopMode::CancelWork }).await.is_err());
         assert_eq!(core.registry.run(&run).unwrap().status, RunStatus::Running);
-        assert_ne!(core.registry.agent(&agent).unwrap().status, AgentStatus::Cancelled);
+        assert_ne!(
+            core.registry.agent(&agent).unwrap().status,
+            AgentStatus::Cancelled
+        );
         assert!(!core.lifecycle.draining());
     }
 
@@ -2087,18 +2603,34 @@ mod tests {
         let (mut first, _rx) = core(&dir);
         let (run, agent) = seed(&mut first);
         finish_attempt(&mut first, &run, agent, AttemptStatus::Lost);
-        let status = first.lifecycle_request(lifecycle::Request::Stop { mode: lifecycle::StopMode::CancelWork }).await.unwrap();
+        let status = first
+            .lifecycle_request(lifecycle::Request::Stop {
+                mode: lifecycle::StopMode::CancelWork,
+            })
+            .await
+            .unwrap();
         assert!(status.stop_error.unwrap().contains("identity was lost"));
         drop(first);
         let (mut restored, _rx) = core(&dir);
         let signal = CancellationToken::new();
         restored.lifecycle.configure(true, signal.clone());
-        restored.lifecycle_request(lifecycle::Request::Stop { mode: lifecycle::StopMode::WhenIdle }).await.unwrap();
+        restored
+            .lifecycle_request(lifecycle::Request::Stop {
+                mode: lifecycle::StopMode::WhenIdle,
+            })
+            .await
+            .unwrap();
         restored.handle_command(Command::Tick).await;
         assert!(!signal.is_cancelled());
-        let status = restored.lifecycle_request(lifecycle::Request::Status).await.unwrap();
+        let status = restored
+            .lifecycle_request(lifecycle::Request::Status)
+            .await
+            .unwrap();
         assert!(status.stop_error.is_some());
-        assert_eq!(restored.registry.run(&run).unwrap().status, RunStatus::Cancelled);
+        assert_eq!(
+            restored.registry.run(&run).unwrap().status,
+            RunStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -2109,23 +2641,44 @@ mod tests {
             let run = RunId::new_v4();
             for _ in 0..2 {
                 core.delegate(DelegateRequest {
-                    run_id: Some(run), role: RoleName::Builder, task: task(), model: None,
-                    session: policy::SessionSpec::Fresh, base_ref: None, worktree: None,
-                    steps: None, caller_run_id: None,
-                }).unwrap();
+                    run_id: Some(run),
+                    role: RoleName::Builder,
+                    task: task(),
+                    model: None,
+                    session: policy::SessionSpec::Fresh,
+                    base_ref: None,
+                    worktree: None,
+                    steps: None,
+                    caller_run_id: None,
+                })
+                .unwrap();
             }
             let helpers: Vec<_> = core.pending_worktree.keys().copied().collect();
             assert_eq!(helpers.len(), 2);
-            core.lifecycle_request(lifecycle::Request::Stop { mode: lifecycle::StopMode::CancelWork }).await.unwrap();
+            core.lifecycle_request(lifecycle::Request::Stop {
+                mode: lifecycle::StopMode::CancelWork,
+            })
+            .await
+            .unwrap();
             for (index, lineage) in helpers.iter().enumerate() {
                 let info = WorktreeInfo {
-                    path: dir.path().join(format!("worktree-{index}")), branch: format!("cancel-test-{index}"), base_sha: "0".repeat(40),
+                    path: dir.path().join(format!("worktree-{index}")),
+                    branch: format!("cancel-test-{index}"),
+                    base_sha: "0".repeat(40),
                 };
                 let result = if fail_second && index == 1 {
-                    Err(GitError::Timeout { op: "cancel-test", secs: 30 })
-                } else { Ok(info) };
+                    Err(GitError::Timeout {
+                        op: "cancel-test",
+                        secs: 30,
+                    })
+                } else {
+                    Ok(info)
+                };
                 core.on_worktree_ready(lineage, result);
-                assert_eq!(core.registry.run(&run).unwrap().status, RunStatus::Cancelled);
+                assert_eq!(
+                    core.registry.run(&run).unwrap().status,
+                    RunStatus::Cancelled
+                );
                 assert!(core.pending_spawn.is_empty());
             }
             assert!(core.cancellation.worktrees.is_empty());
@@ -2133,10 +2686,19 @@ mod tests {
             let mut cancellation_seen = false;
             for event in core.registry.events(&run, None, usize::MAX) {
                 registry::reduce(&mut projected, &event);
-                if projected.runs.get(&run).is_some_and(|r| r.status == RunStatus::Cancelled) { cancellation_seen = true; }
+                if projected
+                    .runs
+                    .get(&run)
+                    .is_some_and(|r| r.status == RunStatus::Cancelled)
+                {
+                    cancellation_seen = true;
+                }
                 if cancellation_seen || !projected.agents.is_empty() {
-                    assert_eq!(projected.runs[&run].status, RunStatus::Cancelled,
-                        "every crash prefix after cancellation or agent creation stays cancelled");
+                    assert_eq!(
+                        projected.runs[&run].status,
+                        RunStatus::Cancelled,
+                        "every crash prefix after cancellation or agent creation stays cancelled"
+                    );
                 }
             }
         }
@@ -2150,7 +2712,10 @@ mod tests {
         let attempt = finish_attempt(&mut core, &run, agent, AttemptStatus::Succeeded);
         core.record_run_cancellation(&run).unwrap();
         core.on_attempt_finished(attempt).await;
-        assert_eq!(core.registry.run(&run).unwrap().status, RunStatus::Cancelled);
+        assert_eq!(
+            core.registry.run(&run).unwrap().status,
+            RunStatus::Cancelled
+        );
         assert!(core.pending_spawn.is_empty());
         assert!(core.pending_retry.is_empty());
         assert!(core.registry.state().gates.is_empty());
@@ -2162,14 +2727,25 @@ mod tests {
         let (mut core, mut rx) = core(&dir);
         let signal = CancellationToken::new();
         core.lifecycle.configure(true, signal.clone());
-        core.lifecycle.request(lifecycle::Request::Stop { mode: lifecycle::StopMode::WhenIdle }, vec![], Instant::now()).unwrap();
+        core.lifecycle
+            .request(
+                lifecycle::Request::Stop {
+                    mode: lifecycle::StopMode::WhenIdle,
+                },
+                vec![],
+                Instant::now(),
+            )
+            .unwrap();
         let handle = core.handle();
         let caller = tokio::spawn(async move { handle.status(StatusQuery::default()).await });
         let command = rx.recv().await.unwrap();
         caller.abort();
         let _ = caller.await;
         core.handle_command(Command::Tick).await;
-        assert!(!signal.is_cancelled(), "queued admission survives its caller");
+        assert!(
+            !signal.is_cancelled(),
+            "queued admission survives its caller"
+        );
         core.handle_command(command).await;
         core.handle_command(Command::Tick).await;
         assert!(signal.is_cancelled());
@@ -2469,6 +3045,41 @@ mod tests {
     /// Issue #4: repeated sends and a resume delegation against a running (or cancelling, or
     /// finalizing — all still `running` until `attempt.finished` is durable) attempt are refused
     /// with `agent_busy` and record nothing — not even the strike `strike: true` asks for.
+    #[test]
+    fn integration_repair_uses_the_gate_payload_even_if_another_draft_froze_later() {
+        let dir = TempDir::new().unwrap();
+        let (mut core, _rx) = core(&dir);
+        let (run, agent) = seed(&mut core);
+        let mut freeze = |label: char| {
+            let attempt = finish_attempt(&mut core, &run, agent, AttemptStatus::Succeeded);
+            let path = dir.path().join(format!("{attempt}.patch"));
+            let hash = label.to_string().repeat(64);
+            core.registry.append(&run, EventPayload::DiffFrozen {
+                attempt_id: attempt, diff_path: path.clone(), diff_hash: hash.clone(),
+                source_inventory_hash: None, files: vec![], added: 1, deleted: 0,
+            }).unwrap();
+            (attempt, path, hash)
+        };
+        let (first, path, hash) = freeze('a');
+        let _newer = freeze('b');
+        let gate = gates::create_gate(&mut core.registry, &run, gates::NewGate {
+            kind: types::GateKind::Integrate, summary: "Evaluate the earlier draft".into(),
+            requested_by: Origin::Lead,
+            payload: gates::GatePayload {
+                diff_path: Some(path), diff_hash: Some(hash.clone()), ..Default::default()
+            },
+        }).unwrap();
+        gates::begin_resolve(&mut core.registry, &gate.gate_id, false,
+            Some("repair the original target".into()), types::Actor::Socket { client_name: "host".into() },
+            &core.roles).unwrap();
+        let repaired = finish_attempt(&mut core, &run, agent, AttemptStatus::Succeeded);
+        fs::remove_file(&gate.payload_path).unwrap();
+        let registry = Registry::open(dir.path()).unwrap();
+        let evidence = gates::current_integration_repair(&registry, &run, repaired).unwrap();
+        assert_eq!(evidence.builder_attempt_id, first, "feedback was rebound to a different attempt");
+        assert_eq!(evidence.denied_diff_hash, hash);
+    }
+
     #[tokio::test]
     async fn follow_ups_to_a_running_attempt_are_agent_busy_without_side_effects() {
         let dir = TempDir::new().expect("tempdir");

@@ -132,6 +132,13 @@ environment failure from prose. After the underlying problem is fixed, the human
 recovery operation continues from the preserved draft without resetting spend, strikes, team,
 effort, or selected checks; a successful recovered draft runs every recorded selected check.
 
+When a human denies an integration gate, append order binds its `gate.created` record to the newest
+durable frozen builder attempt, lineage and diff hash; `gate.resolving` records the feedback and
+actor provenance. Later verifier, reviewer and security prompts reconstruct applicable repair
+criteria from those append-only records, not from the mutable gate payload. Removing or replacing
+the payload after denial therefore cannot change the criterion or block replay. A later MCP denial
+remains advisory and cannot supersede the newest applicable socket-originated human criterion.
+
 ## History compatibility
 
 Event histories are executable only by builds that understand every well-formed event record.
@@ -160,6 +167,77 @@ audit entries. Use the CLI and daemon build that wrote the history before contin
 A historical `execution.limits` object and string `"unlimited"` attempt limits are not supported
 for execution. Status can identify affected `run.created` and `attempt.started` records, but this
 build never converts those values into current numeric limits or authorizes execution from them.
+
+## Blocked verification and human host evidence
+
+Verification has four outcomes. `fail` means a command ran and found a code/build/test failure;
+`blocked` means a required command could not run because the worker environment lacked a concrete
+capability; `pass` and `nothing-to-run` retain their existing meanings. A blocked report has
+non-empty, bounded `blockers`, no `failures`, consumes no builder repair strike and starts no
+equivalent verifier retry. It remains a blocked record: neither a worker nor ACP may relabel it as
+pass or authorize a different environment. Failed, missing and skipped checks never count as
+passing. Verification prerequisites such as temporary paths, local sockets, process inspection or
+a named toolchain are declarative diagnostics only; they are not blanket network/process-access
+guarantees.
+
+Finalization records `diff.frozen.sourceInventoryHash` only when bounded full-source captures
+before and after freezing agree under the existing worktree lock. External evidence must match
+that durable baseline as well as the submission-time capture, including changes made before the
+host's first capture. Legacy diffs or unavailable/unstable capture retain ordinary verification
+and review behavior but cannot use host evidence; no baseline is invented from the current tree.
+Old `verify.report` events default missing commands/blockers to empty and old stored verifier
+results default missing blockers to empty. The current worker-output schema still requires blockers.
+
+A human first runs `acp external-inventory <request-json>` immediately before and after the named
+host commands. Both captures name the current run sequence, builder attempt and diff hash; the
+daemon derives the recorded builder worktree and, under its existing per-worktree mutex, hashes a
+bounded canonical inventory of the actual checkout root, directories and ordinary files, including
+tracked, ignored and untracked inputs and empty directories. The inventory binds names, file kinds,
+permission bits, complete file content, symlink targets and tracked deletions, including unchanged
+tracked files. It excludes Git administrative metadata only at known repository roots, refuses
+unsupported nested repository boundaries and special files, enforces path/file/aggregate/directory-
+and submodule-depth bounds, and never follows a symlink. For an
+initialized tracked submodule it binds the index gitlink, checked-out HEAD, and the recursively
+bounded tracked, ignored and untracked source actually visible to the host. A missing checkout
+is recorded distinctly; a present but uninitialized checkout, escape or cycle is refused. The
+human then submits
+host-side evidence with `acp external-verify <json-file>`. The daemon repeats that same inventory
+capture at submission, so a wrong checkout, added/removed file or changed source is refused. The
+socket-only `verification.external` action requires the current `runId`, `expectedRunSeq`, exact
+builder attempt and frozen `diffHash`, every occurrence of a blocked-report command paired once with its host argv,
+successful exit statuses,
+toolchain identity and provenance, equal before/after source-inventory hashes matching ACP's
+current full-checkout capture, limitations and an
+explicit attestation. Toolchain identity, provenance and attestation each require nonblank text
+without control characters. Denying a pending host-evidence gate keeps the run blocked for fresh evidence. ACP refuses stale state, changed source inventory, mismatched/tampered hashes,
+active/finalizing attempts, pending/resolving gates, skipped/failed commands and evidence not
+preceded by an environment-blocked report for those bytes. MCP has no corresponding action and
+cannot approve this gate.
+
+Host commands must put generated build products, caches and test output outside the tested
+checkout (for example by selecting a toolchain-specific output directory elsewhere). Ignored paths
+and directory structure are inputs too: creating or changing an ignored file or empty directory,
+or changing relevant file/directory permission bits, between the before and after captures
+invalidates the evidence. An ignored output tree that exceeds an inventory bound is refused rather
+than partly attested. Inventory identities created before directories and their modes were covered
+remain readable history, but cannot authorize new evidence; capture a fresh before/after pair with
+the current daemon.
+
+Before the gate is exposed, the complete validated evidence and daemon-captured inventory identity
+are copied into an append-only preparation event. Approval requires the mutable payload to equal
+that record exactly and a live source inventory under the shared worktree lock. The immediate
+submission uses the capture whose lock is still held. If a crash leaves `gate.created` pending,
+a later socket approval reacquires that lock, recaptures the checkout off the actor, and checks
+the current gate, run, worktree and frozen baseline again before appending `gate.resolving`.
+Changed source leaves the gate pending, without accepting evidence or starting a checker.
+Only the accepted record is copied into `gate.resolving`; the payload is never an authority for
+later prompts or predecessor checks. Approval is replay-safe: continuation
+reconstructs only the next selected reviewer/security intent and does so at most once after a
+restart. Reviewer and security prompts receive external evidence only when both builder attempt
+and diff hash match their current frozen input; a repair makes older evidence invisible. The
+blocked worker report remains alongside the host record, and the normal independent checks and
+separate integration gate remain mandatory. Human attestation records provenance and intent; it is
+not cryptographic proof that a test actually ran.
 
 ## Lifecycle and host routes
 
@@ -236,6 +314,81 @@ for this admission check. A cancelled or stopped run cannot launch after the hel
 `acp stop` waits for safe idle. `acp stop --cancel-work` cancels and drains when explicitly requested.
 `acp down` stops the daemon but may leave workers alive for recovery. Never delete resumable
 worktrees merely because supervision stopped. See CLI help for human commands.
+
+## Retained worktrees and deliberate cleanup
+
+Successful integration retains its ACP worktree so the recorded provider session remains
+resumable. `acp worktree list` asks the actor for at most 128 registered lineages and explains each
+as `retained`, `eligible`, `stale`, or `unavailable`; the response says when it was truncated.
+The socket method `retention.inventory` and `acp worktree list` accept optional `runId`/`--run-id`
+and `lineageId`/`--lineage-id` selectors. Selection happens before the same 128-item bound, so a
+known lineage remains addressable beyond the unfiltered page. Retirement always requests a
+run-scoped inventory. If that scoped run itself is truncated, the CLI requires an explicit lineage
+instead of choosing from an incomplete result.
+Ordinary `acp gc` keeps its existing narrow selection: only closed lineages that already carry a
+`worktree.retired` event. Its removal now shares the exact identity, ignored-aware cleanliness,
+Trash handoff, and preserved-ref checks, so an unsafe candidate is reported and retained. A
+historically integrated lineage is bound to its recorded integration commit; an exhausted,
+non-integrated lineage is instead bound to the base commit in its exact `worktree.created` record.
+An advanced branch, dirty/untracked/ignored content, missing ownership, or an unavailable recovery
+receipt is preserved rather than treated as an absent candidate.
+
+`acp worktree retire <runId>` previews the exact repository, run, lineage, sequence, path, branch,
+and integrated commit and prints a `confirmationToken` bound to all of them. Repeating it with
+`--confirm <confirmationToken>` is a deliberate human socket action. The token carries the
+original preview sequence; the CLI does not substitute a newly fetched sequence during confirmation. The daemon
+rechecks the current actor state and refuses active work, pending/finalizing integration,
+recoverable drafts, omitted/mismatched/stale preview tokens, and paths without the matching durable `worktree.created` and
+`integrate.committed` records. This socket is same-user authentication, not proof of physical human
+presence. No MCP tool exposes confirmation, and an MCP actor is rejected by the core. After any
+state change, request a fresh preview and use its new token; deterministic tokens remain valid
+across a daemon restart only while the exact recorded preview remains current.
+
+Under the same per-worktree lock used by attempts and integration, confirmation verifies the exact
+registered ACP branch and Git administration identity, the integrated commit, and an empty Git
+status that includes modified, untracked, and ignored entries. Ignored content is therefore user
+data and causes preservation, not removal. A `refs/acp/retained/<runId>/<lineageId>` ref preserves
+the commit outside the linked worktree. Only then is `worktree.retired{resumable:false}` recorded.
+
+Cleanup asks the supported macOS service for the Trash directory on the worktree's volume, chooses
+an exclusive destination there, and durably records that destination and both filesystem
+identities before the first rename. The source and destination parents are held as non-following
+directory descriptors; the leaf is checked through the source descriptor and moved with macOS's
+descriptor-relative, no-replace rename. That syscall makes destination exclusion atomic, but does
+not condition the rename on filesystem identity. ACP therefore checks the moved identity through
+the destination descriptor and, on a mismatch, attempts a no-replace restoration and reports the
+exact path it could preserve. It then reports the recovery location. No file is unlinked by ACP,
+and the result explicitly says disk space has not been reclaimed; space is reclaimed only if the
+user later empties Trash. Automated tests
+inject a private, same-filesystem no-replace destination and never touch a user's Trash. Platforms
+without a supported Trash route preserve the worktree and report that limitation.
+
+The bounded cleanup receipt is stored under the daemon-owned ACP state directory, outside the
+repository and worker-controlled source. ACP refuses state layouts overlapping the repository or
+resolved Git common directory. Malformed, redirected, oversized, or symlinked receipts fail
+closed. A legacy receipt can be replaced with the current same-filesystem plan only while the
+original registered worktree remains available for complete identity and content revalidation;
+after a move it fails closed and preserves both the recovery item and registration for explicit
+recovery.
+
+After the handoff ACP verifies the moved directory's device/inode, `.git` file, and canonical Git
+administration identity. Before every move and recovery step it resolves the repository's Git
+common directory, derives the registration from that anchor and the registered worktree identity,
+and cross-checks the receipt's filesystem identity. It moves that exact administration directory—including
+Git's existing worktree lock metadata—into a deterministic, symlink-resistant recovery journal
+anchored in the Git common directory, outside Git's `worktrees` registration directory. The source
+and journal are therefore on the same filesystem even when private ACP state is on another volume;
+the authority and receipt remain in private ACP state. The no-replace move and exact directory
+identity check prevent destination reuse, and a reused public path is never passed to a destructive Git command.
+It never runs repository-wide prune. Repeats and restarts recover before or after either rename,
+verify the recovery item and retained ref, and refuse a new tree at the old path. If the public
+path is already absent, inventory and confirmation require a bounded regular cleanup receipt that
+names this run/lineage's retained ref and planned Trash and Git-administration recovery paths; a
+missing, malformed, redirected, or mismatched receipt is stale and cannot authorize cleanup. A
+missing Trash item is reported as incomplete until registration retirement is durable; afterward
+it means the user emptied Trash and disk space was reclaimed. History, frozen evidence, integration events,
+the preserved ref, the recoverable Trash item, and every unrelated worktree registration remain
+intact.
 
 The optional private app is another socket client. `acp app` task links do not install that app
 or transfer a host's entire conversation. Standalone `acp review` works through the public CLI

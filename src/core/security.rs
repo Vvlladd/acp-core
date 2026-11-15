@@ -104,9 +104,16 @@ pub(crate) fn predecessors_passed(
             .attempt(&id)
             .and_then(|a| a.structured.clone())
             .and_then(|v| serde_json::from_value::<VerifyReport>(v).ok());
-        if !report.is_some_and(|r| r.diff_hash == hash && r.status != VerifyStatus::Fail)
-            || !events.iter().any(|e| matches!(e.payload, EventPayload::VerifyReport { attempt_id, builder_attempt_id, status, .. }
-                if attempt_id == id && builder_attempt_id == builder && status != VerifyStatus::Fail)) { return false; }
+        let worker_passed = report.is_some_and(|r| r.diff_hash == hash
+            && crate::core::r#loop::valid_verify_report_shape(&r)
+            && matches!(r.status, VerifyStatus::Pass | VerifyStatus::NothingToRun))
+            && events.iter().any(|e| matches!(e.payload, EventPayload::VerifyReport { attempt_id, builder_attempt_id, status, .. }
+                if attempt_id == id && builder_attempt_id == builder
+                    && matches!(status, VerifyStatus::Pass | VerifyStatus::NothingToRun)));
+        let external_passed = crate::core::gates::accepted_external_evidence(
+            registry, run, builder, hash,
+        ).is_some();
+        if !worker_passed && !external_passed { return false; }
     }
     if steps.review {
         let Some(id) = latest_check(registry, run, builder, RoleName::Reviewer) else {

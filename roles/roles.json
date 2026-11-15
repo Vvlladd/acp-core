@@ -223,7 +223,7 @@
       "writes": false,
       "description": "Builds and runs the repo's tests in the builder's worktree between build and review; never modifies tracked files.",
       "promptFile": "prompts/verifier-worker.md",
-      "promptSha256": "7312026288a65273df4c12b7712dc2936acc21163cb62172a94504fe2ff00b60",
+      "promptSha256": "2c7d7c0f803ab80a157c66f260bdffd57623a30bcd8398f6a69c226befef3c77",
       "tools": [
         "Bash",
         "Read",

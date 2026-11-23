@@ -73,7 +73,13 @@ def notices(package, swift_checkout):
                               license=crate["license"], repository=crate.get("repository"),
                               noticeSource=source,
                               files=[str((dest / p.name).relative_to(package)) for p in files]))
-    rustroot = Path(run("rustc", "--print", "sysroot")) / "share/doc/rust"
+    docroot = Path(run("rustc", "--print", "sysroot")) / "share/doc"
+    # rustup and Homebrew install the same compiler notices under different names.
+    for rustroot in (docroot / "rust", docroot / "rustc"):
+        if (rustroot / "licenses").is_dir() and (rustroot / "COPYRIGHT-library.html").is_file():
+            break
+    else:
+        raise FileNotFoundError(f"Missing Rust standard-library notices in {docroot}")
     rustdest = package / "notices/rust-standard-library"
     shutil.copytree(rustroot / "licenses", rustdest / "licenses")
     shutil.copyfile(rustroot / "COPYRIGHT-library.html", rustdest / "COPYRIGHT-library.html")

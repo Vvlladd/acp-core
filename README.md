@@ -2,7 +2,9 @@
 
 **A local agent control plane for work you can inspect and approve.** Keep your existing Claude Code
 or Codex conversation as the lead. ACP coordinates role-scoped workers, isolated Git worktrees,
-selected checks, recorded evidence, recovery and human integration decisions.
+selected checks, recorded evidence and recovery. You approve integration by default. You can also
+authorize the lead for one run. ACP then checks the selected results against the exact patch
+before committing locally. [Per-run lead approval](docs/PROTOCOL.md#lead-approval-for-one-run)
 
 **MIT licensed:** Rust CLI/daemon, MCP/socket interfaces, roles, schemas, tests and the matching
 Swift Review analyzer. The optional Mac app is developed separately and remains private. It is

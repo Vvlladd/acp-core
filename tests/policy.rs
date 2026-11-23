@@ -26,7 +26,7 @@ use agent_control_plane::core::policy::{
 use agent_control_plane::core::registry::{Registry, State};
 use agent_control_plane::core::team::{validate_team, Assignment, Effort, Team, ValidTeam};
 use agent_control_plane::core::types::{
-    Actor, AgentId, AttemptId, AttemptKind, CostSource, Defaults, EventPayload, Gate, GateId,
+    Actor, AgentId, AttemptError, AttemptId, AttemptKind, AttemptStatus, CostSource, Defaults, ErrorCode, EventPayload, Gate, GateId,
     GateKind, GateStatus, GatesConfig, Limits, LineageId, NewEvent, Origin, ProviderName,
     ProviderSpec, RoleName, RoleSpec, RolesConfig, RunId, SchemaName, Task, TokenUsage,
 };
@@ -297,6 +297,8 @@ fn gate(kind: GateKind) -> Gate {
         created_at: "2026-08-22T09:00:00Z".into(),
         resolved_at: None,
         resolved_by: None,
+        lead_decision: None,
+        lead_evidence: None,
         approve: None,
         feedback: None,
         sha: None,
@@ -701,6 +703,30 @@ fn agent_not_resumable_for_an_unknown_agent_and_for_one_without_a_session() {
 }
 
 #[test]
+fn native_permission_pause_survives_replay_and_guards_both_resume_doors() {
+    let mut world = World::new();
+    let cfg = roles_cfg();
+    let agent = world.writer(&world.dir.path().join("wt"));
+    let attempt = world.attempt(agent, None);
+    world.append(EventPayload::AgentSession { agent_id: agent, attempt_id: attempt,
+        session_id: "session".into(), src_line: 1 });
+    world.append(EventPayload::AttemptFinished { attempt_id: attempt, status: AttemptStatus::Failed,
+        exit_code: Some(0), signal: None, post_sha: None, duration_ms: 1,
+        error: Some(AttemptError { code: ErrorCode::NativePermissionRequired, message: "wait".into() }) });
+    world.registry = Registry::open(world.dir.path()).expect("replay");
+    assert_eq!(check_send_message(&agent, &world.ctx(&cfg)).unwrap_err().code, PolicyCode::AgentNotResumable);
+    let mut req = fresh_builder();
+    req.run_id = Some(world.run);
+    req.session = SessionSpec::Resume(agent);
+    assert_eq!(check_delegate(&req, &world.ctx(&cfg), None).unwrap_err().code, PolicyCode::AgentNotResumable);
+    let other = world.writer(&world.dir.path().join("other"));
+    let other_attempt = world.attempt(other, None);
+    world.append(EventPayload::AgentSession { agent_id: other, attempt_id: other_attempt,
+        session_id: "other".into(), src_line: 1 });
+    assert!(check_send_message(&other, &world.ctx(&cfg)).is_ok());
+}
+
+#[test]
 fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
     let mut world = World::new();
     let cfg = roles_cfg();
@@ -775,6 +801,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         by: Actor::Socket {
             client_name: "cli".into(),
         },
+        lead_decision: None,
         commit: None,
         external_verification: None,
     });
@@ -830,6 +857,7 @@ fn gate_pending_tracks_only_live_integrate_gates_for_the_agents_run() {
         by: Actor::Socket {
             client_name: "acp-mac".into(),
         },
+        lead_decision: None,
         commit: None,
         external_verification: None,
     });

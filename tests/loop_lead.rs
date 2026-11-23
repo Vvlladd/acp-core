@@ -1095,7 +1095,7 @@ fn a_running_lead_is_reattached_after_socket_daemon_restart() {
 
 fn codex_planning_team() -> Value {
     json!({"version":3,"mode":"plan","name":"Codex planning",
-        "lead":{"provider":"codex","model":"gpt-5.5","effort":"high"},"roles":{}})
+        "lead":{"provider":"codex","model":"gpt-6-astra","effort":"high"},"roles":{}})
 }
 
 #[test]
@@ -1105,14 +1105,14 @@ fn codex_lead_recovers_and_resumes_its_recorded_profile_after_team_change() {
         let state = short_state();
         let repo = daemon_repo();
         let release = state.path().join("release-lead");
-        configure_fakes(repo.path(), "pass", &[("ACP_FAKE_VERSION", "codex-cli 0.153.0"),
+        configure_fakes(repo.path(), "pass", &[("ACP_FAKE_VERSION", "codex-cli 0.171.0-alpha.13"),
             ("ACP_FAKE_WAIT_FILE", release.to_str().unwrap())]);
         fs::write(state.path().join("team.json"), codex_planning_team().to_string()).unwrap();
         let sweep = WorkerSweep::new(state.path());
         let mut first = SocketOnlyDaemon::start(state.path(), repo.path());
         let mut wire = SocketWire::connect(&first.socket());
         let catalog = wire.call("roles.list", json!({})).unwrap();
-        assert!(catalog["lead"]["models"].as_array().unwrap().contains(&json!("gpt-5.5")));
+        assert!(catalog["lead"]["models"].as_array().unwrap().contains(&json!("gpt-6-astra")));
         let started = wire.call("lead.start", json!({"message":"Plan without writing."})).unwrap();
         let run: RunId = started["runId"].as_str().unwrap().parse().unwrap();
         let agent: AgentId = started["agentId"].as_str().unwrap().parse().unwrap();
@@ -1161,7 +1161,7 @@ fn codex_lead_recovers_and_resumes_its_recorded_profile_after_team_change() {
         assert_eq!(&argv[1][..2], ["exec", "resume"]);
         for args in argv {
             assert!(args.iter().any(|s| s=="model_reasoning_effort=\"high\""));
-            assert!(args.iter().any(|s| s=="gpt-5.5"));
+            assert!(args.iter().any(|s| s=="gpt-6-astra"));
             assert!(args.iter().any(|s| s.starts_with("mcp_servers=") && s.contains(&run.to_string())));
         }
         assert!(!repo.path().join(".acp/worktrees").exists());
@@ -1205,7 +1205,7 @@ fn codex_lead_refuses_an_unmeasured_cli_before_starting_a_model_turn() {
         let state = short_state();
         let repo = daemon_repo();
         let record = state.path().join("calls.jsonl");
-        configure_fakes(repo.path(), "pass", &[("ACP_FAKE_VERSION", "codex-cli 0.999.0"),
+        configure_fakes(repo.path(), "pass", &[("ACP_FAKE_VERSION", "codex-cli 0.153.0"),
             ("ACP_FAKE_RECORD", record.to_str().unwrap())]);
         fs::write(state.path().join("team.json"), codex_planning_team().to_string()).unwrap();
         let sweep = WorkerSweep::new(state.path());
@@ -1225,7 +1225,7 @@ fn codex_lead_refuses_an_unmeasured_cli_before_starting_a_model_turn() {
         assert!(registry.agent(&agent).unwrap().session_id.is_none());
         let failures = registry.state().attempts.values().filter_map(|a| a.error.as_ref())
             .map(|e| e.message.as_str()).collect::<Vec<_>>();
-        assert!(failures.iter().any(|s| s.contains("requires codex-cli 0.153.0")), "{failures:?}");
+        assert!(failures.iter().any(|s| s.contains("requires codex-cli 0.171.0-alpha.13")), "{failures:?}");
     });
 }
 
@@ -1233,19 +1233,19 @@ fn codex_lead_refuses_an_unmeasured_cli_before_starting_a_model_turn() {
 fn spawned_lead_selection_is_versioned_and_worker_delegation_cannot_resume_it() {
     common::with_shared_env(|| async {
         for (version, requested_provider, requested_model, actual_provider, actual_model) in [
-            (1, "codex", "gpt-5.5", ProviderName::Claude, "haiku"),
-            (2, "codex", "gpt-5.5", ProviderName::Claude, "haiku"),
+            (1, "codex", "gpt-6-astra", ProviderName::Claude, "haiku"),
+            (2, "codex", "gpt-6-astra", ProviderName::Claude, "haiku"),
             (3, "claude", "opus", ProviderName::Claude, "opus"),
-            (3, "codex", "gpt-5.5", ProviderName::Codex, "gpt-5.5"),
+            (3, "codex", "gpt-6-astra", ProviderName::Codex, "gpt-6-astra"),
         ] {
-            let world = LoopWorld::new("lead_messages", &[("ACP_FAKE_VERSION", "codex-cli 0.153.0")]);
+            let world = LoopWorld::new("lead_messages", &[("ACP_FAKE_VERSION", "codex-cli 0.171.0-alpha.13")]);
             let barrier = world.state_dir().join("release");
-            configure_fakes(world.repo_root(), "lead_messages", &[("ACP_FAKE_VERSION", "codex-cli 0.153.0"),
+            configure_fakes(world.repo_root(), "lead_messages", &[("ACP_FAKE_VERSION", "codex-cli 0.171.0-alpha.13"),
                 ("ACP_FAKE_WAIT_FILE", barrier.to_str().unwrap())]);
             let mut team = json!({"version":version,"name":"Lead selection",
                 "lead":{"provider":requested_provider,"model":requested_model},
                 "roles":{"builder":{"provider":"claude","model":"sonnet"},
-                         "reviewer":{"provider":"codex","model":"gpt-5.5"}}});
+                         "reviewer":{"provider":"codex","model":"gpt-6-astra"}}});
             if version==3 { team["mode"]=json!("build"); }
             fs::write(world.state_dir().join("team.json"), team.to_string()).unwrap();
             let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
@@ -1302,7 +1302,7 @@ fn audit_lead_prefix_recovery_preserves_human_input_and_rebuilds_its_prompt() {
         configure_fakes(repo.path(), "lead_messages", &[]);
         let team = json!({"version":3,"mode":"audit","name":"Human comparison",
             "lead":{"provider":"claude","model":"haiku"},
-            "roles":{"reviewer":{"provider":"codex","model":"gpt-5.5"}}});
+            "roles":{"reviewer":{"provider":"codex","model":"gpt-6-astra"}}});
         fs::write(state.path().join("team.json"), team.to_string()).unwrap();
         let selection = json!({"baseRef":"HEAD","target":{"kind":"revision","revision":"HEAD"}});
         let sweep = WorkerSweep::new(state.path());

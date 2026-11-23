@@ -69,6 +69,7 @@ fn run_created(repo_root: &Path, state: &Path) -> NewEvent {
 
 fn worktree_created(agent: AgentId, lineage: LineageId, worktree: &Path) -> NewEvent {
     EventPayload::WorktreeCreated {
+        delegated_task: None,
         agent_id: agent,
         lineage_id: lineage,
         path: worktree.to_path_buf(),
@@ -484,6 +485,7 @@ fn reopening_after_a_kill_rebuilds_an_identical_state() {
                 by: Actor::Socket {
                     client_name: "acp-mac".into(),
                 },
+                lead_decision: None,
                 commit: None,
                 external_verification: None,
             },

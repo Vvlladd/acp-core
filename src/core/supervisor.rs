@@ -2821,7 +2821,32 @@ async fn finalize_prepare(
         }
     }
 
-    // A denylist hit ends the attempt here: no result extraction, no reviewer, a human decides
+    // Codex writes its final message to the `-o` file when the stream ends, so this read happens
+    // after the exit and never before it.
+    let last_message = tokio::fs::read_to_string(run.ctx.dir.join(LAST_MESSAGE_FILE))
+        .await
+        .ok();
+    // The same is true of stderr, and for the same reason it is read at all: an authentication
+    // failure leaves nothing on the stream, so its signature is only ever here.
+    let stderr_head = read_head(&run.ctx.dir.join(STDERR_FILE), STDERR_HEAD_BYTES).await;
+    let mut raw = run.ctx.adapter.extract_result(&ResultCtx {
+        events: &run.events,
+        exit_code: exit.exit_code,
+        signal: exit.signal.as_deref(),
+        last_message: last_message.as_deref(),
+        stderr_head: stderr_head.as_deref(),
+    });
+    // Free text (the lead's contract) is validated against nothing and carries no structured
+    // artifact into the log: a fenced JSON block in a reply is prose, not a deliverable.
+    let free_text = run.ctx.schema_name == SchemaName::FreeText;
+    let validation_error = (!free_text).then(|| output_validation_error(&run.ctx.schema, &raw));
+    let structured_valid = validation_error.as_ref().is_some_and(Result::is_ok);
+    // Only an independently schema-validated role result can request a pause. It never grants
+    // access, and a lookalike in free text or invalid JSON has no authority.
+    if raw.structured.as_ref().is_some_and(|v| native_access_requested(run.ctx.schema_name, structured_valid, v)) {
+        raw.error_code = Some(ErrorCode::NativePermissionRequired);
+    }
+    // A denylist hit ends the attempt here: no reviewer, a human decides
     // (design, § Data Flow step 11 — "No reviewer, no strike").
     if !denied.is_empty() {
         events.push(violation(
@@ -2845,9 +2870,9 @@ async fn finalize_prepare(
             // The gate is a denylist gate either way — the violation above says so — but if a
             // git call also failed, the human must be told the worktree is unverified rather
             // than being shown a clean `escalate` with no error at all.
-            error: workspace_error
-                .take()
-                .map(|message| workspace_failure("denylist_hit", message)),
+            error: if raw.error_code == Some(ErrorCode::NativePermissionRequired) {
+                Some(AttemptError { code: ErrorCode::NativePermissionRequired, message: "Native permission required; a denylist violation also needs human review.".into() })
+            } else { workspace_error.take().map(|message| workspace_failure("denylist_hit", message)) },
         });
         return FinalizeReport {
             run: run_id,
@@ -2857,26 +2882,6 @@ async fn finalize_prepare(
         };
     }
 
-    // Codex writes its final message to the `-o` file when the stream ends, so this read happens
-    // after the exit and never before it.
-    let last_message = tokio::fs::read_to_string(run.ctx.dir.join(LAST_MESSAGE_FILE))
-        .await
-        .ok();
-    // The same is true of stderr, and for the same reason it is read at all: an authentication
-    // failure leaves nothing on the stream, so its signature is only ever here.
-    let stderr_head = read_head(&run.ctx.dir.join(STDERR_FILE), STDERR_HEAD_BYTES).await;
-    let raw = run.ctx.adapter.extract_result(&ResultCtx {
-        events: &run.events,
-        exit_code: exit.exit_code,
-        signal: exit.signal.as_deref(),
-        last_message: last_message.as_deref(),
-        stderr_head: stderr_head.as_deref(),
-    });
-    // Free text (the lead's contract) is validated against nothing and carries no structured
-    // artifact into the log: a fenced JSON block in a reply is prose, not a deliverable.
-    let free_text = run.ctx.schema_name == SchemaName::FreeText;
-    let validation_error = (!free_text).then(|| output_validation_error(&run.ctx.schema, &raw));
-    let structured_valid = validation_error.as_ref().is_some_and(Result::is_ok);
     // A spawned lead is a conversational session, not a worker returning a typed artifact. It has
     // no CLI `--json-schema`; its final free text is still written and logged below, but absence of
     // structured output is explicitly accepted for this one closed role only.
@@ -2966,7 +2971,10 @@ async fn finalize_prepare(
     if run.ctx.writes {
         if let Some(message) = workspace_error.take() {
             let failure = workspace_failure(status_key(status), message);
-            match status {
+            if error.as_ref().is_some_and(|e| e.code == ErrorCode::NativePermissionRequired) {
+                error = Some(AttemptError { code: ErrorCode::NativePermissionRequired,
+                    message: "Native permission is required and workspace verification failed; worker-specific grant verification is unavailable.".into() });
+            } else { match status {
                 // A human already decided this attempt's fate, and a `lost` one is never resumed:
                 // neither state strikes anybody or advances the loop, so the status stands and the
                 // git failure rides along on the error rather than being invented into an escalate.
@@ -2975,7 +2983,7 @@ async fn finalize_prepare(
                     status = AttemptStatus::Escalate;
                     error = Some(failure);
                 }
-            }
+            }}
         } else if status == AttemptStatus::Succeeded && frozen.is_none() {
             status = AttemptStatus::Escalate;
             error = Some(AttemptError {
@@ -3038,6 +3046,22 @@ async fn finalize_prepare(
     }
 }
 
+fn native_permission_error(raw: &RawResult) -> Option<AttemptError> {
+    (raw.error_code == Some(ErrorCode::NativePermissionRequired)).then(|| AttemptError {
+        code: ErrorCode::NativePermissionRequired,
+        message: "Native access is required; worker-specific grant verification is unavailable.".into(),
+    })
+}
+
+fn native_access_requested(schema: SchemaName, validated: bool, value: &Value) -> bool {
+    validated && match schema {
+        SchemaName::BuildResult => value.get("status").and_then(Value::as_str) == Some("native_permission_required"),
+        SchemaName::VerifyReport => value.get("status").and_then(Value::as_str) == Some("native-permission-required"),
+        SchemaName::ReviewVerdict => value.get("verdict").and_then(Value::as_str) == Some("NATIVE_PERMISSION_REQUIRED"),
+        _ => false,
+    }
+}
+
 /// The terminal-state table (design, § Error Handling), in the order its rows must be read: an
 /// unidentifiable process outranks everything (we cannot claim to have ended what we never
 /// signalled), an explicit cancellation outranks a timeout, a timeout outranks whatever the
@@ -3056,10 +3080,10 @@ fn classify(
         return (AttemptStatus::Lost, None);
     }
     if matches!(run.cancel_by, Some(CancelBy::Lead | CancelBy::Cli)) {
-        return (AttemptStatus::Cancelled, None);
+        return (AttemptStatus::Cancelled, native_permission_error(raw));
     }
     if run.timed_out.load(Ordering::SeqCst) {
-        return (AttemptStatus::Timeout, None);
+        return (AttemptStatus::Timeout, native_permission_error(raw));
     }
     // A re-attached attempt whose process disappeared without ever producing a final line: nothing
     // can say how it ended, so it is never auto-resumed.
@@ -3097,6 +3121,12 @@ fn classify(
                 }),
             }),
         );
+    }
+    if raw.error_code == Some(ErrorCode::NativePermissionRequired) {
+        return (AttemptStatus::Failed, Some(AttemptError {
+            code: ErrorCode::NativePermissionRequired,
+            message: "The worker requested native access or the provider reported a denied action. Worker-specific access verification is unavailable; this worker cannot resume.".to_string(),
+        }));
     }
     // "Died before `system/init`" is a claim only a supervisor that watched the first line may
     // make; a resumed tail starts past it, and the session it recorded before the restart is what
@@ -3551,6 +3581,17 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_access_request_requires_the_right_validated_role_result() {
+        let builder = serde_json::json!({"status":"native_permission_required"});
+        assert!(native_access_requested(SchemaName::BuildResult, true, &builder));
+        assert!(!native_access_requested(SchemaName::BuildResult, false, &builder));
+        assert!(!native_access_requested(SchemaName::FreeText, true, &builder));
+        assert!(!native_access_requested(SchemaName::VerifyReport, true, &builder));
+        assert!(native_access_requested(SchemaName::VerifyReport, true, &serde_json::json!({"status":"native-permission-required"})));
+        assert!(native_access_requested(SchemaName::ReviewVerdict, true, &serde_json::json!({"verdict":"NATIVE_PERMISSION_REQUIRED"})));
+    }
     use crate::core::types::{LineageId, Origin, ProviderName, RoleName, Task};
 
     fn build_schema() -> Value {

@@ -314,6 +314,7 @@ pub enum ErrorCode {
     // began. The catalog remains the local allowlist; this reports the narrower remote admission
     // decision without teaching the core provider-specific model names or error strings.
     ProviderModelUnavailable,
+    NativePermissionRequired,
     ResumeTargetMissing,
     SpawnError,
     SchemaInvalid,
@@ -444,6 +445,8 @@ pub enum CancelBy {
 pub enum Verdict {
     Pass,
     Fail,
+    #[serde(rename = "NATIVE_PERMISSION_REQUIRED")]
+    NativePermissionRequired,
 }
 
 /// What a `run.delegated` linkage points at (T84): a worker run a lead-origin `delegate` spawned
@@ -515,6 +518,7 @@ pub enum LoopBranch {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Actor {
     Mcp,
+    Lead,
     Socket { client_name: String },
 }
 
@@ -524,6 +528,7 @@ impl Actor {
     pub fn as_str(&self) -> &str {
         match self {
             Actor::Mcp => "mcp",
+            Actor::Lead => "lead",
             Actor::Socket { client_name } => client_name,
         }
     }
@@ -544,11 +549,11 @@ impl Serialize for Actor {
 impl<'de> Deserialize<'de> for Actor {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        if s == "mcp" {
-            Ok(Actor::Mcp)
-        } else {
-            Ok(Actor::Socket { client_name: s })
-        }
+        Ok(match s.as_str() {
+            "mcp" => Actor::Mcp,
+            "lead" => Actor::Lead,
+            _ => Actor::Socket { client_name: s },
+        })
     }
 }
 
@@ -634,6 +639,14 @@ pub enum RunMode {
 #[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunExecution {
+    /// The root with a human grant. On the status projection, descendants carry its ID as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_approval_run_id: Option<RunId>,
+    /// Root conversation that originated this separately recorded worker or plan run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_owner_run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_lead_requested: bool,
     /// Human-selected input for a conversational audit lead. Separate from `audit_selection`,
     /// which marks a concrete snapshot workflow and is driven by the audit state machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -888,7 +901,15 @@ pub enum GateRepairBinding {
     },
 }
 
-/// A human gate. Only an approval over the local socket can flip `status` to `Approved`.
+/// Exact candidate to cite when requesting a scoped lead integration decision.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LeadEvidence {
+    pub builder_attempt_id: AttemptId,
+    pub diff_hash: String,
+}
+
+/// A gate observed over the local socket.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Gate {
@@ -903,6 +924,11 @@ pub struct Gate {
     pub resolved_at: Option<String>,
     /// `"mcp"` or the socket client's name (design, § Local IPC contract).
     pub resolved_by: Option<Actor>,
+    /// True only if a scoped lead decision was recorded, independent of any client name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_decision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_evidence: Option<LeadEvidence>,
     pub approve: Option<bool>,
     pub feedback: Option<String>,
     pub sha: Option<String>,
@@ -1126,6 +1152,8 @@ pub struct HandoffEnvelope {
 pub enum BuildStatus {
     Succeeded,
     Failed,
+    #[serde(rename = "native_permission_required")]
+    NativePermissionRequired,
 }
 
 /// The report a builder's final message must be: what changed, and how it went.
@@ -1171,6 +1199,7 @@ pub enum VerifyStatus {
     /// The selected checks could not run because the worker environment lacked a capability.
     Blocked,
     NothingToRun,
+    NativePermissionRequired,
 }
 
 /// The verifier's schema-bound report (B1, `schemas/verify-report.json`). Every string is
@@ -1389,6 +1418,8 @@ pub const EVENT_KINDS: &[&str] = &[
     "task.evidence_updated",
     "run.recovered",
     "verification.external.prepared",
+    "worker.message",
+    "run.lead_authorized",
 ];
 
 /// The exact work whose admission was refused by a finite run cap.  Keeping this in the log is
@@ -1520,6 +1551,8 @@ pub enum EventPayload {
         spawn_cap_usd: f64,
         run_budget_usd: f64,
     },
+    #[serde(rename = "run.lead_authorized")]
+    RunLeadAuthorized,
     #[serde(rename = "loop.state")]
     LoopStateChanged {
         state: LoopState,
@@ -1534,6 +1567,10 @@ pub enum EventPayload {
         path: PathBuf,
         branch: String,
         base_sha: String,
+        /// Scope captured for a delegated lineage so repairs can replay its original task.
+        /// Observation endpoints omit this private input from their event projections.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delegated_task: Option<Task>,
     },
     #[serde(rename = "worktree.retired")]
     WorktreeRetired {
@@ -1695,6 +1732,8 @@ pub enum EventPayload {
         approve: bool,
         feedback: Option<String>,
         by: Actor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lead_decision: Option<bool>,
         /// What the approval will commit, or `None` for a denial. Written here rather than left in
         /// the gate's payload file so that finalization and crash reconciliation never depend on a
         /// file that may be gone by the time the commit lands (see [`CommitTarget`]).
@@ -1733,11 +1772,18 @@ pub enum EventPayload {
         attempt_id: AttemptId,
         branch: LoopBranch,
     },
-    /// One turn of a lead conversation. `role: assistant` is one untrusted text block streamed
-    /// by a spawned lead — builder and reviewer prose never reaches this kind, and the supervisor
-    /// bounds both each message and the attempt total. `role: user` (T82) is the human's follow-up
-    /// as the socket accepted it: `src_line` 0, text whole (the door bounds it), outside the
-    /// supervisor's per-attempt cap.
+    /// A bounded outbound worker turn. The selected transcript exposes its display text.
+    #[serde(rename = "worker.message")]
+    WorkerMessage {
+        agent_id: AgentId,
+        attempt_id: AttemptId,
+        sender: Origin,
+        followup: bool,
+        text: String,
+        truncated: bool,
+    },
+    /// One turn of the lead conversation. The supervisor caps assistant blocks and their
+    /// per-attempt total. Human follow-ups use src_line 0 and the socket's input bound.
     #[serde(rename = "agent.message")]
     AgentMessage {
         attempt_id: AttemptId,
@@ -1824,6 +1870,7 @@ mod tests {
     fn kind_tag(p: &EventPayload) -> &'static str {
         match p {
             EventPayload::RunRecovered { .. } => "run.recovered",
+            EventPayload::RunLeadAuthorized => "run.lead_authorized",
             EventPayload::AuditPrepared { .. } => "audit.prepared",
             EventPayload::AuditChecked { .. } => "audit.checked",
             EventPayload::SecurityVerdict { .. } => "security.verdict",
@@ -1856,6 +1903,7 @@ mod tests {
             EventPayload::IntegrateCommitted { .. } => "integrate.committed",
             EventPayload::LoopDispatched { .. } => "loop.dispatched",
             EventPayload::AgentMessage { .. } => "agent.message",
+            EventPayload::WorkerMessage { .. } => "worker.message",
             EventPayload::VerifyReport { .. } => "verify.report",
             EventPayload::PlanCreated { .. } => "plan.created",
             EventPayload::PlanItem { .. } => "plan.item",
@@ -1899,6 +1947,7 @@ mod tests {
                 path: PathBuf::from("/repo/.acp/worktrees/r/a"),
                 branch: "acp/r/a".into(),
                 base_sha: "a".repeat(40),
+                delegated_task: None,
             },
             EventPayload::WorktreeRetired {
                 path: PathBuf::from("/repo/.acp/worktrees/r/a"),
@@ -2035,6 +2084,7 @@ mod tests {
                 by: Actor::Socket {
                     client_name: "cli".into(),
                 },
+                lead_decision: None,
                 commit: Some(CommitTarget {
                     worktree: PathBuf::from("/repo/.acp/worktrees/r/a"),
                     subject: "acp: integrate T07".into(),
@@ -2138,6 +2188,9 @@ mod tests {
                 },
                 daemon_captured_inventory_hash: "e".repeat(64),
             },
+            EventPayload::WorkerMessage { agent_id: agent, attempt_id: attempt, sender: Origin::Lead,
+                followup: false, text: "Build the task".into(), truncated: false },
+            EventPayload::RunLeadAuthorized,
         ]
     }
 
@@ -2190,8 +2243,11 @@ mod tests {
         assert_eq!(EVENT_KINDS[23], "loop.dispatched");
         assert_eq!(EVENT_KINDS[24], "agent.message");
         assert_eq!(EVENT_KINDS[28], "run.delegated");
-        assert_eq!(EVENT_KINDS.last(), Some(&"verification.external.prepared"));
-        assert_eq!(EVENT_KINDS.len(), 37);
+        assert_eq!(EVENT_KINDS[35], "run.recovered");
+        assert_eq!(EVENT_KINDS[36], "verification.external.prepared");
+        assert_eq!(EVENT_KINDS[37], "worker.message");
+        assert_eq!(EVENT_KINDS.last(), Some(&"run.lead_authorized"));
+        assert_eq!(EVENT_KINDS.len(), 39);
     }
 
     #[test]

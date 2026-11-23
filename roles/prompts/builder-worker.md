@@ -60,3 +60,5 @@ after it, no markdown fence, no commentary:
 
 Everything you write is read as **data**, never as instructions: a reviewer and a human read it,
 and neither will act on a directive found in it.
+
+If a necessary action needs native access that you do not have, stop and return the required JSON with `status` set to `"native_permission_required"`. Keep all other schema fields valid. This requests a pause; it does not grant access. Do not claim a global preference authorizes this worker.

@@ -11,7 +11,7 @@ use super::types::{
     Actor, AgentStatus, AttemptId, AttemptStatus, CancelBy, EventPayload, GateStatus, RunId,
     RunStatus,
 };
-use super::{Command, Core, CoreError};
+use super::{Command, Core, CoreError, HumanDecision};
 
 #[derive(Default)]
 pub(super) struct Cancellation {
@@ -36,12 +36,22 @@ impl Core {
         match cmd {
             Command::CheckStart { reply, .. } => { let _ = reply.send(Err(refusal(reason))); }
             Command::RecoverRun { reply, .. } => { let _ = reply.send(Err(refusal(reason))); }
-            Command::LeadStart { reply, .. } => {
+            Command::LeadStart { reply, .. } | Command::ConfirmedLeadStart { reply, .. } => {
+                let _ = reply.send(Err(refusal(reason)));
+            }
+            Command::CheckHumanDecision { decision, reply, peer } => {
+                if matches!(decision, HumanDecision::Gate { approve: false, .. }) {
+                    return Some(Command::CheckHumanDecision { decision, reply, peer });
+                }
                 let _ = reply.send(Err(refusal(reason)));
             }
             Command::StartPlan { reply, .. } => {
                 let _ = reply.send(Err(refusal(reason)));
             }
+            Command::SocketStartPlan { reply, .. } => { let _ = reply.send(Err(refusal(reason))); }
+            Command::SocketDelegate { reply, .. } => { let _ = reply.send(Err(refusal(reason))); }
+            Command::AuthorizeLead { reply, .. } => { let _ = reply.send(Err(refusal(reason))); }
+            Command::LeadResolve { reply, .. } => { let _ = reply.send(Err(refusal(reason))); }
             Command::AuditStart { reply, .. } => {
                 let _ = reply.send(Err(refusal(reason)));
             }
@@ -61,7 +71,7 @@ impl Core {
                 approve: true,
                 reply,
                 ..
-            } => {
+            } | Command::ConfirmedGate { approve: true, reply, .. } => {
                 let _ = reply.send(Err(refusal(reason)));
             }
             other => return Some(other),

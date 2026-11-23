@@ -473,30 +473,31 @@ impl FakeCore {
                                 human_action: human_action(&gate_id),
                             }));
                         }
-                        Command::Delegate { req, reply } => {
+                        Command::CheckHumanDecision { reply, .. } => { let _ = reply.send(Ok(None)); }
+                        Command::SocketDelegate { req, reply, .. } => {
                             note(
                                 &seen,
                                 Seen::Delegate {
                                     caller_run_id: req.caller_run_id,
                                 },
                             );
-                            let _ = reply.send(Ok(DelegateOut {
+                            let _ = reply.send(Ok((DelegateOut {
                                 agent_id: AgentId::new_v4(),
                                 run_id: req.run_id.unwrap_or_else(RunId::new_v4),
                                 attempt_id: AttemptId::new_v4(),
                                 status: RunStatus::Running,
                                 worktree: PathBuf::from("/tmp/acp-fake-worktree"),
-                            }));
+                            }, None)));
                         }
-                        Command::StartPlan {
+                        Command::SocketStartPlan {
                             caller_run_id,
                             reply,
                             ..
                         } => {
                             note(&seen, Seen::StartPlan { caller_run_id });
-                            let _ = reply.send(Ok(PlanStartOut {
+                            let _ = reply.send(Ok((PlanStartOut {
                                 run_id: RunId::new_v4(),
-                            }));
+                            }, None)));
                         }
                         Command::LeadStart { reply, .. } => {
                             note(&seen, Seen::Other("lead.start"));
@@ -2009,6 +2010,27 @@ fn the_socket_drives_a_pass_loop_from_delegate_to_an_approved_commit() {
         })
         .await;
         let gate = integrate_gates(&events)[0];
+
+        // The human transcript follows the chosen worker and returns the actual delegated
+        // task and that worker's validated reply in log order.
+        let params = json!({ "runId": run, "agentId": delegated["agentId"] });
+        let conversation = client.call("run.transcript", params.clone()).await.expect("transcript");
+        let rows = conversation["messages"].as_array().expect("messages");
+        assert_eq!(rows[0]["sender"], "lead");
+        assert_eq!(rows[0]["recipient"], "builder");
+        assert_eq!(rows[0]["attemptId"], delegated["attemptId"]);
+        assert!(rows[0]["text"].as_str().unwrap().contains(&task.description));
+        assert!(rows.iter().any(|row| row["kind"] == "result" && row["sender"] == "builder"));
+        assert!(rows.windows(2).all(|w| w[0]["seq"].as_u64() < w[1]["seq"].as_u64()));
+        assert_eq!(conversation["historyIncomplete"], false);
+        let cross_run = json!({ "runId": RunId::new_v4(), "agentId": delegated["agentId"] });
+        assert!(client.call("run.transcript", cross_run).await.is_err());
+        let status = client.call("get_status", json!({ "runId": run, "lastEvents": 100 }))
+            .await.expect("activity snapshot");
+        let markers: Vec<_> = status["events"].as_array().unwrap().iter()
+            .filter(|e| e["kind"] == "worker.message").collect();
+        assert!(!markers.is_empty());
+        assert!(markers.iter().all(|e| e["text"] == "" && e["truncated"] == true));
 
         // S2 over this transport too: the approving door is `gate.approve`, and only it.
         let refused = client

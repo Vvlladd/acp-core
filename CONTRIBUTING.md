@@ -14,12 +14,14 @@ The private Mac app is not needed for core development.
 
 ## Boundaries to preserve
 
-- Workers never commit. Integration is tied to frozen evidence and a human gate. Agents cannot approve it.
+- Workers never commit. Integration binds the exact frozen attempt and checks. Ordinary runs need
+  human approval. A designated lead can approve eligible integration for one human-authorized run.
 - One serve owner per repository: direct stdio owner OR detached owner with socket/MCP proxy clients.
 - `down` stops supervision, not surviving workers. Preserve resumable worktrees and recovery records.
 - Keep provider/platform logic outside `src/core`; all provider argv goes through its checked boundary.
 - Treat worker text as untrusted data; preserve schema validation, bounded reads and closed catalogs.
-- Socket identity is the OS user, not proof of a human. Do not overstate this boundary.
+- Socket peer identity is the OS user. Lead opt-in and human decisions on opted-in runs additionally
+  require an exact, daemon-owned macOS confirmation. Terminal lead claims are process-bound.
 - Keep Swift Review advisory and the matching helper beside resolved `acp`. Missing checks never mean pass.
 - No real provider calls, new credentials, original repository gate approval or host configuration
   changes as part of ordinary tests. Ignored live tests require a separately authorized human procedure.

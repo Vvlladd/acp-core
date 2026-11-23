@@ -4,7 +4,8 @@
       "description": "How the attempt ended.",
       "enum": [
         "succeeded",
-        "failed"
+        "failed",
+        "native_permission_required"
       ],
       "type": "string"
     }

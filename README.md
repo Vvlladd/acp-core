@@ -38,13 +38,27 @@ and run `acp doctor --repo /absolute/path/to/your/repository` before delegating.
 - Build with isolated workers and selected verifier/reviewer/security checks.
 - Audit an explicitly selected source snapshot without a builder or integration.
 - Record execution choices, attempts, evidence and recoverable history locally.
-- Freeze review evidence and require a human decision before the control plane commits.
+- Freeze review evidence and offer human approval by default. An explicitly authorized lead can
+  decide plans and authorize one verified local commit per integration gate.
 - Run standalone advisory Swift Review using the bundled, locally sandboxed analyzer.
 
 An existing host conversation stays the lead. Switching its model is the host's responsibility.
 The daemon has a closed provider/model catalog; MCP support does not imply compatibility with
 arbitrary providers or models. Automatic Swift checks in builder workflows and the proposed
 codebase decision-memory product are future work, not features of this preview.
+
+### Lead approval for one run
+
+A person can authorize a designated Claude Code or Codex lead for an eligible run from the CLI,
+the optional Mac app, or a paired browser client that implements the [socket contract](docs/PROTOCOL.md#lead-approval-for-one-run).
+The daemon asks for confirmation in a macOS system dialog. A lead can then decide plans and
+authorize integration after the selected checks pass for the exact frozen builder attempt.
+ACP creates the commit in the task worktree. Merging, pushing, escalations, external verification
+and native access grants require separate human action. Ordinary runs keep their existing human
+approval workflow. This grant applies to ACP run decisions independently of QRSPI development gates.
+
+The public core provides the CLI and daemon contract. The optional browser and Mac interfaces
+are maintained separately. Downloaded previews may predate these capabilities.
 
 ## Architecture
 
@@ -101,16 +115,21 @@ sequenceDiagram
     CoreActor->>Supervisor: Run selected checks on this attempt
     alt Repair required and allowed
         CoreActor->>Supervisor: Repair and repeat selected checks
-    else Ready for human decision
+    else Ready for a decision
         CoreActor->>History: Freeze exact diff, attempt and check evidence
         CoreActor-->>Lead: Pending gate
-        Lead-->>Human: Present evidence and wait
-        Human->>Entry: Approve using human CLI / socket client
-        Entry->>CoreActor: Socket-only gate approval
-        CoreActor->>Git: Recheck approved bytes under worktree lock, commit
+        alt Ordinary run
+            Lead-->>Human: Present evidence and wait
+            Human->>Entry: Approve using human CLI / socket client
+            Entry->>CoreActor: Human gate approval
+        else Run authorized by a person
+            Lead->>Entry: Cite the exact builder attempt and frozen hash
+            Entry->>CoreActor: Authenticate lead and validate selected checks
+        end
+        CoreActor->>Git: Recheck approved bytes under worktree lock, commit locally
         CoreActor->>History: Record resulting commit
     end
-    Note over Lead,CoreActor: MCP cannot approve integration. Same-user shell access is not a physical-human boundary.
+    Note over Lead,CoreActor: Direct MCP cannot approve. Opt-in and human decisions on opted-in runs use a macOS system dialog.
 ```
 
 ### Source map

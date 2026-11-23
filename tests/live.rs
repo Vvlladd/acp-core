@@ -305,7 +305,7 @@ async fn codex_pong_pair(codex_home: Option<&Path>) -> (Capture, Capture) {
     let prompt = "Inspect the names of tools available to you without invoking any tool. If none starts with mcp__, return exactly {\"status\":\"succeeded\",\"filesChanged\":[],\"summary\":\"PONG\"}. If any starts with mcp__, sort those exact names lexicographically and return the same JSON except summary must be MCP_EXPOSED:<comma-separated names>. Return JSON only.";
     let fresh_req = SpawnRequest {
         role,
-        model: "gpt-5.5",
+        model: "gpt-6-astra",
         prompt,
         role_prompt:
             "Inspect available tool names without invoking them and return only the requested JSON.",
@@ -1309,7 +1309,7 @@ fn live_full_loop() {
             .roles
             .get_mut(&RoleName::Reviewer)
             .expect("reviewer role");
-        reviewer.default_model = "gpt-5.5".into();
+        reviewer.default_model = "gpt-6-astra".into();
         reviewer.max_turns = 4;
         reviewer.spawn_budget_usd = 0.10;
         let team = Team {
@@ -1330,7 +1330,7 @@ fn live_full_loop() {
                     "reviewer".into(),
                     Assignment {
                         provider: ProviderName::Codex,
-                        model: "gpt-5.5".into(),
+                        model: "gpt-6-astra".into(),
                         // Low, not Minimal: since 2026-08-26 the platform enables web_search/image_gen by default
                         // and rejects reasoning effort `minimal` alongside them (400 invalid_request_error), so
                         // `minimal` is no longer advertised anywhere (roles.json, the app fallback).
@@ -1412,7 +1412,7 @@ fn live_verifier() {
         verifier.max_turns = 24;
         verifier.spawn_budget_usd = 0.15;
         let reviewer = roles.roles.get_mut(&RoleName::Reviewer).expect("reviewer");
-        reviewer.default_model = "gpt-5.5".into();
+        reviewer.default_model = "gpt-6-astra".into();
         reviewer.max_turns = 4;
         reviewer.spawn_budget_usd = 0.10;
 
@@ -1567,7 +1567,7 @@ fn live_codex_builder() {
         builder.max_turns = 16;
         builder.spawn_budget_usd = 0.20;
         let reviewer = roles.roles.get_mut(&RoleName::Reviewer).expect("reviewer");
-        reviewer.default_model = "gpt-5.5".into();
+        reviewer.default_model = "gpt-6-astra".into();
         reviewer.max_turns = 4;
         reviewer.spawn_budget_usd = 0.10;
         let team = Team {
@@ -1579,7 +1579,7 @@ fn live_codex_builder() {
                 "builder".into(),
                 Assignment {
                     provider: ProviderName::Codex,
-                    model: "gpt-5.5".into(),
+                    model: "gpt-6-astra".into(),
                     effort: Some(Effort::Low),
                 },
             )]),
@@ -1695,7 +1695,7 @@ fn live_plan_sequence() {
             .roles
             .get_mut(&RoleName::Reviewer)
             .expect("reviewer role");
-        reviewer.default_model = "gpt-5.5".into();
+        reviewer.default_model = "gpt-6-astra".into();
         reviewer.max_turns = 4;
         reviewer.spawn_budget_usd = 0.10;
 
@@ -1719,7 +1719,7 @@ fn live_plan_sequence() {
                     "reviewer".into(),
                     Assignment {
                         provider: ProviderName::Codex,
-                        model: "gpt-5.5".into(),
+                        model: "gpt-6-astra".into(),
                         effort: Some(Effort::Low),
                     },
                 ),

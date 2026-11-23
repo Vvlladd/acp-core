@@ -39,6 +39,20 @@ const OPUS: &str = "claude-opus-4-1";
 
 const SESSION_ID: &str = "aaaaaaaa-1111-4a11-8a11-aaaaaaaaaaaa";
 
+#[test]
+fn terminal_permission_denials_request_a_pause_without_carrying_tool_inputs() {
+    let adapter = ClaudeAdapter;
+    for (denials, expected) in [
+        (serde_json::json!([]), None),
+        (serde_json::json!([{"tool_name":"Bash","tool_input":{"command":"secret"}}]), Some(ErrorCode::NativePermissionRequired)),
+    ] {
+        let line = serde_json::json!({"type":"result", "is_error":false, "permission_denials":denials}).to_string();
+        let events = adapter.parse_line(&line);
+        assert!(events.iter().any(|event| matches!(event, NormalizedEvent::Final { error_code, .. } if *error_code == expected)));
+        assert!(!format!("{events:?}").contains("secret"));
+    }
+}
+
 const TOOLS: [&str; 6] = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"];
 const LEAD_TOOLS: [&str; 9] = [
     "mcp__acp__delegate",

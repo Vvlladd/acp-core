@@ -118,6 +118,10 @@ impl Peer {
             answer["result"]["capabilities"]["tools"].is_object(),
             "the door advertises the tools capability: {answer}"
         );
+        let instructions = answer["result"]["instructions"].as_str().expect("lead instructions");
+        for required in ["Human approval is the default", "authenticated proxy", "leadEvidence", "Direct MCP cannot approve", "Escalations"] {
+            assert!(instructions.contains(required), "initialize instructions omit {required}: {instructions}");
+        }
         self.notify("notifications/initialized").await;
     }
 
@@ -578,10 +582,12 @@ fn the_resolve_gate_description_names_the_human_approval_path() {
             .as_str()
             .expect("a description");
         for stated in [
-            "HUMAN",
+            "require a human",
             "acp gate approve",
-            "menu-bar app",
+            "ACP Mac app",
             "agent_approve_not_allowed",
+            "Direct MCP cannot approve",
+            "leadEvidence",
         ] {
             assert!(
                 description.contains(stated),
@@ -590,15 +596,16 @@ fn the_resolve_gate_description_names_the_human_approval_path() {
             );
         }
 
-        // The socket-only integrate path is stated on the tools a lead reaches for first, too.
+        // Both the human fallback and opted-in proxy are stated on the tools a lead reaches for.
         for named in ["delegate", "request_human_gate"] {
             let description = tool(&tools, named)["description"]
                 .as_str()
                 .expect("a description");
             assert!(
                 description.contains("acp gate approve"),
-                "{named}'s description names the socket-only approval path: {description}"
+                "{named}'s description names the human approval path: {description}"
             );
+            assert!(description.contains("proxy"), "{named} should name the authenticated proxy: {description}");
         }
         peer.close().await;
     });

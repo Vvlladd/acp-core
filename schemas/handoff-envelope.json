@@ -39,6 +39,7 @@
         "provider_unauthenticated",
         "provider_usage_limit",
         "provider_model_unavailable",
+        "native_permission_required",
         "resume_target_missing",
         "spawn_error",
         "schema_invalid",

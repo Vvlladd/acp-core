@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 const CLAUDE_MODEL: &str = "claude-sonnet-4-5";
-const CODEX_MODEL: &str = "gpt-5.5";
+const CODEX_MODEL: &str = "gpt-6-astra";
 const CLAUDE_SESSION: &str = "aaaaaaaa-1111-4a11-8a11-aaaaaaaaaaaa";
 const CODEX_THREAD: &str = "01930f4a-0000-7000-8000-000000000001";
 

@@ -411,6 +411,10 @@ impl Core {
         {
             return;
         }
+        if a.error.as_ref().is_some_and(|e| e.code == crate::core::types::ErrorCode::NativePermissionRequired) {
+            self.queue_audit_block(run, "A worker needs native permission; worker-specific access verification is unavailable.".into(), Some(attempt));
+            return;
+        }
         let Some(audit) = self.registry.run(&run).and_then(|r| r.audit.as_ref()) else {
             return;
         };
@@ -620,6 +624,7 @@ impl Core {
                             VerifyStatus::Fail => AuditOutcome::Fail,
                             VerifyStatus::Blocked => AuditOutcome::Blocked,
                             VerifyStatus::NothingToRun => AuditOutcome::NothingToRun,
+                            VerifyStatus::NativePermissionRequired => AuditOutcome::Fail,
                         };
                         check.summary = clamp_untrusted(&report.summary, 4000);
                     }

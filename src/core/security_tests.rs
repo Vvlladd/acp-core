@@ -19,7 +19,7 @@ fn seed() -> (TempDir, Core, RunId, AgentId, AttemptId, AgentId, AttemptId) {
     );
     let run = RunId::new_v4();
     let team: team::Team = serde_json::from_value(json!({"version":3,"mode":"build","name":"security",
-        "roles":{"builder":{"provider":"claude","model":"haiku"},"security":{"provider":"codex","model":"gpt-5.5"}}})).unwrap();
+        "roles":{"builder":{"provider":"claude","model":"haiku"},"security":{"provider":"codex","model":"gpt-6-astra"}}})).unwrap();
     let execution = team::capture_execution(
         &core.roles,
         Some(&team::validate_team(&core.roles, &team).unwrap()),
@@ -66,7 +66,7 @@ fn agent(core: &mut Core, run: RunId, id: AgentId, role: RoleName, parent: Optio
                 agent_id: id,
                 role,
                 provider: ProviderName::Codex,
-                model: "gpt-5.5".into(),
+                model: "gpt-6-astra".into(),
                 lineage_id: None,
                 depth: 1,
                 parent_agent_id: parent,

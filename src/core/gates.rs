@@ -30,8 +30,8 @@
 //! - **Approval authority (S2)** — every resolution goes through [`policy::check_gate_resolve`]
 //!   *before* anything is written, so an MCP `resolve_gate{approve:true}` on an `integrate` gate is
 //!   rejected `AgentApproveNotAllowed` (unless `gates.allowAgentApprove`) with **no** side effects.
-//!   A denial from either door is always allowed, and `Actor::Socket{..}` — `acp gate approve`, the
-//!   menu-bar app — may always approve.
+//!   For opted-in runs, the actor also checks the requesting lead or native human confirmation.
+//!   Lead integrations must match the exact builder attempt and recorded selected checks.
 //! - **Exactly-once commit** — `gate.resolving` is appended **before any git call**, and it is the
 //!   last fallible thing [`begin_resolve`] does before handing the caller a [`CommitPlan`]. A
 //!   second resolution from either door then observes a non-`Pending` gate and returns
@@ -73,7 +73,7 @@ use crate::core::registry::{Registry, RegistryError};
 use crate::core::types::{
     Actor, AgentStatus, AttemptId, AttemptStatus, CommitTarget, EventPayload, ExternalCommandStatus,
     ExternalVerificationEvidence, Gate, GateId, GateKind, GateStatus, Origin, RolesConfig, RunId,
-    RunStatus, VerifyStatus,
+    LeadEvidence, RoleName, RunSteps, RunStatus, VerifyStatus,
 };
 use crate::workspace::git::{self, CommitMessage, GitError, MAX_SUBJECT_BYTES};
 
@@ -434,7 +434,7 @@ pub fn begin_resolve(
     by: Actor,
     cfg: &RolesConfig,
 ) -> Result<ResolveOutcome, CoreError> {
-    begin_resolve_inner(reg, id, approve, feedback, by, cfg, None)
+    begin_resolve_inner(reg, id, approve, feedback, by, cfg, None, None)
 }
 
 /// Only the actor's locked host capture can settle a pending external-evidence approval.
@@ -447,12 +447,39 @@ pub fn approve_external_with_inventory(
         return Err(policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
             "a host inventory can settle only an external-verification gate").into());
     }
-    begin_resolve_inner(reg, id, true, None, by, cfg, Some(inventory))
+    begin_resolve_inner(reg, id, true, None, by, cfg, Some(inventory), None)
 }
 
+pub(super) fn begin_lead_resolve(
+    reg: &mut Registry, decision: super::lead_authority::LeadDecision, cfg: &RolesConfig,
+) -> Result<ResolveOutcome, CoreError> {
+    begin_resolve_inner(reg, &decision.gate_id, decision.approve, decision.feedback.clone(),
+        Actor::Lead, cfg, None, Some(&decision))
+}
+
+pub(super) fn lead_candidate(registry: &Registry, gate: &Gate) -> Option<LeadEvidence> {
+    if gate.kind != GateKind::Integrate || gate.requested_by != Origin::ControlPlane || gate.status != GateStatus::Pending {
+        return None;
+    }
+    let events = registry.events(&gate.run_id, None, usize::MAX);
+    let gate_seq = events.iter().rev().find_map(|event| match event.payload {
+        EventPayload::GateCreated { gate_id, .. } if gate_id == gate.gate_id => Some(event.base.seq),
+        _ => None,
+    })?;
+    events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::DiffFrozen { attempt_id, diff_hash, .. } if event.base.seq < gate_seq
+            && crate::core::r#loop::security::current_builder_diff(registry, &gate.run_id, *attempt_id) => {
+                Some(LeadEvidence { builder_attempt_id: *attempt_id, diff_hash: diff_hash.clone() })
+            }
+        _ => None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn begin_resolve_inner(
     reg: &mut Registry, id: &GateId, approve: bool, feedback: Option<String>, by: Actor,
     cfg: &RolesConfig, captured_inventory: Option<&str>,
+    lead: Option<&super::lead_authority::LeadDecision>,
 ) -> Result<ResolveOutcome, CoreError> {
     let gate = reg.gate(id).cloned().ok_or(CoreError::UnknownGate(*id))?;
 
@@ -462,6 +489,9 @@ fn begin_resolve_inner(
         return Ok(ResolveOutcome::Settled(GateResolution::AlreadyResolved));
     }
 
+    if by == Actor::Lead && lead.is_none() {
+        return Err(super::lead_authority::refusal("the approval must use the designated lead decision path"));
+    }
     if approve && !matches!(gate.kind, GateKind::Plan | GateKind::ExternalVerification) && reg.run(&gate.run_id).and_then(|r| r.execution.as_ref())
         .is_some_and(|e| e.mode != crate::core::types::RunMode::Build) {
         return Err(policy::PolicyError::new(policy::PolicyCode::DelegationNotAllowed,
@@ -512,6 +542,13 @@ fn begin_resolve_inner(
     } else {
         None
     };
+    if let Some(decision) = lead {
+        match (&plan, gate.kind) {
+            (Some(plan), GateKind::Integrate) => check_lead_evidence(reg, &gate, &plan.target, decision)?,
+            (_, GateKind::Plan) if decision.diff_hash.is_none() && decision.builder_attempt_id.is_none() => {},
+            _ => return Err(super::lead_authority::refusal("a designated lead may decide a plan or approve matching integration evidence")),
+        }
+    }
 
     // A manually requested gate must not bypass a selected security check. Bind the recorded
     // PASS to the same builder attempt/artifact as this gate before gate.resolving is durable.
@@ -543,6 +580,7 @@ fn begin_resolve_inner(
             approve,
             feedback: feedback.clone(),
             by,
+            lead_decision: lead.map(|_| true),
             commit: plan.as_ref().map(|p| p.target.clone()),
             external_verification: accepted_external,
         },
@@ -575,16 +613,52 @@ pub(crate) fn accepted_external_evidence(
     diff_hash: &str,
 ) -> Option<ExternalVerificationEvidence> {
     reg.events(run, None, usize::MAX).iter().rev().find_map(|event| match &event.payload {
-        EventPayload::GateResolving { gate_id, external_verification: Some(evidence), .. }
-            if evidence.builder_attempt_id == builder_attempt
-                && evidence.diff_hash == diff_hash
-                && evidence.validate_attestation().is_ok()
-                && reg.gate(gate_id).is_some_and(|gate| gate.status == GateStatus::Approved) =>
+        EventPayload::GateResolving {
+            gate_id, approve: true, by: Actor::Socket { .. }, external_verification: Some(evidence), ..
+        } if evidence.builder_attempt_id == builder_attempt
+            && evidence.diff_hash == diff_hash
+            && evidence.validate_attestation().is_ok()
+            && reg.gate(gate_id).is_some_and(|gate| gate.run_id == *run
+                && gate.kind == GateKind::ExternalVerification && gate.status == GateStatus::Approved) =>
         {
             Some(evidence.clone())
         }
         _ => None,
     })
+}
+
+fn check_lead_evidence(
+    reg: &Registry, gate: &Gate, target: &CommitTarget, decision: &super::lead_authority::LeadDecision,
+) -> Result<(), CoreError> {
+    let refuse = || super::lead_authority::refusal("lead integration requires the current builder attempt, exact frozen diff, and passing selected checks");
+    let attempt_id = decision.builder_attempt_id.ok_or_else(refuse)?;
+    let hash = decision.diff_hash.as_deref().ok_or_else(refuse)?;
+    let attempt = reg.attempt(&attempt_id).ok_or_else(refuse)?;
+    let agent = reg.agent(&attempt.agent_id).ok_or_else(refuse)?;
+    let run = reg.run(&gate.run_id).ok_or_else(refuse)?;
+    let selected = run.steps.unwrap_or_default();
+    let owner_steps = run.execution.as_ref().and_then(|e| e.lead_owner_run_id)
+        .and_then(|owner| reg.run(&owner)).and_then(|owner| owner.steps).unwrap_or(selected);
+    let required = RunSteps { verify: selected.verify || owner_steps.verify,
+        review: selected.review || owner_steps.review, security: selected.security || owner_steps.security };
+    if gate.requested_by != Origin::ControlPlane || run.status != RunStatus::AwaitingGate
+        || attempt.run_id != gate.run_id || agent.role != RoleName::Builder
+        || agent.worktree.as_ref() != Some(&target.worktree)
+        || target.pre_sha.as_deref() != Some(attempt.pre_sha.as_str())
+        || target.diff_hash.as_deref() != Some(hash)
+        || !crate::core::r#loop::security::predecessors_passed_with_steps(reg, &gate.run_id, attempt_id, hash, required)
+        || (required.verify
+            && !crate::core::r#loop::security::verification_passed(reg, &gate.run_id, attempt_id, hash))
+        || (required.security
+            && crate::core::r#loop::security::passed_attempt(reg, &gate.run_id, attempt_id, hash).is_none()) {
+        return Err(refuse());
+    }
+    let matched = reg.events(&gate.run_id, None, usize::MAX).iter().any(|event| {
+        matches!(&event.payload, EventPayload::DiffFrozen { attempt_id: builder, diff_path, diff_hash, files, .. }
+            if *builder == attempt_id && Some(diff_path) == target.diff_path.as_ref() && diff_hash == hash && files == &target.files)
+    });
+    if !matched { return Err(refuse()); }
+    Ok(())
 }
 
 /// Appends the `gate.resolved{approved}` half of a commit-less approval (`plan`/`escalate`).
@@ -1202,6 +1276,7 @@ fn heal_commit_target(reg: &mut Registry, gate: &Gate) -> Result<Option<CommitTa
             approve: true,
             feedback: gate.feedback.clone(),
             by,
+            lead_decision: gate.lead_decision,
             commit: Some(target.clone()),
             external_verification: None,
         },

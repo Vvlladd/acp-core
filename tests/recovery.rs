@@ -53,7 +53,7 @@ async fn request(handle: &CoreHandle, run: RunId, agent: AgentId) -> Request {
         request_id: Uuid::new_v4(),
         builder: Assignment {
             provider: ProviderName::Codex,
-            model: "gpt-5.5".into(),
+            model: "gpt-6-astra".into(),
             effort: None,
         },
         feedback: "Keep the preserved draft and complete the task".into(),
@@ -579,6 +579,7 @@ fn preview_reports_retained_strikes_and_exact_one_shot_allowance() {
         reg.append(
             &run,
             EventPayload::WorktreeCreated {
+                delegated_task: None,
                 agent_id: second_agent,
                 lineage_id: LineageId::new_v4(),
                 path: world.repo_root().join("unused-replacement"),
@@ -772,6 +773,7 @@ fn terminal_tasks_pending_decisions_budget_and_modes_refuse_without_mutation() {
                         approve: false,
                         feedback: None,
                         by: human(),
+                        lead_decision: None,
                         commit: None,
                         external_verification: None,
                     },

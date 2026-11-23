@@ -29,6 +29,7 @@ pub mod retention;
 pub mod supervisor;
 pub mod team;
 pub mod types;
+pub mod transcript;
 // `loop` is a reserved word — the module is declared with a raw identifier.
 pub mod r#loop;
 
@@ -52,10 +53,11 @@ use crate::core::supervisor::{
 };
 use crate::core::types::{
     AgentHandle, AgentId, AgentStatus, Attempt, AttemptError, AttemptId, AttemptStatus, CancelBy,
-    Event, EventPayload, ExternalVerificationEvidence, Gate, GateId, GateStatus, HandoffEnvelope, LineageId, LoopBranch,
+    Event, EventPayload, ExternalVerificationEvidence, Gate, GateId, GateKind, GateStatus, HandoffEnvelope, LineageId, LoopBranch,
     LoopState, ProviderName, RoleName, RolesConfig, Run, RunId, RunStatus, Task, TokenUsage,
     SourceInventoryRequest, SourceInventorySnapshot,
 };
+use crate::ipc::human_confirmation::{self, Prompt as HumanPrompt, Proof as HumanProof};
 use crate::workspace::git::{self, GitError};
 
 pub use crate::core::gates::{CoreError, GateResolution};
@@ -116,6 +118,19 @@ struct Waiter(Reply<AwaitOut>);
 pub struct LeadSetup {
     pub audit_selection: Option<git::audit::Selection>,
     pub expected_team: Option<team::Team>,
+    pub lead_approved: bool,
+}
+
+pub mod lead_authority;
+use lead_authority::{LeadAuthorized, LeadDecision, PeerProcess};
+
+/// The actor validates this request before the socket task asks for physical confirmation.
+#[derive(Debug)]
+pub enum HumanDecision {
+    StartLead { task: Task, message: String, setup: LeadSetup },
+    AuthorizeLead(RunId),
+    Gate { gate: GateId, approve: bool, feedback: Option<String> },
+    Recover(recovery::Request),
 }
 
 /// Everything that can reach the actor. `LeadStart` remains daemon-internal until T58 attaches its
@@ -133,6 +148,7 @@ pub struct LeadSetup {
 ///   at its own variant.
 #[derive(Debug)]
 pub enum Command {
+    WorkerTranscript { query: transcript::Query, reply: Reply<transcript::Page> },
     CheckStart {
         request: crate::checks::Request,
         reply: Reply<crate::checks::Summary>,
@@ -168,6 +184,7 @@ pub enum Command {
         reply: Reply<recovery::Preview>,
     },
     RecoverRun {
+        proof: Option<HumanProof>,
         request: recovery::Request,
         by: Actor,
         reply: Reply<recovery::Outcome>,
@@ -187,6 +204,7 @@ pub enum Command {
         setup: LeadSetup,
         reply: Reply<LeadStartOut>,
     },
+    ConfirmedLeadStart { task: Task, message: String, setup: LeadSetup, proof: HumanProof, reply: Reply<LeadStartOut> },
     AuditStart {
         task: Task,
         selection: git::audit::Selection,
@@ -256,6 +274,12 @@ pub enum Command {
         by: Actor,
         reply: Reply<ExternalVerificationOut>,
     },
+    CheckHumanDecision { decision: HumanDecision, peer: Option<PeerProcess>, reply: Reply<Option<HumanPrompt>> },
+    AuthorizeLead { run: RunId, peer: Option<PeerProcess>, proof: Option<HumanProof>, reply: Reply<LeadAuthorized> },
+    ConfirmedGate { gate: GateId, approve: bool, feedback: Option<String>, by: Actor, proof: HumanProof, reply: Reply<GateResolution> },
+    LeadResolve { decision: LeadDecision, peer: Option<PeerProcess>, reply: Reply<GateResolution> },
+    SocketDelegate { req: DelegateRequest, peer: Option<PeerProcess>, terminal_lead_requested: bool, reply: Reply<(DelegateOut, Option<uuid::Uuid>)> },
+    SocketStartPlan { plan: plan::Plan, caller_run_id: Option<RunId>, peer: Option<PeerProcess>, terminal_lead_requested: bool, reply: Reply<(PlanStartOut, Option<uuid::Uuid>)> },
 
     // Completions posted by helper tasks so the mailbox never awaits slow I/O (decision 11).
     WorktreeReady {
@@ -470,6 +494,10 @@ pub struct AgentSummary {
     pub agent_id: AgentId,
     pub run_id: RunId,
     pub role: RoleName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<types::Origin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
     pub provider: ProviderName,
     pub model: String,
     pub process_state: AgentStatus,
@@ -551,10 +579,14 @@ pub struct GateOut {
     pub human_action: String,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ExternalVerificationOut {
     pub gate_id: GateId,
-    pub resolution: GateResolution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<GateResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<GateStatus>,
 }
 
 enum ExternalCapture {
@@ -692,6 +724,7 @@ pub struct Core {
     /// answers [`CoreError::Unavailable`] — the design's "`serve` exits non-zero rather than
     /// serving stale state".
     fatal: Option<String>,
+    lead_authority: lead_authority::LeadAuthority,
 }
 
 impl Core {
@@ -722,6 +755,7 @@ impl Core {
         let mut core = Self {
             local_checks: HashMap::new(),
             lifecycle: lifecycle::Lifecycle::default(),
+            lead_authority: lead_authority::LeadAuthority::default(),
             registry,
             supervisor,
             roles,
@@ -837,11 +871,9 @@ impl Core {
                 let out = self.lifecycle_request(request).await;
                 let _ = reply.send(out);
             }
-            Command::RecoveryPreview { run, reply } => {
-                let _ = reply.send(self.recovery_preview(run));
-            }
-            Command::RecoverRun { request, by, reply } => {
-                let out = self.recover_run(request, by);
+            Command::RecoveryPreview { run, reply } => { let _ = reply.send(self.recovery_preview(run)); }
+            Command::RecoverRun { request, by, proof, reply } => {
+                let out = self.recover_run_with_confirmation(request, by, proof);
                 let _ = reply.send(out);
                 self.after_turn().await;
             }
@@ -866,15 +898,14 @@ impl Core {
                 let _ = reply.send(out);
                 self.after_turn().await;
             }
-            Command::AuditStart {
-                task,
-                selection,
-                caller_run_id,
-                reply,
-            } => {
-                let out = self
-                    .start_audit(task, selection, caller_run_id)
-                    .map(|run_id| PlanStartOut { run_id });
+            Command::ConfirmedLeadStart { task, message, setup, proof, reply } => {
+                let out = self.spawn_lead_with_confirmation(task, message, setup, Some(proof))
+                    .map(|(run_id, agent_id)| LeadStartOut { run_id, agent_id });
+                let _ = reply.send(out);
+                self.after_turn().await;
+            }
+            Command::AuditStart { task, selection, caller_run_id, reply } => {
+                let out = self.start_audit(task, selection, caller_run_id).map(|run_id| PlanStartOut { run_id });
                 let _ = reply.send(out);
                 self.after_turn().await;
             }
@@ -916,6 +947,9 @@ impl Core {
                 self.after_turn().await;
             }
             Command::AwaitResult { agent, reply } => self.park_waiter(agent, reply),
+            Command::WorkerTranscript { query, reply } => {
+                let _ = reply.send(transcript::page(&self.registry, &query));
+            }
             Command::Status { query, reply } => {
                 let out = self.status(&query);
                 let _ = reply.send(Ok(out));
@@ -948,7 +982,37 @@ impl Core {
                 by,
                 reply,
             } => {
-                self.begin_resolve(gate, approve, feedback, by, reply);
+                self.begin_resolve(gate, approve, feedback, by, None, reply);
+                self.after_turn().await;
+            }
+            Command::ConfirmedGate { gate, approve, feedback, by, proof, reply } => {
+                self.begin_resolve(gate, approve, feedback, by, Some(proof), reply);
+                self.after_turn().await;
+            }
+            Command::CheckHumanDecision { decision, peer, reply } => {
+                let _ = reply.send(self.check_human_decision(decision, peer.as_ref()));
+            }
+            Command::AuthorizeLead { run, peer, proof, reply } => {
+                let _ = reply.send(self.authorize_lead_run(run, peer.as_ref(), proof));
+            }
+            Command::LeadResolve { decision, peer, reply } => {
+                match self.authorize_lead_decision(&decision, peer.as_ref()) {
+                    Ok(()) => {
+                        let gate = decision.gate_id;
+                        let outcome = gates::begin_lead_resolve(&mut self.registry, decision, &self.roles);
+                        self.apply_gate_outcome(gate, outcome, reply);
+                    }
+                    Err(error) => { let _ = reply.send(Err(error)); }
+                }
+                self.after_turn().await;
+            }
+            Command::SocketDelegate { req, peer, terminal_lead_requested, reply } => {
+                let _ = reply.send(self.delegate_from_socket(req, peer.as_ref(), terminal_lead_requested));
+                self.after_turn().await;
+            }
+            Command::SocketStartPlan { plan, caller_run_id, peer, terminal_lead_requested, reply } => {
+                let _ = reply.send(self.start_plan_from_socket(plan, caller_run_id, peer.as_ref(), terminal_lead_requested)
+                    .map(|(run_id, claim)| (PlanStartOut { run_id }, claim)));
                 self.after_turn().await;
             }
             Command::SourceInventory { request, reply } => {
@@ -1243,6 +1307,60 @@ impl Core {
     // gates
     // -----------------------------------------------------------------------
 
+    fn check_human_decision(&mut self, decision: HumanDecision, peer: Option<&PeerProcess>) -> Result<Option<HumanPrompt>, CoreError> {
+        match decision {
+            HumanDecision::StartLead { task, message, setup } => {
+                self.authorize_human_peer(peer)?;
+                self.prepare_lead_confirmation(&task, &message, &setup).map(Some)
+            }
+            HumanDecision::AuthorizeLead(run) => self.lead_authorization_prompt(run, peer),
+            HumanDecision::Gate { gate, approve, feedback } => {
+                self.authorize_human_gate_peer(gate, peer)?;
+                let gate = self.registry.gate(&gate).ok_or(CoreError::UnknownGate(gate))?;
+                if let Some(prompt) = self.gate_confirmation(gate, approve, feedback.as_deref())? {
+                    self.authorize_human_peer(peer)?;
+                    return Ok(Some(prompt));
+                }
+                Ok(None)
+            }
+            HumanDecision::Recover(request) => {
+                let prompt = self.recovery_confirmation(&request)?;
+                if prompt.is_some() { self.authorize_human_peer(peer)?; }
+                Ok(prompt)
+            }
+        }
+    }
+
+    fn gate_confirmation(&self, gate: &Gate, approve: bool, feedback: Option<&str>) -> Result<Option<HumanPrompt>, CoreError> {
+        if gate.status != GateStatus::Pending || self.lead_approval_root(&gate.run_id).is_none() {
+            return Ok(None);
+        }
+        let (title, button, consequence) = match (gate.kind, approve) {
+            (GateKind::Integrate, true) => ("ACP — Approve local integration?", "Approve local commit",
+                "ACP will commit the exact reviewed patch in the task worktree."),
+            (GateKind::Integrate, false) => ("ACP — Deny local integration?", "Deny integration",
+                "ACP records the denial and any repair directions."),
+            (GateKind::Plan, true) => ("ACP — Approve this plan?", "Approve plan",
+                "ACP can release the plan's eligible work."),
+            (GateKind::Plan, false) => ("ACP — Deny this plan?", "Deny plan",
+                "ACP records the denial and any feedback."),
+            (GateKind::ExternalVerification, true) => ("ACP — Accept external verification?", "Accept evidence",
+                "ACP will capture and compare the current checkout before recording human verification evidence."),
+            (GateKind::ExternalVerification, false) => ("ACP — Deny external verification?", "Deny evidence",
+                "ACP will record the denial of this external verification."),
+            (GateKind::Escalate, false) => ("ACP — Respond to an escalation?", "Record response",
+                "ACP records your response for this escalation."),
+            (GateKind::Escalate, true) => return Err(human_confirmation::refused("respond to this escalation with gate.deny and optional feedback")),
+        };
+        let repo = human_confirmation::preview(&self.repo_root.to_string_lossy(), 180);
+        let mut message = format!("Repository: {repo}\nRun: {}\nGate: {}\n\n{consequence}", gate.run_id, gate.gate_id);
+        if let Some(feedback) = feedback.filter(|s| !s.is_empty()) {
+            message.push_str("\nFeedback preview: ");
+            message.push_str(&human_confirmation::preview(feedback, 160));
+        }
+        HumanPrompt::new("decide_gate", &(&self.repo_root, gate.gate_id, gate.run_id, gate.kind, approve, feedback), title, message, button).map(Some)
+    }
+
     /// Opens the exactly-once window and, for an approval, parks the reply behind the commit helper.
     fn begin_resolve(
         &mut self,
@@ -1250,8 +1368,25 @@ impl Core {
         approve: bool,
         feedback: Option<String>,
         by: Actor,
+        proof: Option<HumanProof>,
         reply: Reply<GateResolution>,
     ) {
+        if let Some(record) = self.registry.gate(&gate) {
+            let authorized = match by {
+                Actor::Socket { .. } => self.gate_confirmation(record, approve, feedback.as_deref())
+                    .and_then(|prompt| prompt.map_or(Ok(()), |p| human_confirmation::require(proof, &p))),
+                Actor::Mcp if self.lead_approval_root(&record.run_id).is_some() => {
+                    let reason = if record.kind == GateKind::Escalate { "an escalation requires a human decision" }
+                        else { "this gate requires its designated lead or a human decision" };
+                    Err(lead_authority::refusal(reason))
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = authorized {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        }
         if approve && matches!(&by, Actor::Socket { .. }) && self.registry.gate(&gate).is_some_and(|g|
             g.kind == types::GateKind::ExternalVerification && g.status == GateStatus::Pending) {
             if self.pending_external_verification.values().any(|p| matches!(p,
@@ -1267,14 +1402,19 @@ impl Core {
             self.start_external_capture(worktree.clone(), ExternalCapture::ApprovePending { gate, by, worktree, reply });
             return;
         }
-        match gates::begin_resolve(
+        let outcome = gates::begin_resolve(
             &mut self.registry,
             &gate,
             approve,
             feedback,
             by,
             &self.roles,
-        ) {
+        );
+        self.apply_gate_outcome(gate, outcome, reply);
+    }
+
+    fn apply_gate_outcome(&mut self, gate: GateId, outcome: Result<ResolveOutcome, CoreError>, reply: Reply<GateResolution>) {
+        match outcome {
             Ok(ResolveOutcome::Settled(resolution)) => {
                 let _ = reply.send(Ok(resolution.clone()));
                 // A denial resumes the live builder with the feedback and **no strike**
@@ -1465,6 +1605,13 @@ impl Core {
                 requested_by: crate::core::types::Origin::ControlPlane,
                 payload: gates::GatePayload { external_verification: Some(evidence), ..gates::GatePayload::default() },
             }, &captured)?;
+            if self.lead_approval_root(&run_id).is_some() {
+                return Ok(ExternalVerificationOut {
+                    gate_id: gate.gate_id,
+                    resolution: None,
+                    status: Some(GateStatus::Pending),
+                });
+            }
             let resolution = match gates::approve_external_with_inventory(
                 &mut self.registry, &gate.gate_id, by, &self.roles, &captured, &guard,
             )? {
@@ -1473,7 +1620,7 @@ impl Core {
                     "external verification did not settle as an approved commit-less gate").into()),
             };
             self.settled.push((gate.gate_id, resolution.clone()));
-            Ok(ExternalVerificationOut { gate_id: gate.gate_id, resolution })
+            Ok(ExternalVerificationOut { gate_id: gate.gate_id, resolution: Some(resolution), status: None })
         })();
         let _ = reply.send(answer);
     }
@@ -1710,6 +1857,10 @@ impl Core {
         };
         for run in &mut runs {
             run.run_budget_usd = run.effective_budget_usd(self.roles.defaults.run_budget_usd);
+            if let Some(execution) = &mut run.execution {
+                execution.lead_approval_run_id = self.lead_approval_root(&run.run_id);
+                execution.terminal_lead_requested = self.terminal_candidate_is_live(run.run_id);
+            }
         }
 
         let mut agents = Vec::new();
@@ -1726,7 +1877,11 @@ impl Core {
             }
             for gate in &run.gate_ids {
                 if let Some(gate) = self.registry.gate(gate) {
-                    gates.push(gate.clone());
+                    let mut gate = gate.clone();
+                    if self.lead_approval_root(&run.run_id).is_some() {
+                        gate.lead_evidence = gates::lead_candidate(&self.registry, &gate);
+                    }
+                    gates.push(gate);
                 }
             }
             for agent in &run.agent_ids {
@@ -1752,7 +1907,7 @@ impl Core {
                     self.registry
                         .events(&run.run_id, Some(since), limit)
                         .into_iter()
-                        .map(|e| (*e).clone()),
+                        .map(|e| transcript::notification_event(&e).into_owned()),
                 );
             }
         }
@@ -1830,6 +1985,8 @@ impl Core {
             agent_id: agent.agent_id,
             run_id: agent.run_id,
             role: agent.role,
+            origin: Some(agent.origin),
+            parent_agent_id: agent.parent_agent_id,
             provider: agent.provider,
             model: agent.model.clone(),
             process_state: agent.status,
@@ -2002,12 +2159,30 @@ pub struct CoreHandle(
 );
 
 impl CoreHandle {
-    pub async fn check_start(
-        &self,
-        request: crate::checks::Request,
-    ) -> Result<crate::checks::Summary, CoreError> {
-        self.ask(|reply| Command::CheckStart { request, reply })
-            .await
+    async fn confirm_human(&self, decision: HumanDecision, peer: Option<PeerProcess>) -> Result<Option<HumanProof>, CoreError> {
+        let prompt = self.ask(|reply| Command::CheckHumanDecision { decision, peer, reply }).await?;
+        match prompt {
+            Some(prompt) => human_confirmation::request(prompt).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn authorize_lead(&self, run: RunId, peer: Option<PeerProcess>) -> Result<LeadAuthorized, CoreError> {
+        let _admission = self.2.request().ok_or(CoreError::Unavailable)?;
+        let proof = self.confirm_human(HumanDecision::AuthorizeLead(run), peer.clone()).await?;
+        self.ask(|reply| Command::AuthorizeLead { run, peer, proof, reply }).await
+    }
+    pub async fn lead_resolve(&self, decision: LeadDecision, peer: Option<PeerProcess>) -> Result<GateResolution, CoreError> {
+        self.ask(|reply| Command::LeadResolve { decision, peer, reply }).await
+    }
+    pub async fn socket_delegate(&self, req: DelegateRequest, peer: Option<PeerProcess>, terminal_lead_requested: bool) -> Result<(DelegateOut, Option<uuid::Uuid>), CoreError> {
+        self.ask(|reply| Command::SocketDelegate { req, peer, terminal_lead_requested, reply }).await
+    }
+    pub async fn socket_start_plan(&self, plan: plan::Plan, caller_run_id: Option<RunId>, peer: Option<PeerProcess>, terminal_lead_requested: bool) -> Result<(PlanStartOut, Option<uuid::Uuid>), CoreError> {
+        self.ask(|reply| Command::SocketStartPlan { plan, caller_run_id, peer, terminal_lead_requested, reply }).await
+    }
+    pub async fn check_start(&self, request: crate::checks::Request) -> Result<crate::checks::Summary, CoreError> {
+        self.ask(|reply| Command::CheckStart { request, reply }).await
     }
     pub async fn check_cancel(&self, id: uuid::Uuid) -> Result<crate::checks::Summary, CoreError> {
         self.ask(|reply| Command::CheckCancel { id, reply }).await
@@ -2084,19 +2259,17 @@ impl CoreHandle {
         .await
     }
 
-    pub async fn start_audit(
-        &self,
-        task: Task,
-        selection: git::audit::Selection,
-        caller_run_id: Option<RunId>,
-    ) -> Result<PlanStartOut, CoreError> {
-        self.ask(|reply| Command::AuditStart {
-            task,
-            selection,
-            caller_run_id,
-            reply,
-        })
-        .await
+    pub(crate) async fn socket_start_lead(&self, task: Task, message: String, setup: LeadSetup, peer: Option<PeerProcess>) -> Result<LeadStartOut, CoreError> {
+        if !setup.lead_approved { return self.start_lead_with_setup(task, message, setup).await; }
+        let _admission = self.2.request().ok_or(CoreError::Unavailable)?;
+        let proof = self.confirm_human(HumanDecision::StartLead {
+            task: task.clone(), message: message.clone(), setup: setup.clone(),
+        }, peer).await?.ok_or_else(|| human_confirmation::refused("lead approval requires macOS confirmation"))?;
+        self.ask(|reply| Command::ConfirmedLeadStart { task, message, setup, proof, reply }).await
+    }
+
+    pub async fn start_audit(&self, task: Task, selection: git::audit::Selection, caller_run_id: Option<RunId>) -> Result<PlanStartOut, CoreError> {
+        self.ask(|reply| Command::AuditStart { task, selection, caller_run_id, reply }).await
     }
 
     /// Starts a B3 plan through the actor (socket, MCP `submit_plan`, or the CLI).
@@ -2134,13 +2307,14 @@ impl CoreHandle {
     /// Confirm a preview; duplicate accepted requests return their original replacement.
     /// # Errors
     /// [`CoreError::Policy`] for stale/ineligible choices, or registry/availability errors.
-    pub async fn recover_run(
-        &self,
-        request: recovery::Request,
-        by: Actor,
-    ) -> Result<recovery::Outcome, CoreError> {
-        self.ask(|reply| Command::RecoverRun { request, by, reply })
-            .await
+    pub async fn recover_run(&self, request: recovery::Request, by: Actor) -> Result<recovery::Outcome, CoreError> {
+        self.ask(|reply| Command::RecoverRun { request, by, proof: None, reply }).await
+    }
+
+    pub(crate) async fn socket_recover(&self, request: recovery::Request, peer: Option<PeerProcess>, by: Actor) -> Result<recovery::Outcome, CoreError> {
+        let _admission = self.2.request().ok_or(CoreError::Unavailable)?;
+        let proof = self.confirm_human(HumanDecision::Recover(request.clone()), peer).await?;
+        self.ask(|reply| Command::RecoverRun { request, by, proof, reply }).await
     }
 
     /// Return the actor's bounded explanation of every registered ACP worktree.
@@ -2286,6 +2460,15 @@ impl CoreHandle {
         .await
     }
 
+    pub(crate) async fn socket_resolve_gate(&self, gate: GateId, approve: bool, feedback: Option<String>, peer: Option<PeerProcess>, by: Actor) -> Result<GateResolution, CoreError> {
+        let _admission = self.2.request().ok_or(CoreError::Unavailable)?;
+        let proof = self.confirm_human(HumanDecision::Gate { gate, approve, feedback: feedback.clone() }, peer).await?;
+        match proof {
+            Some(proof) => self.ask(|reply| Command::ConfirmedGate { gate, approve, feedback, by, proof, reply }).await,
+            None => self.resolve_gate(gate, approve, feedback, by).await,
+        }
+    }
+
     /// Every event appended from now on. Capacity is
     /// [`EVENT_CHANNEL_CAPACITY`](crate::core::registry::EVENT_CHANNEL_CAPACITY); a subscriber that
     /// falls behind receives `RecvError::Lagged`, which the socket renders as `acp.lagged`.
@@ -2408,8 +2591,48 @@ mod tests {
     use crate::core::types::{BudgetContinuationAction, Origin, Task};
     use crate::roles::loader::load_roles;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    /// Run this test in an isolated process with inert provider executables on PATH.
+    /// The child proceeds with the test body; the parent checks its result.
+    pub(super) fn is_provider_fixture_child(test_module: &str, test_name: &str) -> bool {
+        const FIXTURE_TEST: &str = "ACP_ACTOR_TEST_PROVIDER_FIXTURES";
+
+        let (_, module) = test_module.split_once("::").expect("crate-qualified module");
+        let name = format!("{module}::{test_name}");
+        if std::env::var(FIXTURE_TEST).as_deref() == Ok(name.as_str()) {
+            return true;
+        }
+
+        let fixtures = TempDir::new().expect("provider fixture directory");
+        for program in ["claude", "codex"] {
+            let executable = fixtures.path().join(program);
+            fs::write(&executable, "#!/bin/sh\nexit 97\n").expect("inert provider fixture");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                .expect("executable provider fixture");
+        }
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(fixtures.path().to_path_buf())
+                .chain(std::env::split_paths(&inherited_path)),
+        )
+        .expect("provider fixture PATH");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name.as_str()])
+            .env(FIXTURE_TEST, &name)
+            .env("PATH", path)
+            .output()
+            .expect("run isolated provider fixture test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.lines().any(|line| line == "running 1 test"),
+            "isolated test {name} failed\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        false
+    }
 
     fn task() -> Task {
         Task {
@@ -2585,7 +2808,7 @@ mod tests {
         }).unwrap();
         core.registry.append(&run, EventPayload::GateResolving {
             gate_id: gate.gate_id, approve: true, feedback: None,
-            by: Actor::Socket { client_name: "human".into() }, commit: None,
+            by: Actor::Socket { client_name: "human".into() }, lead_decision: None, commit: None,
             external_verification: None,
         }).unwrap();
         assert!(core.lifecycle_request(lifecycle::Request::Stop { mode: lifecycle::StopMode::CancelWork }).await.is_err());
@@ -3191,6 +3414,7 @@ mod tests {
         let (run, agent) = seed(&mut core);
         let lineage = core.registry.agent(&agent).and_then(|agent| agent.lineage_id).expect("lineage");
         core.registry.append(&run, EventPayload::WorktreeCreated {
+            delegated_task: None,
             agent_id: agent,
             lineage_id: lineage,
             path: core.repo_root.clone(),
@@ -3255,6 +3479,12 @@ mod tests {
 
     #[tokio::test]
     async fn budget_spawn_continuation_recovers_exact_attempt_after_restart() {
+        if !is_provider_fixture_child(
+            module_path!(),
+            "budget_spawn_continuation_recovers_exact_attempt_after_restart",
+        ) {
+            return;
+        }
         let dir = TempDir::new().expect("tempdir");
         fs::create_dir_all(dir.path().join("repo")).expect("repo");
         let (mut first, _rx) = core(&dir);
@@ -3288,6 +3518,12 @@ mod tests {
 
     #[tokio::test]
     async fn reissued_spawn_budget_denial_preserves_ids_and_needs_another_opt_in() {
+        if !is_provider_fixture_child(
+            module_path!(),
+            "reissued_spawn_budget_denial_preserves_ids_and_needs_another_opt_in",
+        ) {
+            return;
+        }
         let dir = TempDir::new().expect("tempdir");
         fs::create_dir_all(dir.path().join("repo")).expect("repo");
         let (mut first, _rx) = core(&dir);

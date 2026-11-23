@@ -550,7 +550,8 @@ pub fn capture_execution(cfg: &RolesConfig, team: Option<&ValidTeam>) -> RunExec
             assignments.insert(role_key(role).to_string(), resolve_assignment(cfg, team, role));
         }
     }
-    RunExecution { authorized_audit_selection: None, audit_selection: None, version: 1, mode: team.map_or(RunMode::Build, ValidTeam::mode), assignments,
+    RunExecution { lead_approval_run_id: None, lead_owner_run_id: None, terminal_lead_requested: false,
+        authorized_audit_selection: None, audit_selection: None, version: 1, mode: team.map_or(RunMode::Build, ValidTeam::mode), assignments,
         steps: team.map(|t| RunSteps { security: t.step_enabled(RoleName::Security), verify: t.step_enabled(RoleName::Verifier),
             review: t.step_enabled(RoleName::Reviewer) }).unwrap_or_default() }
 }
@@ -677,7 +678,7 @@ pub fn roles_list(cfg: &RolesConfig, available: &BTreeMap<ProviderName, bool>) -
         name: "lead".into(), provider: spec.provider, models: spec.models.clone(),
         default_model: spec.default_model.clone(), writes: false, description: spec.description.clone(),
     });
-    RolesListResult { human_setup_version: 1, lead, roles, providers }
+    RolesListResult { human_setup_version: 2, lead, roles, providers }
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +957,7 @@ mod tests {
             &cfg,
             &team_json(json!({
                 "version": 1, "name": "t",
-                "roles": { "verifier": { "provider": "codex", "model": "gpt-5.5" } }
+                "roles": { "verifier": { "provider": "codex", "model": "gpt-6-astra" } }
             })),
         );
         // C1 flipped `sandboxes_writes(Codex)`: the once-refused pairing now validates.
@@ -984,7 +985,7 @@ mod tests {
         let verifier = RoleSpec {
             role: RoleName::Verifier,
             provider: ProviderName::Claude,
-            models: vec!["haiku".into(), "gpt-5.5".into()],
+            models: vec!["haiku".into(), "gpt-6-astra".into()],
             default_model: "haiku".into(),
             writes: false,
             prompt_file: None,
@@ -999,7 +1000,7 @@ mod tests {
         };
         let assignment = Assignment {
             provider: ProviderName::Codex,
-            model: "gpt-5.5".into(),
+            model: "gpt-6-astra".into(),
             effort: None,
         };
         let mut issues = Vec::new();
@@ -1038,7 +1039,7 @@ mod tests {
             "lead": { "provider": "claude", "model": "opus" },
             "roles": {
                 "builder": { "provider": "claude", "model": "sonnet" },
-                "reviewer": { "provider": "codex", "model": "gpt-5.5", "effort": "high" }
+                "reviewer": { "provider": "codex", "model": "gpt-6-astra", "effort": "high" }
             }
         })
     }
@@ -1073,7 +1074,7 @@ mod tests {
 
         let reviewer = resolve_assignment(&cfg, None, RoleName::Reviewer);
         assert_eq!(reviewer.provider, ProviderName::Codex);
-        assert_eq!(reviewer.model, "gpt-5.5");
+        assert_eq!(reviewer.model, "gpt-6-astra");
     }
 
     /// A team that names only one role leaves the other on its default.
@@ -1104,7 +1105,7 @@ mod tests {
         );
         assert_eq!(
             resolve_assignment(&cfg, Some(&team), RoleName::Reviewer).model,
-            "gpt-5.5"
+            "gpt-6-astra"
         );
         assert!(resolve_assignment(&cfg, Some(&team), RoleName::Reviewer)
             .effort
@@ -1222,7 +1223,7 @@ mod tests {
         assert_eq!(
             issue_codes(json!({
                 "version": 1, "name": "t",
-                "lead": { "provider": "claude", "model": "gpt-5.5" },
+                "lead": { "provider": "claude", "model": "gpt-6-astra" },
                 "roles": {}
             })),
             vec![TeamIssueCode::ModelNotInProvider]
@@ -1239,7 +1240,7 @@ mod tests {
                 "roles": {
                     "builder": { "provider": "claude", "model": "sonnet" },
                     "nonesuch": { "provider": "claude", "model": "sonnet" },
-                    "lead": { "provider": "codex", "model": "gpt-5.5" }
+                    "lead": { "provider": "codex", "model": "gpt-6-astra" }
                 }
             })),
         )
@@ -1257,7 +1258,7 @@ mod tests {
     #[test]
     fn an_unknown_effort_does_not_deserialize() {
         let err = serde_json::from_value::<Assignment>(json!({
-            "provider": "codex", "model": "gpt-5.5", "effort": "turbo"
+            "provider": "codex", "model": "gpt-6-astra", "effort": "turbo"
         }))
         .expect_err("closed enum");
         assert!(err.to_string().contains("turbo"), "{err}");
@@ -1266,7 +1267,7 @@ mod tests {
     #[test]
     fn an_unknown_key_in_an_assignment_does_not_deserialize() {
         serde_json::from_value::<Assignment>(json!({
-            "provider": "codex", "model": "gpt-5.5", "sandbox": "danger"
+            "provider": "codex", "model": "gpt-6-astra", "sandbox": "danger"
         }))
         .expect_err("deny_unknown_fields");
     }
@@ -1399,7 +1400,7 @@ mod tests {
         );
         assert_eq!(
             value["roles"]["reviewer"],
-            json!({ "provider": "codex", "model": "gpt-5.5", "effort": "high" })
+            json!({ "provider": "codex", "model": "gpt-6-astra", "effort": "high" })
         );
     }
 
@@ -1447,21 +1448,23 @@ mod tests {
         };
         let mut legacy = value.clone();
         let lead = legacy.as_object_mut().unwrap().remove("lead").unwrap();
-        assert_eq!(legacy.as_object_mut().unwrap().remove("humanSetupVersion"), Some(serde_json::json!(1)));
+        assert_eq!(legacy.as_object_mut().unwrap().remove("humanSetupVersion"), Some(serde_json::json!(2)));
         assert_eq!(lead["name"], "lead");
         assert_eq!(lead["writes"], false);
-        assert!(lead["models"].as_array().unwrap().contains(&json!("gpt-5.5")));
+        assert!(lead["models"].as_array().unwrap().contains(&json!("gpt-6-astra")));
         assert_eq!(keys(&legacy), keys(&fallback), "lead is an additive catalog field");
         assert_eq!(
             keys(&value["roles"][0]),
             keys(&fallback["roles"][0]),
             "a role entry does not match the app's RoleSpec"
         );
-        assert_eq!(
-            keys(&value["providers"]["codex"]),
-            keys(&fallback["providers"]["codex"]),
-            "a provider entry does not match the app's ProviderSpec"
-        );
+        let required_keys = |provider: &Value| {
+            keys(provider).into_iter().filter(|key| key != "modelEfforts").collect::<Vec<_>>()
+        };
+        assert_eq!(required_keys(&value["providers"]["codex"]), required_keys(&fallback["providers"]["codex"]),
+            "the current provider entry must keep the legacy required fields");
+        assert!(value["providers"]["codex"].get("modelEfforts").is_none(),
+            "all currently selectable Codex models inherit the provider's effort list");
 
         let roles = value["roles"].as_array().expect("roles");
         assert_eq!(roles.len(), 4, "the lead is not a worker role");
@@ -1517,19 +1520,22 @@ mod tests {
     /// names the model — "codex does not accept max" would be false for the models that do.
     #[test]
     fn an_effort_the_model_does_not_take_is_refused_by_model_name() {
-        let cfg = cfg();
+        let mut cfg = (*cfg()).clone();
+        let codex = cfg.providers.get_mut(&ProviderName::Codex).unwrap();
+        let narrower = vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh];
+        codex.model_efforts.insert("gpt-6.1-terra".into(), narrower);
         let issues = validate_team(
             &cfg,
             &team_json(json!({
                 "version": 1, "name": "t",
-                "roles": { "reviewer": { "provider": "codex", "model": "gpt-5.5", "effort": "max" } }
+                "roles": { "reviewer": { "provider": "codex", "model": "gpt-6.1-terra", "effort": "max" } }
             })),
         )
-        .expect_err("gpt-5.5 takes no max");
+        .expect_err("the narrowed model takes no max");
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0].code, TeamIssueCode::EffortNotAllowed);
         assert!(
-            issues[0].detail.contains("gpt-5.5") && issues[0].detail.contains("`max`"),
+            issues[0].detail.contains("gpt-6.1-terra") && issues[0].detail.contains("`max`"),
             "{}",
             issues[0].detail
         );
@@ -1548,11 +1554,11 @@ mod tests {
             &cfg,
             &team_json(json!({
                 "version": 3, "mode": "plan", "name": "t",
-                "lead": { "provider": "codex", "model": "gpt-5.3-codex-spark", "effort": "max" },
+                "lead": { "provider": "codex", "model": "gpt-6.1-terra", "effort": "max" },
                 "roles": {}
             })),
         )
-        .expect_err("spark takes no max");
+        .expect_err("the narrowed model takes no max");
         assert_eq!(issues[0].code, TeamIssueCode::EffortNotAllowed);
     }
 
@@ -1560,15 +1566,17 @@ mod tests {
     /// model that takes the whole list send nothing extra, so an older app keeps decoding.
     #[test]
     fn roles_list_carries_model_efforts_only_where_a_model_narrows_the_list() {
-        let cfg = cfg();
+        let mut cfg = (*cfg()).clone();
+        cfg.providers.get_mut(&ProviderName::Codex).unwrap().model_efforts.insert(
+            "gpt-6.1-terra".into(), vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh],
+        );
         let available =
             BTreeMap::from([(ProviderName::Claude, true), (ProviderName::Codex, true)]);
         let value = serde_json::to_value(roles_list(&cfg, &available)).expect("json");
         let codex = &value["providers"]["codex"];
         assert_eq!(codex["efforts"], json!(["low", "medium", "high", "xhigh", "max"]));
-        assert_eq!(codex["modelEfforts"]["gpt-5.5"], json!(["low", "medium", "high", "xhigh"]));
         assert_eq!(
-            codex["modelEfforts"]["gpt-5.3-codex-spark"],
+            codex["modelEfforts"]["gpt-6.1-terra"],
             json!(["low", "medium", "high", "xhigh"])
         );
         assert!(codex["modelEfforts"].get("gpt-6-astra").is_none());
@@ -1583,10 +1591,26 @@ mod tests {
         let decoded: RolesListResult = serde_json::from_value(value).expect("decodes");
         let codex = &decoded.providers[&ProviderName::Codex];
         assert_eq!(
-            codex.efforts_for("gpt-5.5"),
+            codex.efforts_for("gpt-6.1-terra"),
             [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh]
         );
         assert_eq!(codex.efforts_for("gpt-6-astra").last(), Some(&Effort::Max));
         assert!(decoded.providers[&ProviderName::Claude].efforts_for("haiku").is_empty());
+    }
+
+    #[test]
+    fn retired_model_stays_in_saved_team_until_explicit_reselection() {
+        let cfg = cfg();
+        let dir = TempDir::new().unwrap();
+        let team = team_json(json!({
+            "version": 3, "mode": "plan", "name": "historical choice",
+            "lead": { "provider": "codex", "model": "gpt-5.6-sol", "effort": "high" },
+        }));
+        save_team(dir.path(), &team).unwrap();
+        let saved = load_team(dir.path()).unwrap().unwrap();
+        assert_eq!(saved, team);
+        let issues = validate_team(&cfg, &saved).unwrap_err();
+        assert!(issues.iter().any(|issue| issue.code == TeamIssueCode::ModelNotInProvider));
+        assert_eq!(load_team(dir.path()).unwrap(), Some(team));
     }
 }

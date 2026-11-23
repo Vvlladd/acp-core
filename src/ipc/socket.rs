@@ -8,9 +8,9 @@
 //!
 //! Three properties are load-bearing and are spelled out where they are implemented:
 //!
-//! * **`gate.approve` exists only here** (S2). It is the one approving door in the system, and it
-//!   is unreachable over MCP, so an agent cannot approve its own integration. [`Connection::call`]
-//!   is the whole method table — the security claim is checkable by reading one `match`.
+//! * **`gate.approve` is the human socket method.** A run's designated lead uses
+//!   `gate.leadResolve`, which supplies kernel peer identity to the actor. The actor checks
+//!   the per-run grant and integration evidence. [`Connection::call`] lists the methods.
 //! * **`subscribe` attaches the broadcast receiver *before* it takes the `sinceSeq` backfill
 //!   snapshot**, so an event appended during the backfill window is delivered twice rather than
 //!   lost. Clients MUST dedupe by `seq`; that is a term of the contract, not an implementation
@@ -44,13 +44,8 @@
 //!   this package, and CLAUDE.md fixes the dependency list. The codec is the same `LinesCodec` with
 //!   the same `new_with_max_length(MAX_LINE_BYTES)`, doing the same incremental length check while
 //!   the line streams in; only the driving loop is hand-written.
-//! * **`resolve_gate{approve:true}` is refused here for every gate kind**, not only for `integrate`
-//!   under `gates.allowAgentApprove: false`. The design pins "`resolve_gate` over the socket behaves
-//!   exactly as over MCP (deny-only), so there is exactly **one** approving door"; mirroring the
-//!   *conditional* MCP rule would need the gate's kind and the roles config, neither of which a
-//!   transport may read. Refusing outright costs a socket client nothing — `gate.approve` is
-//!   available to it unconditionally — and makes "one approving door" structural rather than
-//!   configuration-dependent.
+//! * **The generic socket `resolve_gate` refuses approvals for every gate kind.** A caller
+//!   must enter through the appropriate human or designated-lead method for approval.
 //! * **The seven tool-equivalent methods carry their own params types.** The design's `DelegateArgs`
 //!   and friends live in `mcp/server.rs`, which is a different door with a different framework
 //!   (`schemars`-advertised input schemas, `rmcp`'s `Parameters`); depending on it from here would
@@ -456,6 +451,7 @@ enum Ending {
 struct Connection {
     core: CoreHandle,
     identity: Arc<ServerIdentity>,
+    peer: Option<crate::core::lead_authority::PeerProcess>,
     /// The `clientName` from `hello`, recorded as [`Actor::Socket`] on everything this connection
     /// resolves. A `Mutex` because request tasks run concurrently; the contract has clients call
     /// `hello` first and await its reply, so there is no ordering to race over.
@@ -484,9 +480,9 @@ async fn serve_connection(
     identity: Arc<ServerIdentity>,
     shutdown: CancellationToken,
 ) {
-    let Some(_connection) = core.ingress().connection() else {
-        return;
-    };
+    let Some(_connection) = core.ingress().connection() else { return; };
+    let peer = stream.peer_cred().ok().and_then(|credential| credential.pid())
+        .and_then(crate::core::lead_authority::PeerProcess::from_pid);
     let (reader, writer) = stream.into_split();
     let (out_tx, out_rx) = mpsc::channel::<String>(OUTBOX_CAPACITY);
     let mut writer_task = tokio::spawn(write_lines(writer, out_rx));
@@ -496,6 +492,7 @@ async fn serve_connection(
     let conn = Arc::new(Connection {
         core,
         identity,
+        peer,
         client: Mutex::new(DEFAULT_CLIENT_NAME.to_string()),
         out: out_tx,
         subscription: sub_tx,
@@ -598,6 +595,10 @@ async fn write_lines(mut writer: OwnedWriteHalf, mut out: mpsc::Receiver<String>
 }
 
 impl Connection {
+    fn peer_process(&self) -> Option<crate::core::lead_authority::PeerProcess> {
+        self.peer.as_ref().filter(|peer| peer.is_live()).cloned()
+    }
+
     /// Queues one framed line. `false` means the client is gone.
     async fn send(&self, mut line: String) -> bool {
         line.push('\n');
@@ -706,6 +707,10 @@ impl Connection {
                 .map_err(|e| RpcError::new(-32000, e.to_string()))?
                 .map_err(|e| RpcError::new(-32000, e))
             }
+            "run.transcript" => {
+                let query = parse_params(params)?;
+                to_value(&self.core.worker_transcript(query).await.map_err(RpcError::from_core)?)
+            }
             "checks.catalog" => {
                 let _: NoParams = parse_params(params)?;
                 let availability = crate::checks::runner::helper();
@@ -773,6 +778,10 @@ impl Connection {
             "lead.start" => self.lead_start(parse_params(params)?).await,
             "evidence.import" => self.evidence_import(parse_params(params)?).await,
             "evidence.show" => self.evidence_show(parse_params(params)?).await,
+            "run.authorize_lead" => {
+                let p: AuthorizeLeadParams = parse_params(params)?;
+                to_value(&self.core.authorize_lead(p.run_id, self.peer_process()).await.map_err(RpcError::from_core)?)
+            }
             "delegate" => self.delegate(parse_params(params)?).await,
             // B3: socket plan entry — same task bounds as `delegate`, applied per work item.
             "plan.start" => self.plan_start(parse_params(params)?).await,
@@ -787,6 +796,7 @@ impl Connection {
             "request_human_gate" => self.request_human_gate(parse_params(params)?).await,
             "resolve_gate" => self.resolve_gate(parse_params(params)?).await,
             "gate.approve" => self.gate_approve(parse_params(params)?).await,
+            "gate.leadResolve" => self.lead_resolve(parse_params(params)?).await,
             "gate.deny" => self.gate_deny(parse_params(params)?).await,
             // Socket-only human evidence. It is deliberately absent from MCP and proxy tools.
             "verification.external" => self.external_verification(parse_params(params)?).await,
@@ -806,7 +816,7 @@ impl Connection {
                 to_value(
                     &self
                         .core
-                        .recover_run(p, self.actor())
+                        .socket_recover(p, self.peer_process(), self.actor())
                         .await
                         .map_err(RpcError::from_core)?,
                 )
@@ -917,12 +927,14 @@ impl Connection {
                 }
             }
         }
-        let out = self
+        let (out, claim) = self
             .core
-            .start_plan(params.plan, params.caller_run_id)
+            .socket_start_plan(params.plan, params.caller_run_id, self.peer_process(), params.terminal_lead_requested)
             .await
             .map_err(RpcError::from_core)?;
-        to_value(&out)
+        let mut response = to_value(&out)?;
+        if let Some(claim) = claim { response["terminalClaim"] = json!(claim); }
+        Ok(response)
     }
 
     async fn audit_start(&self, params: AuditStartParams) -> Result<Value, RpcError> {
@@ -936,13 +948,16 @@ impl Connection {
     }
 
     async fn delegate(&self, params: DelegateParams) -> Result<Value, RpcError> {
+        let terminal_lead_requested = params.terminal_lead_requested;
         let request = params.into_request(&self.identity.repo_root, &self.identity.state_dir)?;
-        let out = self
+        let (out, claim) = self
             .core
-            .delegate(request)
+            .socket_delegate(request, self.peer_process(), terminal_lead_requested)
             .await
             .map_err(RpcError::from_core)?;
-        to_value(&out)
+        let mut response = to_value(&out)?;
+        if let Some(claim) = claim { response["terminalClaim"] = json!(claim); }
+        Ok(response)
     }
 
     /// `lead.start` — the socket-only human act that opens one conversational run. The synthetic
@@ -960,17 +975,15 @@ impl Connection {
         };
         let out = self
             .core
-            .start_lead_with_setup(
-                task,
-                params.message,
-                crate::core::LeadSetup {
-                    audit_selection: params.audit_selection,
-                    expected_team: params.expected_team,
-                },
-            )
+            .socket_start_lead(task, params.message, crate::core::LeadSetup {
+                audit_selection: params.audit_selection, expected_team: params.expected_team,
+                lead_approved: params.lead_approved,
+            }, self.peer_process())
             .await
             .map_err(RpcError::from_core)?;
-        to_value(&out)
+        let mut response = to_value(&out)?;
+        if params.lead_approved { response["leadApproved"] = json!(true); }
+        Ok(response)
     }
 
     async fn evidence_import(&self, params: EvidenceImportParams) -> Result<Value, RpcError> {
@@ -1129,8 +1142,8 @@ impl Connection {
         to_value(&out)
     }
 
-    /// `resolve_gate` — **deny-only**, exactly as over MCP, so `gate.approve` is the one approving
-    /// door in the system (S2). See this module's header for why the refusal is unconditional.
+    /// The generic agent route can only deny. Authority for a scoped lead decision is
+    /// checked separately by `gate.leadResolve`.
     async fn resolve_gate(&self, params: ResolveGateParams) -> Result<Value, RpcError> {
         if params.approve {
             return Err(RpcError::policy(
@@ -1139,8 +1152,17 @@ impl Connection {
                     .to_string(),
             ));
         }
-        self.deny(params.gate_id, params.feedback, params.caller_run_id, Actor::Mcp)
-            .await
+        self.deny(params.gate_id, params.feedback, params.caller_run_id, Actor::Mcp).await
+    }
+
+    async fn lead_resolve(&self, params: crate::core::lead_authority::LeadDecision) -> Result<Value, RpcError> {
+        if let Some(feedback) = &params.feedback { check_chars("feedback", feedback, 0, MAX_FEEDBACK_CHARS)?; }
+        if let Some(hash) = &params.diff_hash {
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                return Err(RpcError::invalid_params("diffHash must be a lowercase SHA-256 digest".to_string()));
+            }
+        }
+        to_value(&self.core.lead_resolve(params, self.peer_process()).await.map_err(RpcError::from_core)?)
     }
 
     /// `gate.approve` — **the only approving door**, reachable over this socket and nowhere else.
@@ -1151,21 +1173,26 @@ impl Connection {
     async fn gate_approve(&self, params: GateApproveParams) -> Result<Value, RpcError> {
         let resolution = self
             .core
-            .resolve_gate(params.gate_id, true, None, self.actor())
+            .socket_resolve_gate(params.gate_id, true, None, self.peer_process(), self.actor())
             .await
             .map_err(RpcError::from_core)?;
         to_value(&resolution)
     }
 
     async fn gate_deny(&self, params: GateDenyParams) -> Result<Value, RpcError> {
-        self.deny(params.gate_id, params.feedback, None, self.actor()).await
+        if let Some(feedback) = &params.feedback {
+            check_chars("feedback", feedback, 0, MAX_FEEDBACK_CHARS)?;
+        }
+        let out = self.core.socket_resolve_gate(params.gate_id, false, params.feedback, self.peer_process(), self.actor())
+            .await.map_err(RpcError::from_core)?;
+        to_value(&out)
     }
 
     async fn external_verification(&self, params: ExternalVerificationParams) -> Result<Value, RpcError> {
         validate_external_evidence(&params.evidence)?;
         let out = self.core.prepare_external_verification(params.run_id, params.evidence, self.actor())
             .await.map_err(RpcError::from_core)?;
-        Ok(json!({ "gateId": out.gate_id, "resolution": out.resolution }))
+        to_value(&out)
     }
 
     async fn source_inventory(&self, request: crate::core::types::SourceInventoryRequest) -> Result<Value, RpcError> {
@@ -1336,6 +1363,8 @@ struct DelegateParams {
     caller_run_id: Option<RunId>,
     #[serde(default)]
     evidence_bundle_id: Option<String>,
+    #[serde(default)]
+    terminal_lead_requested: bool,
 }
 
 #[derive(Deserialize)]
@@ -1348,6 +1377,8 @@ struct LeadStartParams {
     expected_team: Option<crate::core::team::Team>,
     #[serde(default)]
     evidence_bundle_id: Option<String>,
+    #[serde(default)]
+    lead_approved: bool,
 }
 
 #[derive(Deserialize)]
@@ -1360,11 +1391,17 @@ struct EvidenceShowParams { bundle_id: String }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthorizeLeadParams { run_id: RunId }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlanStartParams {
     plan: crate::core::plan::Plan,
     /// T84: same attestation as `DelegateParams.callerRunId`.
     #[serde(default)]
     caller_run_id: Option<RunId>,
+    #[serde(default)]
+    terminal_lead_requested: bool,
 }
 
 fn fresh_session() -> String {
@@ -1685,10 +1722,9 @@ fn check_client_name(name: String) -> Result<String, RpcError> {
             "clientName must not contain control characters".to_string(),
         ));
     }
-    if trimmed == Actor::Mcp.as_str() {
+    if [Actor::Mcp.as_str(), Actor::Lead.as_str()].contains(&trimmed) {
         return Err(RpcError::invalid_params(format!(
-            "clientName must not be \"{}\" — that is the MCP channel's own actor",
-            Actor::Mcp
+            "clientName {trimmed:?} is reserved for an ACP actor"
         )));
     }
     Ok(trimmed.to_string())
@@ -2231,11 +2267,11 @@ fn notification(method: &str, params: &Value) -> String {
     encode(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
 }
 
-/// `acp.event{protocolVersion, event}` — the `Event` exactly as written to `events.jsonl`.
+/// Worker message notifications carry identity only; text is available on demand.
 fn event_notification(event: &Event) -> String {
     notification(
         NOTIFY_EVENT,
-        &json!({ "protocolVersion": PROTOCOL_VERSION, "event": event }),
+        &json!({ "protocolVersion": PROTOCOL_VERSION, "event": crate::core::transcript::notification_event(event) }),
     )
 }
 

@@ -902,6 +902,43 @@ exit 1
     });
 }
 
+#[test]
+fn denied_worker_pauses_without_strikes_and_cannot_resume_after_restart() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("native_permission", &[]);
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let out = actor.handle.delegate(delegate_builder(loop_task("permission-wait"))).await.unwrap();
+        let events = wait_for_log(&world, &out.run_id, "native permission block", |events| !branches(events).is_empty()).await;
+        assert_eq!(finished(&events), vec![(AttemptStatus::Failed, Some(ErrorCode::NativePermissionRequired))]);
+        assert_eq!(branches(&events), vec![LoopBranch::Environment]);
+        assert!(strikes(&events).is_empty());
+        assert_eq!(attempts_started(&events).len(), 1);
+        actor.stop().await;
+        let restarted = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let result = restarted.handle.send_message(out.agent_id, "resume".into()).await.unwrap();
+        assert!(matches!(result, agent_control_plane::core::SendResult::Rejected { .. }));
+        assert_eq!(attempts_started(&world.events(&out.run_id)).len(), 1);
+        restarted.stop().await;
+    });
+}
+
+#[test]
+fn permission_wait_and_denylist_keep_the_human_escalation_and_resume_guard() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("native_permission_denylist", &[]);
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let out = actor.handle.delegate(delegate_builder(loop_task("permission-denylist"))).await.unwrap();
+        let events = wait_for_log(&world, &out.run_id, "permission escalation", |events| !branches(events).is_empty()).await;
+        assert_eq!(finished(&events), vec![(AttemptStatus::Escalate, Some(ErrorCode::NativePermissionRequired))]);
+        assert_eq!(branches(&events), vec![LoopBranch::Gate]);
+        assert!(strikes(&events).is_empty());
+        assert!(events.iter().any(|e| matches!(e.payload, EventPayload::GateCreated { gate_kind: GateKind::Escalate, .. })));
+        assert!(matches!(actor.handle.send_message(out.agent_id, "resume".into()).await.unwrap(),
+            agent_control_plane::core::SendResult::Rejected { .. }));
+        actor.stop().await;
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Steps 10-11 — what the worker did to the workspace
 // ---------------------------------------------------------------------------

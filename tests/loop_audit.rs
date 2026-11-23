@@ -34,13 +34,13 @@ fn setup_with_security(
     if review {
         roles.insert(
             "reviewer".into(),
-            json!({"provider":"codex","model":"gpt-5.5"}),
+            json!({"provider":"codex","model":"gpt-6-astra"}),
         );
     }
     if security {
         roles.insert(
             "security".into(),
-            json!({"provider":"codex","model":"gpt-5.5"}),
+            json!({"provider":"codex","model":"gpt-6-astra"}),
         );
     }
     let team: Team =
@@ -508,12 +508,12 @@ fn human_audit_setup_is_required_recorded_and_enforced_after_team_changes() {
         let mut wrong_team = saved.clone();
         wrong_team.name = "someone else's setup".into();
         let rejected = agent_control_plane::core::LeadSetup {
-            audit_selection: Some(selected.clone()), expected_team: Some(wrong_team),
+            audit_selection: Some(selected.clone()), expected_team: Some(wrong_team), lead_approved: false,
         };
         assert!(actor.handle.start_lead_with_setup(task.clone(), task.description.clone(), rejected).await.is_err());
         assert!(world.reopen().state().runs.is_empty(), "team conflict has no partial run");
         let setup = agent_control_plane::core::LeadSetup {
-            audit_selection: Some(selected.clone()), expected_team: Some(saved),
+            audit_selection: Some(selected.clone()), expected_team: Some(saved), lead_approved: false,
         };
         let lead = actor.handle.start_lead_with_setup(task.clone(), task.description.clone(), setup).await.unwrap();
         wait_for_log(&world, &lead.run_id, "audit lead ended", |events| events.iter().any(|e|
@@ -528,7 +528,7 @@ fn human_audit_setup_is_required_recorded_and_enforced_after_team_changes() {
         assert!(actor.handle.start_audit(task.clone(), selection(), Some(lead.run_id)).await.is_err(),
             "the lead cannot replace a committed input with the working tree");
         assert!(actor.handle.start_lead_with_setup(task.clone(), task.description.clone(),
-            agent_control_plane::core::LeadSetup { audit_selection: Some(selected.clone()), expected_team: Some(plan) })
+            agent_control_plane::core::LeadSetup { audit_selection: Some(selected.clone()), expected_team: Some(plan), lead_approved: false })
             .await.is_err(), "planning cannot silently consume an audit selection");
         let run = actor.handle.start_audit(task, selected.clone(), Some(lead.run_id)).await.unwrap().run_id;
         wait_for_log(&world, &run, "empty human audit", |events| events.iter().any(|e|

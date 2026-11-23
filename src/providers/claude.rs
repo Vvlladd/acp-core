@@ -460,6 +460,8 @@ fn parse_result(value: &Value) -> Vec<NormalizedEvent> {
     let cost_usd = value.get("total_cost_usd").and_then(Value::as_f64);
     let subtype = str_at(value, "subtype");
     let failure = claude_failure(value);
+    let denied = value.get("permission_denials").and_then(Value::as_array)
+        .is_some_and(|entries| !entries.is_empty());
     vec![
         NormalizedEvent::Usage { tokens, cost_usd },
         NormalizedEvent::Final {
@@ -495,6 +497,7 @@ fn parse_result(value: &Value) -> Vec<NormalizedEvent> {
             // classified by the caller from the exit code and the terminal-state table.
             error_code: failure
                 .map(|(_, code)| code)
+                .or_else(|| denied.then_some(ErrorCode::NativePermissionRequired))
                 .or_else(|| (subtype == Some("error_max_turns")).then_some(ErrorCode::MaxTurns)),
         },
     ]

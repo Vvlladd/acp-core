@@ -8,10 +8,54 @@ Choose one entry model: a host owns `acp serve` on stdio, or `acp up --managed -
 detached `serve --no-mcp` and clients attach through CLI/socket or `acp mcp-proxy`. The skill uses
 the latter. An attach result does not grant ownership of another session's daemon lifetime.
 
-Team changes and integration approval are socket-only human operations. MCP may deny a gate but
-cannot approve integration. Tasks retain their recorded team/execution settings across replay;
-editing the saved team does not silently change an in-flight run. The daemon's closed catalog is
-in `roles/roles.json`; arbitrary CLI flag passthrough is not supported.
+Team changes and ordinary integration approvals use the human socket interface. Direct MCP can
+deny gates where policy permits and has no approval authority. Tasks retain their recorded team
+and execution settings across replay. Editing the saved team affects subsequent runs. The closed
+catalog is in `roles/roles.json`.
+
+## Lead approval for one run
+
+Ordinary runs require a person at each integration gate. An eligible run can instead carry a
+human grant for its designated Claude Code or Codex lead. A terminal lead requests a private
+claim with `--request-lead-approval --claim-file <new-path>` when using `acp delegate` or `acp plan`.
+Choose a new owner-private scratch path outside the repository and worker worktrees. The CLI
+writes the claim there. Keep it out of chats, logs and worker messages.
+
+Once the designated lead has obtained the run ID, the person can run this command or select the
+same run in a connected Mac or paired browser client:
+
+```sh
+acp --repo "$REPO" gate authorize-lead "$RUN_ID"
+```
+
+The `run.authorize_lead` request names `runId`. The daemon shows the operation in a macOS system
+dialog with Cancel as the default. Only its affirmative response enables the grant. Interactive
+macOS confirmation is required for new grants. For native clients that start a spawned lead,
+`lead.start` accepts `leadApproved: true` and applies the same confirmation before creating the
+run. Only the confirmed run and its linked delegated work inherit the grant. An existing
+terminal conversation keeps its own provider and model.
+
+The authenticated spawned lead uses its MCP proxy and `resolve_gate`. A designated terminal
+lead from the same connected host uses `acp gate lead-resolve <gate-id> --claim-file <path>`.
+A plan can be approved or denied with optional feedback. Integration approval requires both
+`builderAttemptId` and `diffHash` for the current gate. Terminal leads can read those values via
+`acp gate lead-evidence <gate-id> --run-id <gate-run-id>` and submit them using
+`--builder-attempt-id` and `--diff-hash`. Stale evidence results in a refusal. ACP checks the
+selected tests and reviews against that attempt, rechecks the patch under the worktree lock,
+and commits the verified local bytes on the task worktree branch. Repeated decisions cannot
+create a second commit for the same gate. Successful lead decisions record `leadDecision: true`.
+
+A person handles escalations and external verification, and must authorize any broader worker
+access in its native host. The daemon uses a macOS confirmation for human gate decisions and
+recovery on opted-in runs. ACP integration is a local commit. Target-branch merges, publishing,
+and QRSPI development approvals are separate actions.
+
+A local client can request the selected worker exchange through `run.transcript` with `runId`,
+`agentId` and an optional `afterSeq`. The response includes bounded message text, sender,
+recipient, attempt identity, a pagination cursor and history-gap flags when available. Ordinary
+observation events omit worker transcript text, launch arguments and the full delegated task.
+The exchange excludes raw provider logs and private reasoning. A browser client should keep
+access to this exchange scoped to its paired local session.
 
 A build run also retains the base commit resolved for its first builder. Every automatic
 replacement lineage, including one reissued during restart reconciliation, creates its clean
@@ -60,6 +104,12 @@ spawn; an effort for a model whose list is empty is `effort_unsupported`, and a 
 model's list is `effort_not_allowed`. Omitting `effort` stays valid and leaves the provider on its
 own default, so teams saved before efforts existed keep working unchanged.
 
+The selectable Codex IDs are `gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-terra`, `gpt-6.1-sol`,
+`gpt-6-astra`, `gpt-6-sol` and `gpt-6-luna`. The supported effort levels are `low`, `medium`,
+`high`, `xhigh` and `max`. The spawned coordination profile requires `codex-cli 0.171.0-alpha.13`.
+Availability still depends on the account and endpoint. Historical model IDs remain readable.
+Select an available replacement explicitly in saved teams before starting unsupported work.
+
 - **Codex** spends it as `-c model_reasoning_effort=<level>` on a fresh spawn only; its resume
   argv is unchanged and carries no effort.
 - **Claude** accepts exactly `medium`, and only for the `opus` alias; `fable`, `sonnet` and `haiku`
@@ -68,6 +118,8 @@ own default, so teams saved before efforts existed keep working unchanged.
   to the current session and does not persist. Because of that, ACP emits the checked pair
   `--effort medium` directly after `--model opus` on fresh **and** resume argv. No environment
   variable (such as `CLAUDE_CODE_EFFORT_LEVEL`) or other flag is passed through.
+  A Claude Code 2.1.330 account check resolved these aliases to Opus 5.5, Fable 5.2, Sonnet 5.5
+  and Haiku 5.5 respectively. The aliases remain the identifiers saved by ACP.
 - The effort a run was started with is recorded in its execution assignments. Replays, fresh
   re-spawns, builder recovery, and lead **and** worker resumes reuse that recorded value, and
   only while the agent still runs the recorded provider and model. Editing the saved team later
@@ -121,8 +173,8 @@ recorded `resultPath`; an envelope for absent output carries an empty `resultPat
 artifact. Retry prompts keep
 the existing worktree and counters. A replacement receives a clean worktree, but its handoff names
 the retired worktree that preserves the implementation draft and distinguishes an output-format
-rejection from a review or verification failure. Independent checks and the human integration gate
-remain required after any successful retry or replacement.
+rejection from a review or verification failure. Independent checks and the applicable integration
+decision remain required after any successful retry or replacement.
 
 A builder's process/schema outcome and task outcome are separate. A provider turn can finish
 successfully with a schema-valid build result whose `status` is `failed`; ACP preserves that result
@@ -170,9 +222,11 @@ build never converts those values into current numeric limits or authorizes exec
 
 ## Blocked verification and human host evidence
 
-Verification has four outcomes. `fail` means a command ran and found a code/build/test failure;
-`blocked` means a required command could not run because the worker environment lacked a concrete
-capability; `pass` and `nothing-to-run` retain their existing meanings. A blocked report has
+Verification records `fail` when a command ran and found a code, build or test failure. `blocked`
+means a required command could not run because the worker environment lacked a concrete capability.
+`pass` and `nothing-to-run` retain their existing meanings. `native-permission-required` pauses a
+worker for a native access issue. ACP keeps the worker paused when it cannot verify an applicable
+worker-specific grant. A blocked report has
 non-empty, bounded `blockers`, no `failures`, consumes no builder repair strike and starts no
 equivalent verifier retry. It remains a blocked record: neither a worker nor ACP may relabel it as
 pass or authorize a different environment. Failed, missing and skipped checks never count as
@@ -225,8 +279,11 @@ the current daemon.
 
 Before the gate is exposed, the complete validated evidence and daemon-captured inventory identity
 are copied into an append-only preparation event. Approval requires the mutable payload to equal
-that record exactly and a live source inventory under the shared worktree lock. The immediate
-submission uses the capture whose lock is still held. If a crash leaves `gate.created` pending,
+that record exactly and a live source inventory under the shared worktree lock. For ordinary
+runs, immediate submission uses the capture whose lock is still held. For a run with lead
+decisions enabled, `verification.external` returns `{"gateId":"…","status":"pending"}`. A person
+reviews the evidence and confirms that gate with `acp gate approve <gate-id>` in the macOS
+dialog. The designated lead cannot attest host-run commands. For each pending gate,
 a later socket approval reacquires that lock, recaptures the checkout off the actor, and checks
 the current gate, run, worktree and frozen baseline again before appending `gate.resolving`.
 Changed source leaves the gate pending, without accepting evidence or starting a checker.

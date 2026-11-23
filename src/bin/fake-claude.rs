@@ -41,6 +41,7 @@ const PROVIDER: &str = "claude";
 /// exercised directly by the provider tests — but it is embedded here so the table matches the
 /// README's file list.
 const FIXTURES: &[(&str, &str)] = &[
+    ("native-permission-1", include_str!("../../fixtures/jsonl/claude/native-permission-1.jsonl")),
     (
         "pass-1",
         include_str!("../../fixtures/jsonl/claude/pass-1.jsonl"),
@@ -97,6 +98,8 @@ const FIXTURES: &[(&str, &str)] = &[
 
 /// Scenario → transcript basename. Scenarios absent from this table emit no transcript of their own.
 const TRANSCRIPTS: &[(&str, &str)] = &[
+    ("native_permission", "native-permission"),
+    ("native_permission_denylist", "native-permission"),
     ("pass", "pass"),
     ("fail_then_pass", "pass"), // the builder always succeeds; the FAIL comes from the reviewer
     ("worker_commits", "worker_commits"), // byte-identical to pass-1; the commit is the side effect
@@ -333,7 +336,7 @@ fn main() {
             if scenario == "worker_commits" {
                 worker_commit();
             }
-            if scenario == "denylist" {
+            if matches!(scenario.as_str(), "denylist" | "native_permission_denylist") {
                 write_in_cwd("App.xcconfig", "x");
             }
             // `no_changes` replays the happy-path transcript — a `build-result` claiming

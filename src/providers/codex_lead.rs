@@ -1,11 +1,11 @@
-//! Codex 0.153.0 coordination profile. See the zero-token probes in the Sep 5 research record.
+//! Version-pinned Codex coordination profile with a closed MCP-only tool surface.
 use super::{base_env, path_arg, SpawnPlan, SpawnRequest};
 use crate::core::policy::{PolicyCode, PolicyError};
 use crate::core::types::RunId;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-pub const REQUIRED_VERSION: &str = "codex-cli 0.153.0";
+pub const REQUIRED_VERSION: &str = "codex-cli 0.171.0-alpha.13";
 const CATALOG: &str = "lead-model-catalog.json";
 const INSTRUCTIONS: &str = "lead-instructions.md";
 const TOOLS: &[&str] = &[
@@ -28,8 +28,16 @@ const DISABLED_FEATURES: &[&str] = &[
     "multi_agent_v2",
     "apps",
     "plugins",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "browser_annotation_api",
+    "computer_use",
     "code_mode",
+    "code_mode_host",
     "code_mode_only",
+    "daemon_auto_start",
+    "guardian_approval",
     "js_repl",
     "view_image",
     "image_generation",
@@ -44,24 +52,28 @@ const DISABLED_FEATURES: &[&str] = &[
     "memories",
     "remote_plugin",
     "recommended_plugins",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "tool_call_mcp_elicitation",
+    "workspace_dependencies",
 ];
 
-/// The models a Codex lead may run, each with the reasoning levels it takes — the embedded
-/// `roles.json` catalog restated where the chokepoint can see it without a config (a test pins the
-/// two equal). Codex 0.153.0 accepts any non-empty effort string at config time and only the API
-/// refuses a pair (report 31), so this table is what actually bounds the profile. `ultra` is absent
-/// on purpose: it makes Codex delegate to its own sub-agents.
-pub(crate) const MODELS: &[(&str, &[&str])] = &[
-    ("gpt-6-astra", &["low", "medium", "high", "xhigh", "max"]),
-    ("gpt-5.6-sol", &["low", "medium", "high", "xhigh", "max"]),
-    ("gpt-5.6-terra", &["low", "medium", "high", "xhigh", "max"]),
-    ("gpt-5.6-luna", &["low", "medium", "high", "xhigh", "max"]),
-    ("gpt-5.5", &["low", "medium", "high", "xhigh"]),
-    ("gpt-5.3-codex-spark", &["low", "medium", "high", "xhigh"]),
+/// Match the active embedded catalog at the launch boundary. Retired IDs still deserialize in
+/// saved records. The bundled Codex catalog also offers ultra on some models. ACP excludes it
+/// because the provider can delegate natively at that effort.
+const MODELS: &[&str] = &[
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "gpt-6.1-terra",
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
 ];
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 fn levels(model: &str) -> Option<&'static [&'static str]> {
-    MODELS.iter().find(|(m, _)| *m == model).map(|(_, l)| *l)
+    MODELS.contains(&model).then_some(EFFORTS)
 }
 
 /// `supported_reasoning_levels` for the daemon-owned catalog: the model's own levels, so the
@@ -130,6 +142,7 @@ fn argv(
         "--json".into(),
         "--strict-config".into(),
         "--ignore-user-config".into(),
+        "--ignore-rules".into(),
         "-m".into(),
         model.into(),
     ]);
@@ -141,8 +154,7 @@ fn argv(
     config.insert("notify".into(), json!([]));
     config.insert("model_provider".into(), json!("openai"));
     config.insert("model_providers".into(), json!({}));
-    // 0.153.0 filters an empty override to None, preserving the official API/ChatGPT route
-    // selected by auth mode. A fixed API URL would break ChatGPT-authenticated leads.
+    // An empty override preserves Codex's built-in route for the selected auth mode.
     config.insert("openai_base_url".into(), json!(""));
     config.insert("sandbox_mode".into(), json!("read-only"));
     config.insert("model_catalog_json".into(), json!(dir.join(CATALOG)));
@@ -299,7 +311,7 @@ mod tests {
             role: RoleName::Lead,
             provider: ProviderName::Codex,
             models: Vec::new(),
-            default_model: "gpt-5.5".into(),
+            default_model: "gpt-6.2-sol".into(),
             writes: false,
             prompt_file: None,
             prompt_sha256: None,
@@ -350,20 +362,21 @@ mod tests {
             .collect()
     }
 
-    /// The daemon-owned catalog advertises each model's own levels — `max` only where the model
-    /// takes it — because that file is what Codex validates the configured effort against.
+    /// Restrict the daemon-owned catalog to the measured effort range on each active model.
     #[test]
     fn the_catalog_lists_each_models_own_levels() {
-        assert_eq!(levels("gpt-5.5"), ["low", "medium", "high", "xhigh"]);
-        assert_eq!(levels("gpt-6-astra"), ["low", "medium", "high", "xhigh", "max"]);
+        for model in MODELS {
+            assert_eq!(levels(model), EFFORTS);
+        }
+        assert!(levels("gpt-5.6-luna").is_empty());
     }
 
     #[test]
     fn the_chokepoint_binds_the_effort_to_the_models_own_levels() {
         assert!(checked("gpt-6-astra", Some(Effort::Max)).is_ok());
-        assert!(checked("gpt-5.6-luna", None).is_ok());
-        assert!(checked("gpt-5.5", Some(Effort::High)).is_ok());
-        assert!(checked("gpt-5.5", Some(Effort::Max)).is_err());
+        assert!(checked("gpt-6-luna", None).is_ok());
+        assert!(checked("gpt-6.2-sol", Some(Effort::High)).is_ok());
+        assert!(checked("gpt-5.6-sol", Some(Effort::High)).is_err());
         assert!(checked("gpt-9", Some(Effort::Low)).is_err());
     }
 
@@ -374,12 +387,12 @@ mod tests {
         let cfg = load_roles(None).expect("embedded roles config");
         let codex = &cfg.providers[&ProviderName::Codex];
         assert_eq!(
-            MODELS.iter().map(|(model, _)| *model).collect::<Vec<_>>(),
+            MODELS,
             codex.models
         );
-        for (model, table) in MODELS {
+        for model in MODELS {
             let catalog: Vec<&str> = codex.efforts_for(model).iter().map(|e| e.as_str()).collect();
-            assert_eq!(*table, catalog.as_slice(), "{model}");
+            assert_eq!(EFFORTS, catalog.as_slice(), "{model}");
         }
     }
 }

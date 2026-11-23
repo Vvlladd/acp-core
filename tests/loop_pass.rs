@@ -40,7 +40,7 @@ use std::sync::Arc;
 use agent_control_plane::core::gates::GatePayload;
 use agent_control_plane::core::types::{
     AgentId, AgentStatus, AttemptId, AttemptKind, AttemptStatus, ErrorCode, Event, EventPayload,
-    False, GateId, GateKind, LineageId, LoopState, RoleName, RunId, RunStatus, Verdict,
+    False, GateId, GateKind, LineageId, LoopState, RoleName, RunId, RunStatus, Verdict, VerifyStatus,
 };
 use agent_control_plane::core::{GateResolution, RecommendedNext, StatusQuery};
 use serde_json::Value;
@@ -377,6 +377,7 @@ fn pass_reaches_an_integrate_gate_and_the_human_approval_commits_the_reviewed_di
 fn a_review_failure_resumes_the_same_builder_and_the_second_review_is_a_new_agent() {
     common::with_shared_env(|| async {
         let world = LoopWorld::new("fail_then_pass", &[]);
+        let base = head_sha(world.repo_root());
         let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
         let handle = actor.handle.clone();
 
@@ -424,6 +425,24 @@ fn a_review_failure_resumes_the_same_builder_and_the_second_review_is_a_new_agen
             "the repair is a resume of the session the first attempt opened"
         );
 
+        let problem = events.iter().find_map(|e| match &e.payload {
+            EventPayload::ReviewVerdict { verdict: Verdict::Fail, findings, .. } =>
+                findings.first().map(|finding| finding.problem.as_str()),
+            _ => None,
+        }).expect("a reviewer finding");
+        let query = agent_control_plane::core::transcript::Query {
+            run_id: run, agent_id: out.agent_id, after_seq: 0,
+        };
+        let exchange = serde_json::to_value(handle.worker_transcript(query).await.unwrap()).unwrap();
+        let rows = exchange["messages"].as_array().unwrap();
+        let repair = rows.iter().find(|row| row["kind"] == "followup").expect("builder repair");
+        assert_eq!(repair["sender"], "workflow");
+        assert!(repair["text"].as_str().unwrap().contains(problem));
+        assert_ne!(rows[0]["attemptId"], repair["attemptId"]);
+        assert_eq!(rows.last().unwrap()["attemptId"], repair["attemptId"]);
+        assert_eq!(rows.last().unwrap()["kind"], "result");
+        assert_eq!(exchange["historyIncomplete"], false);
+
         // …and the gate that finally opened is bound to the *second* diff.
         let frozen = frozen(&events);
         assert_eq!(frozen.len(), 2, "one diff per builder attempt");
@@ -433,6 +452,41 @@ fn a_review_failure_resumes_the_same_builder_and_the_second_review_is_a_new_agen
             "the PASS echoes the hash of the diff it was shown"
         );
         assert_eq!(gates_of(&events, GateKind::Integrate).len(), 1);
+
+        let final_builder = frozen[1].0;
+        assert!(
+            events.iter().any(|event| matches!(event.payload,
+                EventPayload::VerifyReport { builder_attempt_id, status: VerifyStatus::Pass, .. }
+                    if builder_attempt_id == final_builder)),
+            "the repaired diff passed the selected verifier"
+        );
+        let seqs: Vec<u64> = rows.iter().map(|row| row["seq"].as_u64().unwrap()).collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "transcript is ordered");
+        let gate = gates_of(&events, GateKind::Integrate)[0].0;
+        let payload = gate_payload(world.state_dir(), &run, &gate);
+        assert_eq!(payload.diff_hash.as_deref(), Some(frozen[1].2.as_str()));
+        let expected = std::fs::read(out.worktree.join("src/adder.ts")).unwrap();
+        let resolution = handle.resolve_gate(gate, true, None, cli_actor()).await.unwrap();
+        let GateResolution::Approved { sha: Some(sha) } = resolution else {
+            panic!("{resolution:?}");
+        };
+        let committed = std::process::Command::new("git")
+            .current_dir(&out.worktree)
+            .args(["show", "HEAD:src/adder.ts"])
+            .output()
+            .unwrap();
+        assert!(committed.status.success());
+        assert_eq!(committed.stdout, expected);
+        assert_eq!(files_in_commit(&out.worktree, &sha), vec!["src/adder.ts"]);
+        assert_eq!(head_sha(world.repo_root()), base, "the original branch is untouched");
+        assert!(matches!(
+            handle.resolve_gate(gate, true, None, cli_actor()).await.unwrap(),
+            GateResolution::AlreadyResolved
+        ));
+        let committed = world.events(&run).iter()
+            .filter(|e| matches!(e.payload, EventPayload::IntegrateCommitted { .. }))
+            .count();
+        assert_eq!(committed, 1);
 
         quiesce(&handle).await;
         actor.stop().await;

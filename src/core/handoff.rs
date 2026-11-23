@@ -627,7 +627,7 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// The task, identically in every prompt: what to do, where, and what "done" means.
-fn task_block(task: &Task) -> String {
+pub(super) fn task_block(task: &Task) -> String {
     let mut block = format!(
         "## Task {} — {}\n\n{}\n",
         task.id, task.title, task.description
@@ -713,7 +713,7 @@ fn evidence_block(task: &Task) -> Option<String> {
 }
 
 /// Reviewer findings as text. Numbered, so a repair prompt can be talked about ("finding 2").
-fn render_findings(findings: &[ReviewFinding]) -> String {
+pub(super) fn render_findings(findings: &[ReviewFinding]) -> String {
     if findings.is_empty() {
         return "(the reviewer recorded no findings)".to_owned();
     }

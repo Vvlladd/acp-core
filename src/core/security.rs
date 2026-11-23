@@ -91,10 +91,16 @@ pub(crate) fn predecessors_passed(
     builder: AttemptId,
     hash: &str,
 ) -> bool {
+    let steps = registry.run(run).and_then(|r| r.steps).unwrap_or_default();
+    predecessors_passed_with_steps(registry, run, builder, hash, steps)
+}
+
+pub(crate) fn predecessors_passed_with_steps(
+    registry: &Registry, run: &RunId, builder: AttemptId, hash: &str, steps: RunSteps,
+) -> bool {
     if !current_builder_diff(registry, run, builder) {
         return false;
     }
-    let steps = registry.run(run).and_then(|r| r.steps).unwrap_or_default();
     let events = registry.events(run, None, usize::MAX);
     if steps.verify {
         let Some(id) = latest_check(registry, run, builder, RoleName::Verifier) else {
@@ -124,6 +130,33 @@ pub(crate) fn predecessors_passed(
             if *attempt_id == id && *builder_attempt_id == builder && diff_hash.as_deref() == Some(hash))) { return false; }
     }
     true
+}
+
+pub(crate) fn verification_passed(registry: &Registry, run: &RunId, builder: AttemptId, hash: &str) -> bool {
+    let Some(id) = latest_check(registry, run, builder, RoleName::Verifier) else { return false; };
+    let Some(report) = registry.attempt(&id)
+        .and_then(|attempt| attempt.structured.clone())
+        .and_then(|result| serde_json::from_value::<VerifyReport>(result).ok()) else { return false; };
+    if report.diff_hash != hash || !crate::core::r#loop::valid_verify_report_shape(&report) {
+        return false;
+    }
+    let logged = registry.events(run, None, usize::MAX).iter().any(|event| matches!(&event.payload,
+        EventPayload::VerifyReport { attempt_id, builder_attempt_id, status, .. }
+            if *attempt_id == id && *builder_attempt_id == builder && *status == report.status));
+    if !logged { return false; }
+    match report.status {
+        VerifyStatus::Pass => true,
+        VerifyStatus::Blocked => crate::core::gates::accepted_external_evidence(registry, run, builder, hash)
+            .is_some_and(|evidence| {
+                let mut blocked_commands = report.commands.iter().map(String::as_str).collect::<Vec<_>>();
+                let mut accepted_commands = evidence.commands.iter()
+                    .map(|result| result.worker_command.as_str()).collect::<Vec<_>>();
+                blocked_commands.sort_unstable();
+                accepted_commands.sort_unstable();
+                blocked_commands == accepted_commands
+            }),
+        VerifyStatus::Fail | VerifyStatus::NothingToRun | VerifyStatus::NativePermissionRequired => false,
+    }
 }
 
 pub(crate) fn passed_attempt(

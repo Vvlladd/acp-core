@@ -1267,6 +1267,7 @@ fn seed_lineage(core: &mut Core, run: &RunId, agent: AgentId, worktree: &Path) -
                 path: worktree.to_path_buf(),
                 branch: "acp/lineage-1".to_string(),
                 base_sha,
+                delegated_task: None,
             },
         )
         .expect("worktree.created");

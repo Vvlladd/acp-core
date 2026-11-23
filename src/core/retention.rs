@@ -679,6 +679,7 @@ mod tests {
             .append(
                 &run,
                 EventPayload::WorktreeCreated {
+                    delegated_task: None,
                     agent_id: agent,
                     lineage_id: lineage,
                     path: path.clone(),
@@ -834,6 +835,7 @@ mod tests {
             .append(
                 &finalizing.run,
                 EventPayload::GateResolving {
+                    lead_decision: None,
                     gate_id: gate,
                     approve: true,
                     feedback: None,
@@ -1232,6 +1234,7 @@ mod tests {
             .append(
                 &seed.run,
                 EventPayload::GateResolving {
+                    lead_decision: None,
                     gate_id: gate,
                     approve: true,
                     feedback: None,

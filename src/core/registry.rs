@@ -19,6 +19,7 @@
 //!
 //! This module must not know about providers, git or processes (design, § `src/core/registry.rs`).
 
+use super::types::Task;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -178,8 +179,10 @@ pub struct State {
     /// B3: the plan each container run carries, folded from `plan.created`/`plan.item`. The
     /// conductor reads only this — replayed state, never anything in-memory-only.
     pub plans: HashMap<RunId, PlanProjection>,
+    lineage_tasks: HashMap<(RunId, LineageId), Task>,
     /// C2 bookkeeping: the `(attempt, kind, srcLine)` triples already folded in. Private so the
     /// idempotency invariant cannot be broken from outside this module.
+    pub(super) worker_inputs: HashSet<(RunId, AgentId, AttemptId)>,
     applied: HashSet<(AttemptId, TailEvent, u64)>,
 }
 
@@ -237,6 +240,11 @@ pub fn reduce(s: &mut State, e: &Event) {
 
     match &e.payload {
         EventPayload::RunRecovered { recovery } => super::recovery::reduce(s, e, recovery),
+        EventPayload::RunLeadAuthorized => {
+            if let Some(execution) = s.runs.get_mut(&e.base.run_id).and_then(|r| r.execution.as_mut()) {
+                execution.lead_approval_run_id = Some(e.base.run_id);
+            }
+        }
         EventPayload::AuditPrepared { snapshot } => {
             if let Some(run) = s.runs.get_mut(&run_id) {
                 if run.audit.is_none() {
@@ -327,11 +335,15 @@ pub fn reduce(s: &mut State, e: &Event) {
             agent_id,
             lineage_id,
             path,
+            delegated_task,
             ..
         } => {
             if let Some(run) = s.runs.get_mut(&run_id) {
                 let lineage = lineage_mut(run, *lineage_id);
                 lineage.worktree.clone_from(path);
+                if let Some(task) = delegated_task {
+                    s.lineage_tasks.entry((run_id, *lineage_id)).or_insert_with(|| task.clone());
+                }
                 if !lineage.agent_ids.contains(agent_id) {
                     lineage.agent_ids.push(*agent_id);
                 }
@@ -492,6 +504,9 @@ pub fn reduce(s: &mut State, e: &Event) {
         // `agent.progress` is the line-level cursor commit after every message block from that
         // provider line is durable. Advancing on an individual message would let a crash skip its
         // later siblings on restart.
+        EventPayload::WorkerMessage { agent_id, attempt_id, .. } => {
+            s.worker_inputs.insert((run_id, *agent_id, *attempt_id));
+        }
         EventPayload::AgentMessage { .. } => {}
 
         // B3: the conductor's projection. `plan.created` seeds every item `pending`; each
@@ -670,6 +685,8 @@ pub fn reduce(s: &mut State, e: &Event) {
                 created_at: e.base.ts.clone(),
                 resolved_at: None,
                 resolved_by: None,
+                lead_decision: None,
+                lead_evidence: None,
                 approve: None,
                 feedback: None,
                 sha: None,
@@ -687,6 +704,7 @@ pub fn reduce(s: &mut State, e: &Event) {
             approve,
             feedback,
             by,
+            lead_decision,
             commit,
             ..
         } => {
@@ -697,6 +715,7 @@ pub fn reduce(s: &mut State, e: &Event) {
                 }
                 gate.approve = Some(*approve);
                 gate.resolved_by = Some(by.clone());
+                if lead_decision.is_some() { gate.lead_decision = *lead_decision; }
                 if feedback.is_some() {
                     gate.feedback.clone_from(feedback);
                 }
@@ -1007,6 +1026,10 @@ impl Registry {
     }
 
     #[must_use]
+    pub(super) fn lineage_task(&self, run: &RunId, lineage: &LineageId) -> Option<&Task> {
+        self.state.lineage_tasks.get(&(*run, *lineage))
+    }
+
     pub fn run(&self, id: &RunId) -> Option<&Run> {
         self.state.runs.get(id)
     }
@@ -1060,14 +1083,9 @@ impl Registry {
     #[must_use]
     pub fn events(&self, run: &RunId, since_seq: Option<u64>, limit: usize) -> Vec<Arc<Event>> {
         let since = since_seq.unwrap_or(0);
-        self.events
-            .get(run)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.base.seq > since)
-            .take(limit)
-            .map(Arc::clone)
-            .collect()
+        let Some(events) = self.events.get(run) else { return vec![] };
+        let start = events.partition_point(|event| event.base.seq <= since);
+        events[start..].iter().take(limit).map(Arc::clone).collect()
     }
 
     /// A stable, bounded page of lineages which have an actual recorded worktree identity.

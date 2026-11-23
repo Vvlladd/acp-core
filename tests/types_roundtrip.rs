@@ -437,6 +437,16 @@ const EVENT_FIXTURES: &str = r#"[
       "attestation":"I ran the recorded argv.", "limitations":["human attestation"]
     },
     "daemonCapturedInventoryHash":"7d6d0f2c1b3a49586776859493a2b1c0dfeeddccbbaa99887766554433221100"
+  },
+  {
+    "seq":38, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
+    "kind":"worker.message", "agentId":"22222222-2222-4222-8222-222222222222",
+    "attemptId":"33333333-3333-4333-8333-333333333333", "sender":"lead", "followup":false,
+    "text":"Build the task","truncated":false
+  },
+  {
+    "seq":39, "ts":"2026-08-22T22:00:00.000Z", "runId":"11111111-1111-4111-8111-111111111111",
+    "kind":"run.lead_authorized"
   }
 ]"#;
 
@@ -547,6 +557,7 @@ fn payloads() -> Vec<EventPayload> {
             path: PathBuf::from(WORKTREE),
             branch: "acp/run-1/agent-1".into(),
             base_sha: PRE_SHA.into(),
+            delegated_task: None,
         },
         EventPayload::WorktreeRetired {
             path: PathBuf::from(WORKTREE),
@@ -692,6 +703,7 @@ fn payloads() -> Vec<EventPayload> {
             by: Actor::Socket {
                 client_name: "acp-mac".into(),
             },
+            lead_decision: None,
             commit: Some(commit_target()),
             external_verification: None,
         },
@@ -807,6 +819,9 @@ fn payloads() -> Vec<EventPayload> {
             },
             daemon_captured_inventory_hash: DIFF_HASH.into(),
         },
+        EventPayload::WorkerMessage { agent_id: agent_id(), attempt_id: attempt_id(), sender: Origin::Lead,
+            followup: false, text: "Build the task".into(), truncated: false },
+        EventPayload::RunLeadAuthorized,
     ]
 }
 
@@ -833,8 +848,8 @@ fn event(seq: usize, payload: EventPayload) -> Event {
 fn every_design_event_kind_has_exactly_one_fixture() {
     assert_eq!(
         EVENT_KINDS.len(),
-        37,
-        "budget, evidence and external verification records each have a wire fixture"
+        39,
+        "all public event variants, including lead authority and worker transcripts, have wire fixtures"
     );
     let fixtures = fixtures();
     let kinds: Vec<&str> = fixtures
@@ -1064,6 +1079,8 @@ fn gate_round_trips_through_serde_json() {
         approve: Some(true),
         feedback: None,
         sha: Some(INTEGRATE_SHA.into()),
+        lead_decision: None,
+        lead_evidence: None,
         commit: Some(commit_target()),
     };
     let json = serde_json::to_value(&gate).expect("serialize gate");

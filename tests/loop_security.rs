@@ -16,7 +16,7 @@ fn setup(verify: bool, review: bool, extra: &[(&str, &str)]) -> LoopWorld {
     );
     roles.insert(
         "security".into(),
-        json!({"provider":"codex","model":"gpt-5.5"}),
+        json!({"provider":"codex","model":"gpt-6-astra"}),
     );
     if verify {
         roles.insert(
@@ -27,7 +27,7 @@ fn setup(verify: bool, review: bool, extra: &[(&str, &str)]) -> LoopWorld {
     if review {
         roles.insert(
             "reviewer".into(),
-            json!({"provider":"codex","model":"gpt-5.5"}),
+            json!({"provider":"codex","model":"gpt-6-astra"}),
         );
     }
     let team: Team =
@@ -441,7 +441,7 @@ fn security_membership_requires_v3_and_is_frozen_with_the_run() {
     for version in [1, 2, 3] {
         let mut value = json!({"version":version,"name":"security","roles":{
             "builder":{"provider":"claude","model":"haiku"},
-            "security":{"provider":"codex","model":"gpt-5.5"}}});
+            "security":{"provider":"codex","model":"gpt-6-astra"}}});
         if version == 3 {
             value["mode"] = json!("build");
         }
@@ -463,7 +463,7 @@ fn security_membership_requires_v3_and_is_frozen_with_the_run() {
     }
     let audit: Team =
         serde_json::from_value(json!({"version":3,"mode":"audit","name":"security only",
-        "roles":{"security":{"provider":"codex","model":"gpt-5.5"}}}))
+        "roles":{"security":{"provider":"codex","model":"gpt-6-astra"}}}))
         .unwrap();
     let valid = team::validate_team(&cfg, &audit).unwrap();
     let execution = team::capture_execution(&cfg, Some(&valid));

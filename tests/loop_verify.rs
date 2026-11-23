@@ -498,7 +498,7 @@ fn pending_host_evidence_after_restart_recaptures_the_checkout_before_approval()
                 actor.stop().await;
                 let actor = start_actor(&world, embedded_roles(), ActorOpts { reattach: true, ..ActorOpts::default() });
                 let accepted = actor.handle.prepare_external_verification(run, fresh, common::cli_actor()).await.unwrap();
-                assert!(matches!(accepted.resolution, agent_control_plane::core::GateResolution::Approved { sha: None }));
+                assert!(matches!(accepted.resolution, Some(agent_control_plane::core::GateResolution::Approved { sha: None })));
                 actor.handle.status(StatusQuery { run_id: Some(run), ..StatusQuery::default() }).await.unwrap();
                 let events = world.events(&run);
                 assert_eq!(agents_of(&events, RoleName::Reviewer).len(), 1, "fresh evidence must start the selected reviewer");
@@ -696,5 +696,76 @@ fn a_roles_config_without_a_verifier_skips_the_verify_step() {
 
         quiesce(&handle).await;
         actor.stop().await;
+    });
+}
+
+#[test]
+fn opted_in_host_evidence_stays_pending_until_separate_human_confirmation() {
+    common::with_shared_env(|| async {
+        use agent_control_plane::core::types::{
+            ExternalCommandResult, ExternalCommandStatus, ExternalVerificationEvidence, GateStatus,
+        };
+        use agent_control_plane::workspace::git;
+
+        let world = LoopWorld::new("pass", &[("ACP_FAKE_VERIFY_SCENARIO", "verify_blocked")]);
+        let first = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let run = first.handle.delegate(delegate_builder(loop_task("host-evidence-confirmation")))
+            .await.unwrap().run_id;
+        let query = StatusQuery { run_id: Some(run), ..StatusQuery::default() };
+        wait_for_status(&first.handle, query.clone(), "blocked verification", |status| {
+            status.runs.first().is_some_and(|run| run.status == RunStatus::Blocked)
+        }).await;
+        quiesce(&first.handle).await;
+        first.stop().await;
+
+        let mut registry = world.reopen();
+        registry.append(&run, EventPayload::RunLeadAuthorized).unwrap();
+        let events = registry.events(&run, None, usize::MAX);
+        let (attempt, diff_hash) = events.iter().rev().find_map(|event| match &event.payload {
+            EventPayload::DiffFrozen { attempt_id, diff_hash, .. } => Some((*attempt_id, diff_hash.clone())),
+            _ => None,
+        }).unwrap();
+        let commands = events.iter().rev().find_map(|event| match &event.payload {
+            EventPayload::VerifyReport { commands, status: VerifyStatus::Blocked, .. } => Some(commands.clone()),
+            _ => None,
+        }).unwrap();
+        let builder = registry.attempt(&attempt).unwrap().agent_id;
+        let worktree = registry.agent(&builder).unwrap().worktree.clone().unwrap();
+        let inventory = git::source_inventory_hash(&worktree).await.unwrap();
+        let evidence = ExternalVerificationEvidence {
+            builder_attempt_id: attempt,
+            diff_hash,
+            expected_run_seq: registry.run(&run).unwrap().last_seq,
+            commands: commands.into_iter().map(|worker_command| ExternalCommandResult {
+                worker_command,
+                argv: vec!["cargo".into(), "test".into()],
+                status: ExternalCommandStatus::Passed,
+                exit_status: Some(0),
+            }).collect(),
+            toolchain_identity: "test host".into(),
+            provenance: "disposable regression fixture".into(),
+            source_inventory_before_hash: inventory.clone(),
+            source_inventory_after_hash: inventory,
+            attestation: "External evidence requires separate human confirmation".into(),
+            limitations: vec!["fake providers".into()],
+        };
+        drop(registry);
+
+        let second = start_actor(&world, embedded_roles(), ActorOpts { reattach: true, ..ActorOpts::default() });
+        let prepared = second.handle.prepare_external_verification(run, evidence, common::cli_actor()).await.unwrap();
+        assert_eq!(serde_json::to_value(&prepared).unwrap(), serde_json::json!({
+            "gateId": prepared.gate_id,
+            "status": "pending",
+        }));
+        assert!(second.handle.resolve_gate(prepared.gate_id, true, None, common::cli_actor()).await.is_err());
+        let status = second.handle.status(query).await.unwrap();
+        assert_eq!(status.gates.len(), 1);
+        assert_eq!(status.gates[0].kind, GateKind::ExternalVerification);
+        assert_eq!(status.gates[0].status, GateStatus::Pending);
+        assert_eq!(status.runs[0].status, RunStatus::Blocked);
+        assert!(!world.events(&run).iter().any(|event| matches!(&event.payload,
+            EventPayload::GateResolving { gate_id, .. } if *gate_id == prepared.gate_id)));
+        quiesce(&second.handle).await;
+        second.stop().await;
     });
 }

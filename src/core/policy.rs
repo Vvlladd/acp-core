@@ -482,6 +482,10 @@ pub fn check_delegate<'a>(
         return Err(PolicyError::new(PolicyCode::RunBlocked, "cancelled runs cannot accept new work; start a new task"));
     }
     if let SessionSpec::Resume(agent) = req.session {
+        if native_access_paused(ctx.registry, &agent) {
+            return Err(PolicyError::new(PolicyCode::AgentNotResumable,
+                "worker-specific native access verification is unavailable"));
+        }
         if ctx.registry.agent(&agent).and_then(|a| ctx.registry.run(&a.run_id))
             .is_some_and(|r| r.status == RunStatus::Cancelled) {
             return Err(PolicyError::new(PolicyCode::RunBlocked, "cancelled runs cannot be resumed; start a new task"));
@@ -570,6 +574,10 @@ pub fn check_send_message<'a>(
     agent: &AgentId,
     ctx: &PolicyCtx<'a>,
 ) -> Result<&'a AgentHandle, PolicyError> {
+    if native_access_paused(ctx.registry, agent) {
+        return Err(PolicyError::new(PolicyCode::AgentNotResumable,
+            "worker-specific native access verification is unavailable"));
+    }
     let handle = ctx.registry.agent(agent).ok_or_else(|| {
         PolicyError::new(
             PolicyCode::AgentNotResumable,
@@ -644,6 +652,11 @@ pub fn check_send_message<'a>(
     }
 
     Ok(handle)
+}
+
+fn native_access_paused(registry: &Registry, agent: &AgentId) -> bool {
+    registry.state().attempts.values().any(|a| a.agent_id == *agent &&
+        a.error.as_ref().is_some_and(|e| e.code == crate::core::types::ErrorCode::NativePermissionRequired))
 }
 
 /// Enforces S2, the approval authority: a model may not approve its own integration.

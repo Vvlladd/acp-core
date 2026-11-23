@@ -856,6 +856,7 @@ fn lead_profile_is_closed_on_fresh_and_resume_and_binds_its_owner() {
     let run = RunId::new_v4();
     for session in [None, Some(PASS_THREAD_ID)] {
         let mut req = request(&role, &schema, ROLE_PROMPT, session);
+        req.model = "gpt-6.2-sol";
         req.lead_run_id = Some(run);
         req.effort = Some(Effort::High);
         let mut plan = if session.is_some() { CodexAdapter.build_resume(&req) }
@@ -872,7 +873,10 @@ fn lead_profile_is_closed_on_fresh_and_resume_and_binds_its_owner() {
             prompt_index: Some(plan.argv.len() - 1),
         };
         assert_safe_argv(plan.clone(), &ctx).expect("the complete restricted lead profile");
-        assert_eq!(plan.required_version.as_deref(), Some("codex-cli 0.153.0"));
+        assert_eq!(plan.required_version.as_deref(), Some("codex-cli 0.171.0-alpha.13"));
+        for flag in ["--ignore-rules", "features.daemon_auto_start=false", "features.browser_use=false", "features.computer_use=false"] {
+            assert!(plan.argv.iter().any(|arg| arg == flag), "missing {flag}");
+        }
         assert!(!plan.argv.iter().any(|s| s == "--output-schema"));
         let catalog: Value = serde_json::from_str(&plan.write_files[0].1).unwrap();
         assert!(catalog["models"][0]["apply_patch_tool_type"].is_null());

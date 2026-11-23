@@ -46,12 +46,13 @@
     },
     "codex": {
       "models": [
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
         "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.3-codex-spark"
+        "gpt-6-sol",
+        "gpt-6-luna"
       ],
       "efforts": [
         "low",
@@ -59,21 +60,7 @@
         "high",
         "xhigh",
         "max"
-      ],
-      "modelEfforts": {
-        "gpt-5.5": [
-          "low",
-          "medium",
-          "high",
-          "xhigh"
-        ],
-        "gpt-5.3-codex-spark": [
-          "low",
-          "medium",
-          "high",
-          "xhigh"
-        ]
-      }
+      ]
     }
   },
   "rates": {
@@ -112,18 +99,19 @@
         "opus",
         "sonnet",
         "haiku",
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
         "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.3-codex-spark"
+        "gpt-6-sol",
+        "gpt-6-luna"
       ],
       "defaultModel": "haiku",
       "writes": false,
-      "description": "Coordinates work through closed ACP tools; never writes or approves integration.",
+      "description": "Coordinates work through closed ACP tools; never writes or commits changes itself.",
       "promptFile": "prompts/lead.md",
-      "promptSha256": "a6e3a5b4ecf9e58b3fc3a80f634d0a12445bdb1661ce83fddc9b6dc24ba3477f",
+      "promptSha256": "75fc90b3ecfd12acba8e6d85666857a233eb62eb3dbf28ad392dda27f3d05c9c",
       "tools": [
         "mcp__acp__delegate",
         "mcp__acp__submit_plan",
@@ -153,18 +141,19 @@
         "opus",
         "sonnet",
         "haiku",
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
         "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.3-codex-spark"
+        "gpt-6-sol",
+        "gpt-6-luna"
       ],
       "defaultModel": "sonnet",
       "writes": true,
       "description": "Implements one task in an isolated worktree; never commits.",
       "promptFile": "prompts/builder-worker.md",
-      "promptSha256": "f6e421735d3e83e4dac45b8049ecfee6586351ef8ae493519b7c1e70c413ab6a",
+      "promptSha256": "491b06ed928f1fa9530cb85880968eeba2275ae265cc0bd71ba5162b0b170f36",
       "tools": [
         "Bash",
         "Read",
@@ -186,19 +175,20 @@
         "opus",
         "sonnet",
         "haiku",
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
         "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.3-codex-spark"
+        "gpt-6-sol",
+        "gpt-6-luna"
       ],
-      "defaultModel": "gpt-5.5",
+      "defaultModel": "gpt-6-astra",
       "writes": false,
       "description": "Reviews the builder's frozen diff read-only and returns a verdict.",
       "sandboxMode": "read-only",
       "promptFile": "prompts/reviewer-worker.md",
-      "promptSha256": "cad8e82500dd38d54c0fe2c0a9573dd8dc8b1e84abca495e804bb1c30b985038",
+      "promptSha256": "69e5348e9d53c6274a440f94e7a24105281e88534a69354a58f468944fa9f72c",
       "maxTurns": 12,
       "spawnBudgetUsd": 2,
       "resultSchema": "review-verdict",
@@ -212,18 +202,19 @@
         "opus",
         "sonnet",
         "haiku",
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
         "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.3-codex-spark"
+        "gpt-6-sol",
+        "gpt-6-luna"
       ],
       "defaultModel": "haiku",
       "writes": false,
       "description": "Builds and runs the repo's tests in the builder's worktree between build and review; never modifies tracked files.",
       "promptFile": "prompts/verifier-worker.md",
-      "promptSha256": "2c7d7c0f803ab80a157c66f260bdffd57623a30bcd8398f6a69c226befef3c77",
+      "promptSha256": "a1420511e42b24210fa9f8f298384cb01261bf5a1858975480fbd0944ee8ece8",
       "tools": [
         "Bash",
         "Read",
@@ -243,19 +234,20 @@
         "opus",
         "sonnet",
         "haiku",
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
         "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-        "gpt-5.3-codex-spark"
+        "gpt-6-sol",
+        "gpt-6-luna"
       ],
-      "defaultModel": "gpt-5.5",
+      "defaultModel": "gpt-6-astra",
       "writes": false,
       "description": "Inspects the frozen diff for concrete security defects, read-only, and returns a diff-bound verdict.",
       "sandboxMode": "read-only",
       "promptFile": "prompts/security-worker.md",
-      "promptSha256": "48c2c6b6e6240c064d49bb6c22d107821e41b05c5a6c962df9eb3038d06974e8",
+      "promptSha256": "d270c2465399efdce12dc93601cd231f460551e3ade1b895ac5fc7fd5c7fe1c8",
       "maxTurns": 12,
       "spawnBudgetUsd": 2,
       "resultSchema": "review-verdict",

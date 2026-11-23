@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use agent_control_plane::core::team::{save_team, Assignment, Effort, Team};
 use agent_control_plane::core::types::{
-    AgentId, AttemptStatus, Event, EventPayload, GateKind, ProviderName, RoleName,
+    AgentId, AttemptStatus, ErrorCode, Event, EventPayload, GateKind, ProviderName, RoleName,
 };
 use agent_control_plane::core::GateResolution;
 use serde_json::Value;
@@ -45,6 +45,28 @@ fn team_of(role: &str, provider: ProviderName, model: &str, effort: Option<Effor
         lead: None,
         roles,
     }
+}
+
+#[test]
+fn codex_typed_native_access_request_blocks_and_survives_restart() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("native_permission", &[]);
+        save_team(world.state_dir(), &team_of("builder", ProviderName::Codex, "gpt-6-astra", Some(Effort::Low))).unwrap();
+        let actor = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let out = actor.handle.delegate(delegate_builder(loop_task("codex-permission"))).await.unwrap();
+        let events = wait_for_log(&world, &out.run_id, "permission wait", |events| events.iter().any(|e|
+            matches!(&e.payload, EventPayload::LoopDispatched { .. }))).await;
+        assert!(events.iter().any(|e| matches!(&e.payload, EventPayload::AttemptFinished { error: Some(error), .. }
+            if error.code == ErrorCode::NativePermissionRequired)));
+        assert!(!events.iter().any(|e| matches!(&e.payload, EventPayload::LineageStrike { .. })));
+        assert_eq!(attempts_started(&events).len(), 1);
+        actor.stop().await;
+        let restarted = start_actor(&world, embedded_roles(), ActorOpts::default());
+        let result = restarted.handle.send_message(out.agent_id, "resume".into()).await.unwrap();
+        assert!(matches!(result, agent_control_plane::core::SendResult::Rejected { .. }));
+        assert_eq!(attempts_started(&world.events(&out.run_id)).len(), 1);
+        restarted.stop().await;
+    });
 }
 
 /// `(agent_id, argv, cwd)` of every `attempt.started`, in log order.
@@ -101,7 +123,7 @@ fn a_codex_builder_drives_the_full_loop_sandboxed_to_an_approved_commit() {
         let world = LoopWorld::new("pass", &[]);
         save_team(
             world.state_dir(),
-            &team_of("builder", ProviderName::Codex, "gpt-5.5", Some(Effort::Low)),
+            &team_of("builder", ProviderName::Codex, "gpt-6-astra", Some(Effort::Low)),
         )
         .expect("a codex builder team is savable since C1");
         let base_sha = head_sha(world.repo_root());
@@ -213,7 +235,7 @@ fn a_codex_verifier_team_spawns_with_the_workspace_write_shape() {
             &team_of(
                 "verifier",
                 ProviderName::Codex,
-                "gpt-5.5",
+                "gpt-6-astra",
                 Some(Effort::Low),
             ),
         )

@@ -45,4 +45,6 @@ credentials, change the lead model or start workers. Official downloaded binarie
 Developer ID signing/notarization for the intended trusted distribution experience.
 
 Ask the host to inspect readiness and your saved team before a small task. Do not register a
-second `acp serve` while a detached owner already runs. Human approval remains human-only.
+second `acp serve` while a detached owner already runs. Ordinary runs require human approval.
+The optional [lead approval grant](PROTOCOL.md#lead-approval-for-one-run) requires a compatible
+runtime and interactive macOS confirmation for the selected run.

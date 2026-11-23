@@ -518,6 +518,7 @@ fn fixture_run(state: &Path, repo: &Path, task_id: &str) -> RunId {
         .append(
             &run,
             EventPayload::WorktreeCreated {
+                delegated_task: None,
                 agent_id: agent,
                 lineage_id: lineage,
                 path: worktree,
@@ -1348,6 +1349,7 @@ fn fixture_lineages(state: &Path, repo: &Path) -> (RunId, PathBuf, PathBuf) {
             .append(
                 &run,
                 EventPayload::WorktreeCreated {
+                    delegated_task: None,
                     agent_id: agent,
                     lineage_id: lineage,
                     path: path.clone(),
@@ -1700,10 +1702,10 @@ fn team_get_set_and_roles_are_thin_socket_clients() {
     let team = json!({
         "version": 1,
         "name": "T50 team",
-        "lead": { "provider": "codex", "model": "gpt-5.5", "effort": "high" },
+        "lead": { "provider": "codex", "model": "gpt-6-astra", "effort": "high" },
         "roles": {
             "builder": { "provider": "claude", "model": "sonnet" },
-            "reviewer": { "provider": "codex", "model": "gpt-5.5", "effort": "xhigh" },
+            "reviewer": { "provider": "codex", "model": "gpt-6-astra", "effort": "xhigh" },
             "future_role": { "provider": "claude", "model": "haiku" }
         }
     });
@@ -1921,6 +1923,74 @@ fn a_client_refuses_a_daemon_whose_protocol_it_does_not_know() {
             refused.stdout
         );
         server.join().expect("the fake future daemon did not panic");
+    }
+}
+
+#[test]
+fn terminal_claim_files_fail_before_submit_and_keep_private_claims_out_of_stdout() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = short_dir();
+    let repo = repo_with_exclude();
+    let socket = state.path().join("acp.sock");
+    let plan = state.path().join("plan.json");
+    fs::write(&plan, "{}").unwrap();
+    let token = "10000000-0000-4000-8000-000000000001";
+    for (version, existing, reply_to_submission) in [(1, false, false), (2, true, false), (2, false, false), (2, false, true)] {
+        let _ = fs::remove_file(&socket);
+        let claim = state.path().join("private.claim");
+        let _ = fs::remove_file(&claim);
+        if existing { fs::write(&claim, b"keep me").unwrap(); }
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut writer, _) = listener.accept().unwrap();
+            writer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            for (method, result) in [
+                ("hello", json!({"protocolVersion": 1, "serverVersion": "0.1.0", "pid": 1})),
+                ("roles.list", json!({"humanSetupVersion": version})),
+            ] {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                writeln!(writer, "{response}").unwrap();
+            }
+            let mut line = String::new();
+            let size = reader.read_line(&mut line).unwrap();
+            if version == 1 || existing {
+                assert_eq!(size, 0, "unsupported capability or existing output file must prevent submission");
+                return;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "plan.start");
+            assert_eq!(request["params"]["terminalLeadRequested"], true);
+            if reply_to_submission {
+                let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":{
+                    "runId":"20000000-0000-4000-8000-000000000001", "terminalClaim":token
+                }});
+                writeln!(writer, "{response}").unwrap();
+            }
+        });
+        let out = acp(state.path(), repo.path(), &[
+            "plan", "--request-lead-approval", "--claim-file", claim.to_str().unwrap(), plan.to_str().unwrap(),
+        ]);
+        server.join().unwrap();
+        assert!(!out.stdout.contains(token));
+        if version == 1 {
+            assert!(!claim.exists());
+            assert!(out.stderr.contains("does not support terminal lead authorization"));
+        } else if existing {
+            assert_eq!(fs::read_to_string(&claim).unwrap(), "keep me");
+        } else if reply_to_submission {
+            assert_eq!(out.code, Some(0), "{}", out.stderr);
+            assert!(out.stdout.contains("runId"));
+            assert_eq!(fs::read_to_string(&claim).unwrap().trim(), token);
+            assert_eq!(fs::metadata(&claim).unwrap().permissions().mode() & 0o777, 0o600);
+        } else {
+            assert!(out.stderr.contains("Check acp status before submitting again"));
+            assert!(fs::read_to_string(&claim).unwrap().is_empty());
+        }
     }
 }
 
@@ -2651,7 +2721,7 @@ fn audit_cli_captures_existing_work_and_finishes_without_integration() {
             &team,
             serde_json::to_vec(&json!({"version":3,"mode":"audit","name":"Audit",
             "roles":{"verifier":{"provider":"claude","model":"haiku"},
-                     "reviewer":{"provider":"codex","model":"gpt-5.5"}}}))
+                     "reviewer":{"provider":"codex","model":"gpt-6-astra"}}}))
             .unwrap(),
         )
         .unwrap();
@@ -2850,7 +2920,7 @@ fn closing_last_host_stops_managed_owner_and_preserves_history_across_restart() 
         fs::write(
             &team,
             serde_json::to_vec(&json!({"version":3,"mode":"audit","name":"History",
-            "roles":{"reviewer":{"provider":"codex","model":"gpt-5.5"}}}))
+            "roles":{"reviewer":{"provider":"codex","model":"gpt-6-astra"}}}))
             .unwrap(),
         )
         .unwrap();

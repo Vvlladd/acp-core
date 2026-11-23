@@ -76,3 +76,5 @@ it, no markdown fence, no commentary:
   "looks fine" and "consider improving this" are both useless to the human who reads your verdict.
 
 `{"verdict": "PASS", "diffHash": "…", "findings": []}` is a complete and valid review.
+
+If a necessary action needs native access that you do not have, stop and return the required JSON with `verdict` set to `"NATIVE_PERMISSION_REQUIRED"`. Keep all other schema fields valid. This requests a pause; it does not grant access. Do not claim a global preference authorizes this worker.

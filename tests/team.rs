@@ -88,7 +88,7 @@ fn brief_team() -> Value {
         "lead": { "provider": "claude", "model": "opus" },
         "roles": {
             "builder": { "provider": "claude", "model": "sonnet" },
-            "reviewer": { "provider": "codex", "model": "gpt-5.5", "effort": "high" }
+            "reviewer": { "provider": "codex", "model": "gpt-6-astra", "effort": "high" }
         }
     })
 }
@@ -251,7 +251,7 @@ fn every_team_issue_code_is_produced_and_spelled_for_the_wire() {
         .roles
         .get_mut(&RoleName::Reviewer)
         .expect("the reviewer role")
-        .models = vec!["gpt-5.5".to_string()];
+        .models = vec!["gpt-6-astra".to_string()];
     // A provider that takes efforts, but not all of them.
     doctored
         .providers
@@ -273,7 +273,7 @@ fn every_team_issue_code_is_produced_and_spelled_for_the_wire() {
                 // effort this catalog no longer offers.
                 "reviewer": {
                     "provider": "codex",
-                    "model": "gpt-5.3-codex-spark",
+                    "model": "gpt-6.1-terra",
                     "effort": "xhigh"
                 }
             }
@@ -326,7 +326,7 @@ fn every_team_issue_code_is_produced_and_spelled_for_the_wire() {
         &team_of(json!({
             "version": 2,
             "name": "no writer",
-            "roles": { "reviewer": { "provider": "codex", "model": "gpt-5.5" } }
+            "roles": { "reviewer": { "provider": "codex", "model": "gpt-6-astra" } }
         })),
     )
     .expect_err("a v2 team without a builder is refused");
@@ -343,7 +343,7 @@ fn every_team_issue_code_is_produced_and_spelled_for_the_wire() {
             "name": "typo'd reviewer",
             "roles": {
                 "builder": { "provider": "claude", "model": "sonnet" },
-                "reviewers": { "provider": "codex", "model": "gpt-5.5" }
+                "reviewers": { "provider": "codex", "model": "gpt-6-astra" }
             }
         })),
     )
@@ -393,7 +393,7 @@ fn a_codex_builder_team_is_accepted_since_c1() {
         &team_of(json!({
             "version": 1,
             "name": "a builder that now starts",
-            "roles": { "builder": { "provider": "codex", "model": "gpt-5.5", "effort": "low" } }
+            "roles": { "builder": { "provider": "codex", "model": "gpt-6-astra", "effort": "low" } }
         })),
     )
     .expect("a codex builder is a legal team since C1");
@@ -418,7 +418,7 @@ fn resolve_assignment_falls_back_to_the_role_defaults() {
         defaults(RoleName::Reviewer),
         Assignment {
             provider: ProviderName::Codex,
-            model: "gpt-5.5".to_string(),
+            model: "gpt-6-astra".to_string(),
             effort: None,
         }
     );
@@ -430,7 +430,7 @@ fn resolve_assignment_falls_back_to_the_role_defaults() {
             "version": 1,
             "name": "reviewer only",
             "roles": {
-                "reviewer": { "provider": "codex", "model": "gpt-5.3-codex-spark",
+                "reviewer": { "provider": "codex", "model": "gpt-6.1-terra",
                               "effort": "xhigh" }
             }
         })),
@@ -445,7 +445,7 @@ fn resolve_assignment_falls_back_to_the_role_defaults() {
         resolve_assignment(&cfg, Some(&partial), RoleName::Reviewer),
         Assignment {
             provider: ProviderName::Codex,
-            model: "gpt-5.3-codex-spark".to_string(),
+            model: "gpt-6.1-terra".to_string(),
             effort: Some(Effort::Xhigh),
         }
     );
@@ -475,9 +475,8 @@ fn resolve_assignment_falls_back_to_the_role_defaults() {
     );
 }
 
-/// `roles.list` is the app's `RoleCatalog` — the same document as its bundled
-/// `roles.fallback.json`, key for key. The two are decoded by one Swift type, so a drift here is a
-/// picker that cannot be filled from the daemon.
+/// The current catalog preserves the legacy client field shape and advertises the executable
+/// role lists. The frozen fixture must still decode with the older model and effort choices.
 #[test]
 fn roles_list_keeps_the_legacy_worker_catalog_and_adds_a_separate_lead() {
     let cfg = cfg();
@@ -509,6 +508,8 @@ fn roles_list_keeps_the_legacy_worker_catalog_and_adds_a_separate_lead() {
     assert_eq!(answer["lead"]["writes"], false);
     let old: agent_control_plane::core::team::RolesListResult = serde_json::from_value(fallback.clone()).unwrap();
     assert!(old.lead.is_none(), "old catalogs still decode without a spawned-lead offer");
+    assert_eq!(old.providers[&ProviderName::Codex].efforts_for("gpt-5.5"),
+        [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh]);
 
     for role in answer["roles"].as_array().expect("roles") {
         let name = role["name"].as_str().expect("a role name");
@@ -520,7 +521,9 @@ fn roles_list_keeps_the_legacy_worker_catalog_and_adds_a_separate_lead() {
             .unwrap_or_else(|| panic!("the app's catalog has no `{name}` role"));
         assert_eq!(keys(role), keys(same), "the `{name}` entry differs");
         assert_eq!(role["provider"], same["provider"], "`{name}` provider");
-        assert_eq!(role["models"], same["models"], "`{name}` models");
+        let role_name = serde_json::from_value::<RoleName>(role["name"].clone()).unwrap();
+        let spec = agent_control_plane::roles::loader::role_spec(&cfg, role_name).unwrap();
+        assert_eq!(role["models"], json!(spec.models), "`{name}` models");
         assert!(
             role["description"].is_string(),
             "the app's picker shows a description for every role"
@@ -552,15 +555,12 @@ fn roles_list_keeps_the_legacy_worker_catalog_and_adds_a_separate_lead() {
             );
             continue;
         }
-        assert_eq!(keys(provider), keys(same), "the `{name}` catalog differs");
-        assert_eq!(provider["models"], same["models"], "`{name}` models");
+        let mut legacy = same.clone();
+        legacy.as_object_mut().unwrap().remove("modelEfforts");
+        assert_eq!(keys(provider), keys(&legacy), "the `{name}` catalog differs");
+        assert_eq!(provider["models"], json!(cfg.providers[&ProviderName::Codex].models), "`{name}` models");
         assert_eq!(provider["efforts"], same["efforts"], "`{name}` efforts");
-        // Revision 28: the per-model narrowing must agree too, or the two files could narrow
-        // different models and this drift guard would stay green.
-        assert_eq!(
-            provider["modelEfforts"], same["modelEfforts"],
-            "`{name}` modelEfforts"
-        );
+        assert!(provider.get("modelEfforts").is_none(), "current Codex choices inherit the provider efforts");
     }
 
     // `available` is this machine, not the bundle: it is whatever was probed, per call.
@@ -945,8 +945,8 @@ fn an_invalid_team_set_lists_every_issue_and_writes_nothing() {
                         "version": 1,
                         "name": "wrong twice",
                         "roles": {
-                            // claude has no `gpt-5.5` …
-                            "builder": { "provider": "claude", "model": "gpt-5.5" },
+                            // claude has no `gpt-6-astra` …
+                            "builder": { "provider": "claude", "model": "gpt-6-astra" },
                             // … and claude sonnet takes no reasoning effort.
                             "reviewer": { "provider": "claude", "model": "sonnet", "effort": "high" }
                         }
@@ -1099,7 +1099,7 @@ fn a_team_the_daemon_cannot_parse_is_invalid_params() {
             (
                 "an unknown effort",
                 json!({ "version": 1, "name": "n",
-                        "roles": { "builder": { "provider": "codex", "model": "gpt-5.5",
+                        "roles": { "builder": { "provider": "codex", "model": "gpt-6-astra",
                                                 "effort": "ludicrous" } } }),
             ),
             (
@@ -1190,7 +1190,7 @@ fn a_team_set_over_the_socket_decides_the_next_spawn() {
                         "lead": { "provider": "claude", "model": "opus" },
                         "roles": {
                             "builder": { "provider": "claude", "model": "haiku" },
-                            "reviewer": { "provider": "codex", "model": "gpt-5.5",
+                            "reviewer": { "provider": "codex", "model": "gpt-6-astra",
                                           "effort": "high" }
                         }
                     }
@@ -1250,8 +1250,8 @@ fn a_team_set_over_the_socket_decides_the_next_spawn() {
             (*role, *provider),
             (RoleName::Reviewer, ProviderName::Codex)
         );
-        assert_eq!(model, "gpt-5.5");
-        assert_eq!(after(argv, "-m"), Some("gpt-5.5"), "the reviewer's model");
+        assert_eq!(model, "gpt-6-astra");
+        assert_eq!(after(argv, "-m"), Some("gpt-6-astra"), "the reviewer's model");
         // One assertion for both halves: the team's effort is there, and the adapter's `medium`
         // constant is not. (`argv` is kept out of the message: it carries the whole role prompt.)
         assert_eq!(
@@ -1364,7 +1364,7 @@ fn step_enabled_reads_membership_only_from_version_2() {
             "name": "build and review",
             "roles": {
                 "builder": { "provider": "claude", "model": "sonnet" },
-                "reviewer": { "provider": "codex", "model": "gpt-5.5" }
+                "reviewer": { "provider": "codex", "model": "gpt-6-astra" }
             }
         })),
     )
@@ -1410,7 +1410,7 @@ fn a_v2_subset_is_captured_on_run_created_and_shapes_the_spawns() {
                         "name": "build and review, no verify",
                         "roles": {
                             "builder": { "provider": "claude", "model": "haiku" },
-                            "reviewer": { "provider": "codex", "model": "gpt-5.5" }
+                            "reviewer": { "provider": "codex", "model": "gpt-6-astra" }
                         }
                     }
                 }),

@@ -35,3 +35,5 @@ evidence and consequence, at most 4000 characters) and `fix` (suggested remedy o
 Report at most 100 findings. Echo `diffHash` exactly; a verdict for different bytes is invalid.
 A PASS states that this selected inspection found no blocking issue in the supplied diff;
 it does not claim test execution, general code review or a complete security audit.
+
+If a necessary action needs native access that you do not have, stop and return the required JSON with `verdict` set to `"NATIVE_PERMISSION_REQUIRED"`. Keep all other schema fields valid. This requests a pause; it does not grant access. Do not claim a global preference authorizes this worker.

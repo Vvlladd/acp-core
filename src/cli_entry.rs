@@ -115,7 +115,7 @@ impl<R: BufRead, W: Write> Dialogue<R, W> {
         let Some(mut chosen) = choices[index].clone() else {
             return Ok(None);
         };
-        // Revision 28: the chosen model's own list, not the provider's — gpt-5.5 takes no `max`.
+        // A catalog may restrict an individual model to a subset of the provider's efforts.
         let efforts = catalog.providers[&chosen.provider].efforts_for(&chosen.model);
         if !efforts.is_empty() {
             writeln!(self.output, "Reasoning effort:\n  1. Provider default")?;
@@ -337,24 +337,27 @@ mod tests {
         assert_eq!(dialogue.choose("Choose", 2, 0).unwrap(), 1);
         assert!(dialogue.choose("Confirm", 2, 0).is_err());
     }
-    /// The effort menu follows the chosen model, not the provider: gpt-5.5 never offers `max`,
-    /// gpt-6-astra does. Lead choices are 4 claude models, then codex in catalog order.
+    /// The effort menu follows a model-specific restriction when a catalog advertises one.
     #[test]
     fn effort_choices_follow_the_chosen_model() {
+        let mut catalog = catalog();
+        catalog.providers.get_mut(&ProviderName::Codex).unwrap().model_efforts.insert(
+            "gpt-6.2-sol".into(), vec![team::Effort::Low, team::Effort::Medium, team::Effort::High, team::Effort::Xhigh],
+        );
         let run = |lead: &str, effort: &str| {
             let mut dialogue = Dialogue {
                 input: io::Cursor::new(format!("{lead}\n{effort}\n1\n1\n1\n1\n")),
                 output: Vec::new(),
             };
-            let setup = dialogue.setup(&catalog(), None).unwrap();
+            let setup = dialogue.setup(&catalog, None).unwrap();
             validate_team(&load_roles(None).unwrap(), &setup.team).unwrap();
             (String::from_utf8(dialogue.output).unwrap(), setup.team.lead.unwrap())
         };
-        let (output, lead) = run("9", "5");
-        assert_eq!((lead.model.as_str(), lead.effort), ("gpt-5.5", Some(team::Effort::Xhigh)));
+        let (output, lead) = run("5", "5");
+        assert_eq!((lead.model.as_str(), lead.effort), ("gpt-6.2-sol", Some(team::Effort::Xhigh)));
         assert!(output.contains("  5. xhigh") && !output.contains("max"), "{output}");
-        let (output, lead) = run("5", "6");
-        assert_eq!((lead.model.as_str(), lead.effort), ("gpt-6-astra", Some(team::Effort::Max)));
+        let (output, lead) = run("6", "6");
+        assert_eq!((lead.model.as_str(), lead.effort), ("gpt-6.2-astra", Some(team::Effort::Max)));
         assert!(output.contains("  6. max"), "{output}");
     }
 }

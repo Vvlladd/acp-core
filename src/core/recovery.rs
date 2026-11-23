@@ -365,9 +365,38 @@ impl Core {
         Ok(())
     }
 
+    pub(super) fn recovery_confirmation(&self, request: &Request) -> Result<Option<crate::ipc::human_confirmation::Prompt>, CoreError> {
+        use crate::ipc::human_confirmation::{preview, Prompt};
+        if self.lead_approval_root(&request.run_id).is_none() { return Ok(None); }
+        let run = self.registry.run(&request.run_id).ok_or_else(|| refuse("This task is no longer available."))?;
+        if self.registry.events(&request.run_id, None, usize::MAX).iter().any(|event|
+            matches!(&event.payload, EventPayload::RunRecovered { recovery } if recovery.request.request_id == request.request_id)) {
+            return Ok(None);
+        }
+        if run.last_seq != request.expected_seq {
+            return Err(refuse("This task changed after the preview. Refresh and confirm the current draft."));
+        }
+        if request.feedback.chars().count() > 4000 {
+            return Err(refuse("Recovery direction is limited to 4,000 characters."));
+        }
+        self.check_recovery_idle(run)?;
+        let repo = preview(&self.repo_root.to_string_lossy(), 180);
+        let feedback = preview(&request.feedback, 160);
+        Prompt::new("recover_run", &(&self.repo_root, request), "ACP — Recover this task?", format!(
+            "Repository: {repo}\nRun: {}\n\nStart a new builder from the preserved draft and supersede outstanding decisions.\nRecovery direction: {feedback}", request.run_id
+        ), "Recover task").map(Some)
+    }
+
     pub fn recover_run(&mut self, request: Request, by: Actor) -> Result<Outcome, CoreError> {
+        self.recover_run_with_confirmation(request, by, None)
+    }
+
+    pub(super) fn recover_run_with_confirmation(&mut self, request: Request, by: Actor, proof: Option<crate::ipc::human_confirmation::Proof>) -> Result<Outcome, CoreError> {
         if !matches!(by, Actor::Socket { .. }) {
             return Err(refuse("Recovery is a human socket action."));
+        }
+        if let Some(prompt) = self.recovery_confirmation(&request)? {
+            crate::ipc::human_confirmation::require(proof, &prompt)?;
         }
         if request.feedback.chars().count() > 4000 {
             return Err(refuse("Recovery direction is limited to 4,000 characters."));

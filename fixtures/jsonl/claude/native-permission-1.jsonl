@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"bbbbbbbb-2222-4b22-8b22-bbbbbbbbbbbb"}
+{"type":"result","subtype":"success","is_error":false,"result":"Permission needed","permission_denials":[{"tool_name":"Bash","tool_use_id":"example","tool_input":{"command":"private"}}]}

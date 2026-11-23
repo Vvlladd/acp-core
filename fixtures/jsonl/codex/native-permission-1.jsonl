@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a02001-0002-7002-8002-000000000002"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"status\":\"native_permission_required\",\"filesChanged\":[\"src/adder.ts\"],\"summary\":\"Native access needed.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}

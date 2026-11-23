@@ -55,7 +55,8 @@
       "description": "A reviewer's verdict. The casing matches the provider fixtures (`{\"verdict\":\"PASS\"}`).",
       "enum": [
         "PASS",
-        "FAIL"
+        "FAIL",
+        "NATIVE_PERMISSION_REQUIRED"
       ],
       "type": "string"
     }

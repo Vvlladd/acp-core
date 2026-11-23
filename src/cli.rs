@@ -8,8 +8,8 @@
 //! * `status` without `--follow` reads the durable log **read-only**: no socket, no lock, and
 //!   therefore an answer even when no daemon is running.
 //! * `status --follow`, `gate approve` and `gate deny` are socket clients. `gate approve` is *the*
-//!   human approval path (S2): it exists on this transport and nowhere else, so an agent driving
-//!   the MCP door can never approve its own integration.
+//!   human approval path. An opted-in lead uses a separate, run-scoped decision path through the
+//!   daemon with its exact integration evidence.
 //! * `team get`, `team set` and `team roles` are also socket clients. The daemon remains the
 //!   authority that reads, validates and writes `team.json`; the CLI never edits it directly.
 //! * `gc` and `doctor` are offline tools over the same log and the same config.
@@ -36,7 +36,7 @@ use agent_control_plane::core::registry::{now_rfc3339, CompatibilitySummary, Reg
 use agent_control_plane::core::supervisor::{ProcessProbe as _, PsProbe, Supervisor};
 use agent_control_plane::core::team::{self, validate_team};
 use agent_control_plane::core::types::{
-    AgentHandle, Attempt, Gate, GateId, GateStatus, ProviderName, RolesConfig, Run, RunId,
+    AgentHandle, Attempt, AttemptId, Gate, GateId, GateStatus, ProviderName, RolesConfig, Run, RunId,
 };
 use agent_control_plane::core::{
     channel, human_action, run_actor, spawn_signal_forwarder, spawn_tick_task, Core, DEFAULT_TICK,
@@ -174,7 +174,7 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Approve or deny a human gate. Approving is only ever done here (S2).
+    /// Resolve human gates and inspect or use a run's lead authorization.
     #[command(subcommand)]
     Gate(GateCmd),
     /// Record human-attested host verification for an environment-blocked verifier.
@@ -237,6 +237,12 @@ pub enum Cmd {
         /// Immutable host-imported evidence bundle to attach.
         #[arg(long, value_name = "SHA256")]
         evidence: Option<String>,
+        /// Request a private terminal lead claim for this new run, pending human opt-in.
+        #[arg(long, requires = "claim_file", conflicts_with_all = ["run_id", "session"])]
+        request_lead_approval: bool,
+        /// New local file for the private terminal claim. The claim is never printed.
+        #[arg(long, requires = "request_lead_approval", value_name = "NEW_PATH")]
+        claim_file: Option<PathBuf>,
     },
     /// Import or inspect immutable host-supplied offline evidence.
     #[command(subcommand)]
@@ -269,6 +275,12 @@ pub enum Cmd {
     Plan {
         /// A JSON file holding the plan: `{version, name, items: [{id, kind, …}]}`.
         file: PathBuf,
+        /// Request a private terminal lead claim for this plan, pending human opt-in.
+        #[arg(long, requires = "claim_file")]
+        request_lead_approval: bool,
+        /// New local file for the private terminal claim. The claim is never printed.
+        #[arg(long, requires = "request_lead_approval", value_name = "NEW_PATH")]
+        claim_file: Option<PathBuf>,
     },
     /// Audit existing changes with the selected checks and no builder or integration.
     Audit {
@@ -305,6 +317,29 @@ pub enum GateCmd {
         gate_id: String,
         #[arg(long, value_name = "TEXT")]
         feedback: Option<String>,
+    },
+    /// Human opt-in for one run and its designated native lead.
+    AuthorizeLead { run_id: RunId },
+    /// Read the live frozen-patch identifiers for an opted-in integration gate.
+    LeadEvidence {
+        gate_id: GateId,
+        #[arg(long)]
+        run_id: RunId,
+    },
+    /// Decide a plan or approve verified integration from this run's designated terminal lead.
+    LeadResolve {
+        gate_id: String,
+        #[arg(long)]
+        deny: bool,
+        #[arg(long)]
+        feedback: Option<String>,
+        #[arg(long)]
+        diff_hash: Option<String>,
+        #[arg(long)]
+        builder_attempt_id: Option<AttemptId>,
+        /// Read the private terminal claim from the file created at submission.
+        #[arg(long, value_name = "PATH")]
+        claim_file: Option<PathBuf>,
     },
 }
 
@@ -475,8 +510,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             session,
             base_ref,
             evidence,
+            request_lead_approval,
+            claim_file,
         } => {
-            let params = delegate_params(
+            let mut params = delegate_params(
                 role,
                 description,
                 task_id,
@@ -488,7 +525,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
                 base_ref,
                 evidence,
             );
-            call_socket(repo, "delegate", params).await
+            if request_lead_approval { params["terminalLeadRequested"] = json!(true); }
+            submit_with_terminal_claim(repo, "delegate", params, claim_file.as_deref()).await
         }
         Cmd::Evidence(EvidenceCmd::Import { manifest }) => {
             // Make the path unambiguous to the daemon without following any component: the
@@ -520,12 +558,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
             };
             call_socket(repo, "daemon.stop", serde_json::json!({"mode": mode})).await
         }
-        Cmd::Plan { file } => {
+        Cmd::Plan { file, request_lead_approval, claim_file } => {
             let bytes = fs::read(&file)
                 .with_context(|| format!("reading the plan document {}", file.display()))?;
             let plan: Value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing the plan document {}", file.display()))?;
-            call_socket(repo, "plan.start", json!({ "plan": plan })).await
+            let mut params = json!({ "plan": plan });
+            if request_lead_approval { params["terminalLeadRequested"] = json!(true); }
+            submit_with_terminal_claim(repo, "plan.start", params, claim_file.as_deref()).await
         }
         Cmd::Review { action } => {
             let (method, params) = match action {
@@ -598,6 +638,30 @@ async fn call_socket(repo: Option<&Path>, method: &str, params: Value) -> anyhow
     let places = Places::locate(repo).await?;
     let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
     let result = client.call(method, params).await?;
+    print_json(&result)?;
+    Ok(EXIT_OK)
+}
+
+async fn submit_with_terminal_claim(repo: Option<&Path>, method: &str, params: Value, claim_path: Option<&Path>) -> anyhow::Result<i32> {
+    let Some(path) = claim_path else { return call_socket(repo, method, params).await; };
+    let places = Places::locate(repo).await?;
+    let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
+    let catalog = client.call("roles.list", json!({})).await?;
+    if catalog["humanSetupVersion"].as_u64().unwrap_or_default() < 2 {
+        bail!("the connected daemon does not support terminal lead authorization");
+    }
+    let mut claim_file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+        .with_context(|| format!("opening a new terminal claim file {}", path.display()))?;
+    let mut result = client.call(method, params).await
+        .context("the task was not confirmed. Check acp status before submitting again")?;
+    let claim = result.as_object_mut().and_then(|object| object.remove("terminalClaim"))
+        .and_then(|claim| claim.as_str().and_then(|value| uuid::Uuid::parse_str(value).ok()));
+    if let Some(claim) = claim {
+        writeln!(claim_file, "{claim}").and_then(|()| claim_file.sync_all())
+            .with_context(|| format!("task {} started, but writing its private terminal claim failed", result["runId"]))?;
+    } else {
+        bail!("task {} started without a terminal claim. Check acp status before submitting again", result["runId"]);
+    }
     print_json(&result)?;
     Ok(EXIT_OK)
 }
@@ -1018,8 +1082,20 @@ impl mcp::server::Backend for SocketBackend {
         &self,
         args: mcp::server::ResolveGateArgs,
     ) -> Result<mcp::server::ResolveGateOut, CallToolResult> {
-        self.call_attributed("resolve_gate", args).await
+        let wants_lead = args.approve || args.lead_decision == Some(true)
+            || args.diff_hash.is_some() || args.builder_attempt_id.is_some();
+        if wants_lead {
+            self.call("gate.leadResolve", json!({
+                "gateId": args.gate_id, "approve": args.approve, "feedback": args.feedback,
+                "diffHash": args.diff_hash, "builderAttemptId": args.builder_attempt_id,
+            })).await
+        } else {
+            self.call_attributed("resolve_gate", json!({
+                "gateId": args.gate_id, "approve": args.approve, "feedback": args.feedback,
+            })).await
+        }
     }
+    fn supports_lead_decisions(&self) -> bool { self.lead_run_id.is_some() }
 }
 
 async fn mcp_proxy(repo: Option<&Path>) -> anyhow::Result<i32> {
@@ -2028,9 +2104,22 @@ async fn follow_status(state_dir: &Path, run: Option<RunId>, as_json: bool) -> a
 // gate
 // ---------------------------------------------------------------------------
 
-/// `acp gate approve|deny` — the human's door, and for `approve` the only one there is (S2).
+/// Human and designated-lead gate actions, each dispatched to its own authority path.
 async fn resolve_gate(repo: Option<&Path>, cmd: GateCmd) -> anyhow::Result<i32> {
+    if let GateCmd::AuthorizeLead { run_id } = cmd {
+        return call_socket(repo, "run.authorize_lead", json!({"runId": run_id})).await;
+    }
     let places = Places::locate(repo).await?;
+    if let GateCmd::LeadEvidence { gate_id, run_id } = cmd {
+        let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
+        let status = client.call("get_status", json!({"runId": run_id, "lastEvents": 0})).await?;
+        let gate = json!(gate_id);
+        let evidence = status["gates"].as_array().and_then(|gates| gates.iter().find(|item| item["gateId"] == gate))
+            .and_then(|item| item.get("leadEvidence"))
+            .context("this run and gate have no current lead integration evidence")?;
+        print_json(evidence)?;
+        return Ok(EXIT_OK);
+    }
     let (method, params) = match &cmd {
         GateCmd::Approve { gate_id } => (
             "gate.approve",
@@ -2040,6 +2129,17 @@ async fn resolve_gate(repo: Option<&Path>, cmd: GateCmd) -> anyhow::Result<i32> 
             "gate.deny",
             json!({ "gateId": parse_gate(gate_id)?.to_string(), "feedback": feedback }),
         ),
+        GateCmd::LeadResolve { gate_id, deny, feedback, diff_hash, builder_attempt_id, claim_file } => {
+            let terminal_claim = if let Some(path) = claim_file {
+                let bytes = agent_control_plane::core::lead_authority::read_private_regular(path, 128)
+                    .context("reading the private terminal lead claim")?;
+                let value = std::str::from_utf8(&bytes).context("invalid terminal lead claim")?;
+                Some(uuid::Uuid::parse_str(value.trim()).map_err(|_| anyhow!("invalid terminal lead claim"))?)
+            } else { None };
+            ("gate.leadResolve", json!({"gateId": parse_gate(gate_id)?, "approve": !deny, "feedback": feedback,
+                "diffHash": diff_hash, "builderAttemptId": builder_attempt_id, "terminalClaim": terminal_claim}))
+        }
+        GateCmd::AuthorizeLead { .. } | GateCmd::LeadEvidence { .. } => unreachable!("handled above"),
     };
 
     let mut client = Client::connect(&places.state_dir.join(SOCKET_FILE)).await?;
@@ -3125,9 +3225,7 @@ impl Client {
         {
             return Ok(None);
         }
-        serde_json::from_str(&line)
-            .map(Some)
-            .with_context(|| format!("the daemon sent a line that is not JSON: {line:?}"))
+        serde_json::from_str(&line).map(Some).context("the daemon sent a line that is not JSON")
     }
 }
 

@@ -124,6 +124,50 @@ fn gate_payload(
     serde_json::from_str(&text).expect("the gate payload is valid")
 }
 
+#[test]
+fn same_run_repair_uses_the_narrow_delegation_after_replay() {
+    common::with_shared_env(|| async {
+        let world = LoopWorld::new("fail_then_pass", &[]);
+        let first = start_actor(&world, embedded_roles(), ActorOpts { reattach: false, no_tick: true });
+        let mut conversation = loop_task("broad-run");
+        conversation.description = "Broad conversation sentinel is not a worker assignment.".into();
+        let run = first.handle.start_lead(conversation.clone(), conversation.description.clone()).await.unwrap().run_id;
+        let mut delegated_task = loop_task("narrow-worker");
+        delegated_task.description = "Narrow worker sentinel is the original delegated instruction.".into();
+        let mut request = delegate_builder(delegated_task.clone());
+        request.run_id = Some(run);
+        let builder = first.handle.delegate(request).await.unwrap().agent_id;
+        wait_for_log(&world, &run, "the original builder starts", |events| {
+            events.iter().any(|event| matches!(&event.payload,
+                EventPayload::AttemptStarted { agent_id, .. } if *agent_id == builder))
+        }).await;
+        let status = first.handle.status(StatusQuery { run_id: Some(run), last_events: 100, agent_id: None }).await.unwrap();
+        let status = serde_json::to_string(&status).unwrap();
+        assert!(!status.contains("delegatedTask"));
+        assert!(!status.contains(&delegated_task.description));
+        first.stop().await;
+
+        let second = start_actor(&world, embedded_roles(), ActorOpts { reattach: true, no_tick: false });
+        let events = wait_for_log(&world, &run, "a passing gate after the repair", |events| !integrate_gates(events).is_empty()).await;
+        assert!(events.iter().any(|event| matches!(&event.payload,
+            EventPayload::WorktreeCreated { delegated_task: Some(task), .. } if task == &delegated_task)));
+        let worker_ids: Vec<AgentId> = pick(&events, |payload| match payload {
+            EventPayload::AgentCreated { agent_id, role, .. } if *role != RoleName::Lead => Some(*agent_id),
+            _ => None,
+        });
+        let worker_attempts: Vec<_> = attempts_started(&events).into_iter().filter(|(agent, ..)| worker_ids.contains(agent)).collect();
+        assert!(worker_attempts.iter().any(|(agent, kind, _)| *agent == builder && *kind == AttemptKind::Resume));
+        assert!(!reviewers(&events).is_empty());
+        for (_, _, dir) in worker_attempts {
+            let prompt = rendered_prompt(&dir);
+            assert!(prompt.contains(&delegated_task.description), "worker prompt lost its scoped task: {prompt}");
+            assert!(!prompt.contains(&conversation.description), "worker prompt was broadened: {prompt}");
+        }
+        quiesce(&second.handle).await;
+        second.stop().await;
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Restart mid-run
 // ---------------------------------------------------------------------------

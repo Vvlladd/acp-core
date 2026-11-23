@@ -149,6 +149,7 @@ pub struct PendingWorktree {
     base_ref: String,
     run_budget_usd: Option<f64>,
     task: Task,
+
     prompt: String,
     lead: Option<String>,
     team_name: Option<String>,
@@ -195,6 +196,9 @@ impl PendingSpawn {
     pub fn agent(&self) -> AgentId {
         self.ctx.agent
     }
+    pub(super) fn run(&self) -> RunId {
+        self.ctx.run
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +235,12 @@ enum Branch {
 /// resolves on its own; `escalate` next because a denylist hit or an unverified worktree must not
 /// be turned into a strike; then the two states a human owns; then role and success.
 fn branch_of(role: RoleName, status: AttemptStatus, error: Option<&AttemptError>) -> Branch {
+    if matches!(status, AttemptStatus::Cancelled | AttemptStatus::Lost | AttemptStatus::Running) {
+        return Branch::None;
+    }
+    if status == AttemptStatus::Escalate {
+        return Branch::Escalate;
+    }
     if matches!(
         error.map(|e| e.code),
         Some(
@@ -238,6 +248,7 @@ fn branch_of(role: RoleName, status: AttemptStatus, error: Option<&AttemptError>
                 | ErrorCode::ProviderUnauthenticated
                 | ErrorCode::ProviderUsageLimit
                 | ErrorCode::ProviderModelUnavailable
+                | ErrorCode::NativePermissionRequired
         )
     ) {
         return Branch::Environment;
@@ -366,6 +377,13 @@ fn lead_setup_prompt(message: &str, execution: Option<&RunExecution>) -> String 
         serde_json::to_string(selection).expect("audit selection is serializable"))
 }
 
+struct LeadPreparation {
+    execution: RunExecution,
+    assignment: team::Assignment,
+    team_name: Option<String>,
+    spawn_budget_usd: f64,
+}
+
 impl Core {
     /// Starts one conversational lead directly in the repository root. This is the daemon-side
     /// spawn primitive; T58's socket-only `lead.start` door owns human-input validation and the
@@ -387,6 +405,10 @@ impl Core {
         message: String,
         setup: super::LeadSetup,
     ) -> Result<(RunId, AgentId), CoreError> {
+        self.spawn_lead_with_confirmation(task, message, setup, None)
+    }
+
+    fn prepare_lead_start(&mut self, setup: &super::LeadSetup) -> Result<LeadPreparation, CoreError> {
         if let Some(agent) = self.live_lead_agent() {
             return Err(CoreError::Policy(
                 PolicyError::new(
@@ -416,13 +438,12 @@ impl Core {
         let selected = team.as_ref().filter(|t| t.team().version >= 3);
         let assignment = team::resolve_assignment(&self.roles, selected, RoleName::Lead);
         let provider = assignment.provider;
-        let model = assignment.model.clone();
-        if !role.models.contains(&model)
+        if !role.models.contains(&assignment.model)
             || !self
                 .roles
                 .providers
                 .get(&provider)
-                .is_some_and(|p| p.models.contains(&model))
+                .is_some_and(|p| p.models.contains(&assignment.model))
         {
             return Err(CoreError::Policy(PolicyError::new(
                 PolicyCode::UnknownModel,
@@ -433,8 +454,11 @@ impl Core {
         execution
             .assignments
             .insert("lead".into(), assignment.clone());
+        if setup.lead_approved && execution.mode == RunMode::Audit {
+            return Err(super::lead_authority::refusal("audit runs have no lead-approvable decisions"));
+        }
         if execution.mode == RunMode::Audit {
-            let selection = setup.audit_selection.ok_or_else(|| {
+            let selection = setup.audit_selection.clone().ok_or_else(|| {
                 PolicyError::new(
                     PolicyCode::InvalidBaseRef,
                     "choose an explicit audit base and target before starting",
@@ -449,9 +473,41 @@ impl Core {
             )
             .into());
         }
-        let message =
-            handoff::build_lead_prompt(&lead_setup_prompt(&message, Some(&execution)), &task);
+        Ok(LeadPreparation { execution, assignment, spawn_budget_usd, team_name: team.as_ref().map(|t| t.name().to_string()) })
+    }
+
+    fn lead_start_confirmation(&self, task: &Task, message: &str, prepared: &LeadPreparation) -> Result<crate::ipc::human_confirmation::Prompt, CoreError> {
+        use crate::ipc::human_confirmation::{preview, Prompt};
+        let repo = preview(&self.repo_root.to_string_lossy(), 180);
+        let prompt = preview(message, 160);
+        let provider = provider_key(prepared.assignment.provider);
+        let model = preview(&prepared.assignment.model, 80);
+        Prompt::new("lead_start", &(&self.repo_root, task, message, &prepared.execution, &prepared.team_name),
+            "ACP — Start a task with lead decisions?", format!(
+                "Repository: {repo}\nLead: {provider} · {model}\nTask preview: {prompt}\n\nThe lead can decide plans and authorize the exact checked patch for a local commit in the task worktree. Escalations still require human confirmation."
+            ), "Start with lead decisions")
+    }
+
+    pub(super) fn prepare_lead_confirmation(&mut self, task: &Task, message: &str, setup: &super::LeadSetup) -> Result<crate::ipc::human_confirmation::Prompt, CoreError> {
+        let prepared = self.prepare_lead_start(setup)?;
+        self.lead_start_confirmation(task, message, &prepared)
+    }
+
+    pub(super) fn spawn_lead_with_confirmation(
+        &mut self, task: Task, message: String, setup: super::LeadSetup,
+        proof: Option<crate::ipc::human_confirmation::Proof>,
+    ) -> Result<(RunId, AgentId), CoreError> {
+        let prepared = self.prepare_lead_start(&setup)?;
+        if setup.lead_approved {
+            let prompt = self.lead_start_confirmation(&task, &message, &prepared)?;
+            crate::ipc::human_confirmation::require(proof, &prompt)?;
+        }
+        let LeadPreparation { mut execution, assignment, team_name, spawn_budget_usd } = prepared;
+        let provider = assignment.provider;
+        let model = assignment.model;
+        let message = handoff::build_lead_prompt(&lead_setup_prompt(&message, Some(&execution)), &task);
         let run = RunId::new_v4();
+        execution.lead_approval_run_id = setup.lead_approved.then_some(run);
         let agent = AgentId::new_v4();
         let attempt = AttemptId::new_v4();
         self.registry.append(
@@ -468,7 +524,7 @@ impl Core {
                 task,
                 version: RUN_VERSION,
                 lead: Some(format!("{}:{model}", provider_key(provider))),
-                team_name: team.as_ref().map(|t| t.name().to_string()),
+                team_name,
                 steps: Some(execution.steps),
             },
         )?;
@@ -522,7 +578,7 @@ impl Core {
     /// The one lead that has a pending provider spawn or any attempt still running.
     /// The actor serializes `LeadStart` commands, so this check and the subsequent durable
     /// `agent.created` append are one decision: two racing socket requests cannot both pass it.
-    fn live_lead_agent(&self) -> Option<AgentId> {
+    pub(super) fn live_lead_agent(&self) -> Option<AgentId> {
         self.registry
             .state()
             .agents
@@ -679,6 +735,12 @@ impl Core {
     /// `TeamInvalid` for a `team.json` that exists and cannot be trusted (Rev 26) and `InvalidTask`
     /// for a fresh `reviewer` delegation, which only the control plane may start.
     pub fn delegate(&mut self, req: DelegateRequest) -> Result<DelegateOut, CoreError> {
+        self.delegate_from_socket(req, None, false).map(|(out, _)| out)
+    }
+
+    pub(super) fn delegate_from_socket(&mut self, mut req: DelegateRequest, peer: Option<&super::lead_authority::PeerProcess>, terminal_lead_requested: bool) -> Result<(DelegateOut, Option<uuid::Uuid>), CoreError> {
+        let lead_owner = self.authenticated_spawned_lead(peer);
+        if let Some(owner) = lead_owner { req.caller_run_id = Some(owner); }
         if self.caller_without_builder(req.caller_run_id) {
             return Err(PolicyError::new(
                 PolicyCode::DelegationNotAllowed,
@@ -686,10 +748,18 @@ impl Core {
             )
             .into());
         }
-        let inherited = req
-            .caller_run_id
-            .and_then(|id| self.registry.run(&id))
-            .and_then(|r| r.execution.clone());
+        let terminal = if terminal_lead_requested {
+            if req.run_id.is_some() || !matches!(req.session, SessionSpec::Fresh) || req.caller_run_id.is_some() {
+                return Err(super::lead_authority::refusal("a terminal lead claim applies only when submitting a new run"));
+            }
+            Some(self.terminal_candidate(peer)?)
+        } else { None };
+        let mut inherited = req.caller_run_id
+            .and_then(|id| self.registry.run(&id)).and_then(|r| r.execution.clone());
+        if let Some(execution) = &mut inherited {
+            execution.lead_approval_run_id = None;
+            execution.lead_owner_run_id = lead_owner;
+        }
         if inherited.as_ref().is_some_and(|e| e.mode != RunMode::Build) {
             return Err(PolicyError::new(
                 PolicyCode::DelegationNotAllowed,
@@ -697,14 +767,10 @@ impl Core {
             )
             .into());
         }
-        self.delegate_with_execution(req, inherited)
+        self.delegate_with_execution(req, inherited, terminal)
     }
 
-    fn delegate_with_execution(
-        &mut self,
-        req: DelegateRequest,
-        inherited: Option<RunExecution>,
-    ) -> Result<DelegateOut, CoreError> {
+    fn delegate_with_execution(&mut self, req: DelegateRequest, inherited: Option<RunExecution>, terminal: Option<super::lead_authority::ProcessIdentity>) -> Result<(DelegateOut, Option<uuid::Uuid>), CoreError> {
         let cfg = Arc::clone(&self.roles);
         let captured = self.request_execution(&req).cloned().or(inherited);
         let team = match captured.as_ref() {
@@ -805,7 +871,7 @@ impl Core {
         let validated_caller = self.validated_caller_run(req.caller_run_id);
 
         if let SessionSpec::Resume(agent) = req.session {
-            return self.delegate_resume(agent, &req, &resolved, &digest, validated_caller);
+            return self.delegate_resume(agent, &req, &resolved, &digest, validated_caller).map(|out| (out, None));
         }
 
         // A reviewer reviews a **frozen diff**, and only the loop knows which one: there is no
@@ -833,6 +899,7 @@ impl Core {
             },
         );
         let run = req.run_id.unwrap_or_else(RunId::new_v4);
+        let terminal_claim = terminal.map(|owner| self.record_terminal_lead(owner, run)).transpose()?;
         let new_run = self.registry.run(&run).is_none();
         let (task, evidence_update) = if new_run {
             (req.task.clone(), None)
@@ -911,13 +978,13 @@ impl Core {
             resolved.base_ref,
         );
 
-        Ok(DelegateOut {
+        Ok((DelegateOut {
             agent_id: agent,
             run_id: run,
             attempt_id: attempt,
             status: RunStatus::Running,
             worktree,
-        })
+        }, terminal_claim))
     }
 
     // Preserve the caller's continuation instructions. Only evidence is inherited from the
@@ -1030,7 +1097,8 @@ impl Core {
             self.registry
                 .append(&run, EventPayload::TaskEvidenceUpdated { evidence })?;
         }
-        match self.resume_attempt(agent, attempt, prompt, resolved.spawn_budget_usd) {
+        match self.resume_attempt(agent, attempt, prompt, resolved.spawn_budget_usd,
+            Some((Origin::Lead, handoff::task_block(&continuation_task)))) {
             Ok(()) => {
                 self.record_delegation(
                     validated_caller,
@@ -1168,6 +1236,7 @@ impl Core {
                 path: info.path.clone(),
                 branch: info.branch.clone(),
                 base_sha: info.base_sha.clone(),
+                delegated_task: (!p.new_run).then(|| p.task.clone()),
             },
         );
         self.emit(
@@ -1216,7 +1285,7 @@ impl Core {
             timeout_sec: p.timeout_sec,
             spawn_budget_usd: p.spawn_budget_usd,
         };
-        if let Err(err) = self.start_attempt(spawn) {
+        if let Err(err) = self.start_attempt_with_input(spawn, Some((p.origin, handoff::task_block(&p.task)))) {
             let reason = format!("the builder could not be started: {}", err.reason);
             self.registry.audit(AuditEntry::new(
                 "delegate",
@@ -1317,6 +1386,7 @@ impl Core {
                 // end the one it just took charge of.
                 let run = pending.ctx.run;
                 let agent = pending.ctx.agent;
+                self.register_managed_process(*attempt, proc.pid);
                 let adopted = self.supervisor.adopt(proc, pending.ctx, &mut self.registry);
                 if cancel_requested {
                     tracing::info!(%attempt, %run, "a cancelled pending spawn arrived; adopting then cancelling");
@@ -1366,12 +1436,22 @@ impl Core {
     /// A rejection is a **value**, not an error: `core::loop` branches on it, and a run that cannot
     /// resume its builder becomes `run.status{blocked}` rather than propagating anything to a door.
     pub async fn send_message(&mut self, agent: &AgentId, msg: &str, strike: bool) -> SendResult {
+        self.send_worker_turn(agent, msg, strike, Origin::Lead, msg).await
+    }
+
+    async fn send_worker_turn(&mut self, agent: &AgentId, msg: &str, strike: bool,
+                              sender: Origin, display: &str) -> SendResult {
         let Some(handle) = self.registry.agent(agent) else {
             return SendResult::Rejected {
                 code: PolicyCode::AgentNotResumable,
                 reason: format!("no agent {agent} with a resumable session"),
             };
         };
+        if self.registry.state().attempts.values().any(|a| a.agent_id == *agent &&
+            a.error.as_ref().is_some_and(|e| e.code == ErrorCode::NativePermissionRequired)) {
+            return SendResult::Rejected { code: PolicyCode::AgentNotResumable,
+                reason: "Worker-specific access verification is unavailable; this worker cannot resume".into() };
+        }
         if handle.role == RoleName::Lead {
             if let Some(busy) = self.live_lead_agent() {
                 return SendResult::Rejected {
@@ -1432,7 +1512,8 @@ impl Core {
         }
 
         let attempt = AttemptId::new_v4();
-        match self.resume_attempt(*agent, attempt, msg.to_string(), spawn_cap) {
+        match self.resume_attempt(*agent, attempt, msg.to_string(), spawn_cap,
+            (role != RoleName::Lead).then(|| (sender, display.to_owned()))) {
             Ok(()) => {
                 // The human's half of a lead conversation becomes durable the moment it is
                 // accepted (B3 walkthrough fix). Keyed on the *target's* role: every door that
@@ -1534,10 +1615,15 @@ impl Core {
                 reason: format!("no lineage {lineage} to retry"),
             };
         };
-        let Some(task) = self.task_of(&run) else {
+        if self.registry.state().attempts.values().any(|a| a.agent_id == prior.agent &&
+            a.error.as_ref().is_some_and(|e| e.code == ErrorCode::NativePermissionRequired)) {
+            return SendResult::Rejected { code: PolicyCode::AgentNotResumable,
+                reason: "Worker-specific access verification is unavailable; this worker cannot retry".into() };
+        }
+        let Some(task) = self.task_for_lineage(&run, lineage) else {
             return SendResult::Rejected {
                 code: PolicyCode::ResumeTargetMissing,
-                reason: format!("no run {run}"),
+                reason: "the original task scope for this lineage is unavailable".to_string(),
             };
         };
 
@@ -1659,8 +1745,8 @@ impl Core {
                 return;
             }
         };
-        let Some(task) = self.task_of(&run) else {
-            self.block_run(&run, "the run has no task on record to retry");
+        let Some(task) = self.task_for_agent(agent) else {
+            self.block_run(&run, "the original task scope for this retry is unavailable");
             return;
         };
         let last_error = parent.and_then(|parent| self.last_attempt_error(&parent));
@@ -2044,8 +2130,8 @@ impl Core {
             if !self.attempt_started_since(&f.run, f.finish_seq, &target.agent) {
                 // No task, no prompt: a worker is never spawned with an empty one, so a run whose
                 // `run.created` is missing blocks here rather than starting a turn about nothing.
-                let Some(task) = self.task_of(&f.run) else {
-                    self.block_run(&f.run, "the run has no task on record to repair against");
+                let Some(task) = self.task_for_lineage(&f.run, &target.lineage) else {
+                    self.block_run(&f.run, "the original task scope for this repair is unavailable");
                     self.mark(f, LoopBranch::Resume);
                     return;
                 };
@@ -2062,7 +2148,13 @@ impl Core {
                         handoff::build_failure_repair_prompt(&err, &task)
                     }
                 };
-                match self.send_message(&target.agent, &prompt, false).await {
+                let feedback = match &cause {
+                    StrikeCause::ReviewFail(findings) => handoff::render_findings(findings),
+                    StrikeCause::VerifyFail(report) => std::iter::once(report.summary.as_str())
+                        .chain(report.failures.iter().map(String::as_str)).collect::<Vec<_>>().join("\n"),
+                    StrikeCause::Failure(_) => handoff::task_block(&task),
+                };
+                match self.send_worker_turn(&target.agent, &prompt, false, Origin::ControlPlane, &feedback).await {
                     SendResult::Ok { .. } => {}
                     SendResult::Rejected { code, reason } => {
                         self.block_rejection(&f.run, f.attempt, code, &reason);
@@ -2238,10 +2330,10 @@ impl Core {
                     );
                     return;
                 };
-                let Some(task) = self.task_of(&run) else {
+                let Some(task) = self.task_for_agent(&agent) else {
                     self.block_run(
                         &run,
-                        "the gate was denied and the run has no task on record",
+                        "the gate was denied and its builder's original task scope is unavailable",
                     );
                     return;
                 };
@@ -2286,7 +2378,8 @@ impl Core {
                 }];
                 let prompt = handoff::build_repair_prompt(&findings, &task);
                 if let SendResult::Rejected { code, reason } =
-                    self.send_message(&agent, &prompt, false).await
+                    self.send_worker_turn(&agent, &prompt, false, Origin::ControlPlane,
+                        &handoff::render_findings(&findings)).await
                 {
                     self.block_run(&run, &format!("{code}: {reason}"));
                 }
@@ -2479,10 +2572,10 @@ impl Core {
             return;
         }
 
-        let Some(task) = self.task_of(&run) else {
+        let Some(task) = self.task_for_agent(agent) else {
             self.block_run(
                 &run,
-                "an agent is owed a spawn but the run has no task on record",
+                "an agent is owed a spawn but its original task scope is unavailable",
             );
             return;
         };
@@ -2711,10 +2804,10 @@ impl Core {
         if !self.run_accepts_workers(&owed.run) {
             return;
         }
-        let Some(task) = self.task_of(&owed.run) else {
+        let Some(task) = self.task_for_agent(&owed.agent) else {
             self.block_run(
                 &owed.run,
-                "a repair is owed but the run has no task on record",
+                "a repair is owed but the builder's original task scope is unavailable",
             );
             return;
         };
@@ -2774,7 +2867,8 @@ impl Core {
             .and_then(|a| self.roles.roles.get(&a.role))
             .map_or(self.roles.defaults.spawn_budget_usd, |r| r.spawn_budget_usd);
         let attempt = AttemptId::new_v4();
-        if let Err(err) = self.resume_attempt(owed.agent, attempt, prompt, spawn_cap) {
+        if let Err(err) = self.resume_attempt(owed.agent, attempt, prompt, spawn_cap,
+            Some((Origin::ControlPlane, handoff::task_block(&task)))) {
             self.block_policy(&owed.run, owed.marked, "a reissued repair was refused", &err);
         }
     }
@@ -3066,6 +3160,20 @@ impl Core {
     /// `assert_safe_argv` is a control-plane bug or an attack, and it must not be recorded as
     /// something the worker did.
     fn start_attempt(&mut self, s: StartSpawn) -> Result<(), PolicyError> {
+        // Record only the task text actually included in a generated request. Some recovery
+        // and historical paths have no typed display content; the reader marks those as gaps.
+        let input = (s.role != RoleName::Lead).then(|| self.task_for_agent(&s.agent)).flatten()
+            .and_then(|task| {
+                let block = handoff::task_block(&task);
+                if s.prompt.contains(&block) { Some(block) }
+                else if !task.description.is_empty() && s.prompt.contains(&task.description) {
+                    Some(task.description)
+                } else { None }
+            }).map(|text| (Origin::ControlPlane, text));
+        self.start_attempt_with_input(s, input)
+    }
+
+    fn start_attempt_with_input(&mut self, s: StartSpawn, input: Option<(Origin, String)>) -> Result<(), PolicyError> {
         let cfg = Arc::clone(&self.roles);
         let run = self.registry.run(&s.run).ok_or_else(|| {
             PolicyError::new(PolicyCode::RunBlocked, "the attempt's run is not on record")
@@ -3172,6 +3280,12 @@ impl Core {
             },
         )?;
         let argv = checked.plan().argv.clone();
+        if let Some((sender, text)) = input {
+            let event = crate::core::transcript::outbound(s.agent, s.attempt, sender,
+                s.kind == AttemptKind::Resume, &text);
+            self.registry.append(&s.run, event)
+                .map_err(|e| PolicyError::new(PolicyCode::RunBlocked, e.to_string()))?;
+        }
 
         self.pending_spawn.insert(
             s.attempt,
@@ -3286,6 +3400,7 @@ impl Core {
         attempt: AttemptId,
         prompt: String,
         spawn_cap: f64,
+        input: Option<(Origin, String)>,
     ) -> Result<(), PolicyError> {
         // Issue #4: the delegate-resume route reaches here without passing `send_message`.
         if let Some(err) = self.agent_busy(&agent) {
@@ -3328,7 +3443,7 @@ impl Core {
         // The worktree's HEAD is the lineage's base commit: a worker that commits is soft-reset
         // back to it, so this is the sha the next attempt diffs against.
         spawn.pre_sha = self.agent_base_sha(&agent);
-        self.start_attempt(spawn)
+        self.start_attempt_with_input(spawn, input)
     }
 
     /// Records an attempt that never ran: `attempt.started` with pid 0 (which
@@ -3408,10 +3523,10 @@ impl Core {
                 "the builder is no longer on record",
             ));
         };
-        let Some(task) = self.task_of(run) else {
+        let Some(task) = self.task_for_lineage(run, &target.lineage) else {
             return Err(PolicyError::new(
                 PolicyCode::ResumeTargetMissing,
-                "the run has no task on record",
+                "the original task scope for this review is unavailable",
             ));
         };
         let request = DelegateRequest {
@@ -3515,10 +3630,10 @@ impl Core {
                 "the builder is no longer on record",
             ));
         };
-        let Some(task) = self.task_of(run) else {
+        let Some(task) = self.task_for_lineage(run, &target.lineage) else {
             return Err(PolicyError::new(
                 PolicyCode::ResumeTargetMissing,
-                "the run has no task on record",
+                "the original task scope for this verification is unavailable",
             ));
         };
         let request = DelegateRequest {
@@ -3754,6 +3869,12 @@ impl Core {
         }
 
 
+        if report.status == VerifyStatus::NativePermissionRequired {
+            self.block_run(&f.run, "verification needs worker-specific native permission");
+            self.mark(f, LoopBranch::Verify);
+            return;
+        }
+
         if report.status == VerifyStatus::Blocked {
             self.block_run(
                 &f.run,
@@ -3848,10 +3969,10 @@ impl Core {
         target: &Target,
         cause: &StrikeCause,
     ) -> Result<(), PolicyError> {
-        let Some(task) = self.task_of(&f.run) else {
+        let Some(task) = self.task_for_lineage(&f.run, &target.lineage) else {
             return Err(PolicyError::new(
                 PolicyCode::ResumeTargetMissing,
-                "the run has no task on record",
+                "the original task scope for this replacement is unavailable",
             ));
         };
         let base_sha = self.replacement_base_sha(&f.run)?;
@@ -3946,6 +4067,7 @@ impl Core {
                 base_ref: base_sha.clone(),
                 run_budget_usd: None, // Existing run: never recaptured by a replacement.
                 task,
+
                 prompt,
                 lead: None,
                 team_name: None,
@@ -4029,6 +4151,7 @@ impl Core {
                         clamp_untrusted(&report.summary, 200)
                     )
                 }
+                VerifyStatus::NativePermissionRequired => "Verification needs native permission.\n\n".to_string(),
             });
         let external_line = self.recorded_external_evidence(&f.run, frozen.attempt, &frozen.hash)
             .map_or_else(String::new, |_| {
@@ -4048,8 +4171,12 @@ impl Core {
                 .attempt(&frozen.attempt)
                 .map_or(f.agent, |a| a.agent_id)
         };
-        let task_line = self
-            .task_of(&f.run)
+        if self.registry.attempt(&frozen.attempt)
+            .and_then(|attempt| self.task_for_agent(&attempt.agent_id)).is_none() {
+            self.block_run(&f.run, "the original task scope for this integration is unavailable");
+            return;
+        }
+        let task_line = self.task_of(&f.run)
             .map(|t| format!("{}: {}", t.id, t.title));
         let summary = format!(
             "{lead_line}\n\n{}\n\n{verify_line}{external_line}{}\n\n{} file(s) changed.\n\n{}",
@@ -4100,6 +4227,14 @@ impl Core {
         plan: Plan,
         caller_run_id: Option<RunId>,
     ) -> Result<RunId, CoreError> {
+        self.start_plan_from_socket(plan, caller_run_id, None, false).map(|(run, _)| run)
+    }
+
+    pub(super) fn start_plan_from_socket(
+        &mut self, plan: Plan, caller_run_id: Option<RunId>, peer: Option<&super::lead_authority::PeerProcess>, terminal_lead_requested: bool,
+    ) -> Result<(RunId, Option<uuid::Uuid>), CoreError> {
+        let lead_owner = self.authenticated_spawned_lead(peer);
+        let caller_run_id = lead_owner.or(caller_run_id);
         if let Err(issues) = validate_plan(&plan) {
             let detail = issues
                 .iter()
@@ -4136,8 +4271,7 @@ impl Core {
             })?),
             None => self.valid_team()?,
         };
-        let execution =
-            inherited.unwrap_or_else(|| team::capture_execution(&self.roles, team.as_ref()));
+        let mut execution = inherited.unwrap_or_else(|| team::capture_execution(&self.roles, team.as_ref()));
         if execution.mode != RunMode::Build {
             return Err(PolicyError::new(
                 PolicyCode::DelegationNotAllowed,
@@ -4150,6 +4284,14 @@ impl Core {
         // attribution window by racing the mint.
         let validated_caller = self.validated_caller_run(caller_run_id);
         let run = RunId::new_v4();
+        execution.lead_approval_run_id = None;
+        execution.lead_owner_run_id = lead_owner;
+        let terminal_claim = if terminal_lead_requested {
+            if caller_run_id.is_some() { return Err(super::lead_authority::refusal("a terminal claim cannot be attached to a spawned lead")); }
+            let owner = self.terminal_candidate(peer)?;
+            execution.lead_owner_run_id = Some(run);
+            Some(self.record_terminal_lead(owner, run)?)
+        } else { None };
         self.registry.append(
             &run,
             EventPayload::RunCreated {
@@ -4181,7 +4323,7 @@ impl Core {
         self.registry
             .append(&run, EventPayload::PlanCreated { plan })?;
         self.drive_plans();
-        Ok(run)
+        Ok((run, terminal_claim))
     }
 
     /// Re-examines every plan after something moved. Cheap — plans are ≤ 20 items and rare — and
@@ -4445,8 +4587,8 @@ impl Core {
             caller_run_id: None,
         };
         execution.steps = steps;
-        match self.delegate_with_execution(request, Some(execution)) {
-            Ok(out) => {
+        match self.delegate_with_execution(request, Some(execution), None) {
+            Ok((out, _)) => {
                 self.plan_item(
                     container,
                     &item.id,
@@ -5114,6 +5256,23 @@ impl Core {
     fn task_of(&self, run: &RunId) -> Option<Task> {
         self.registry.run(run).map(|r| r.task.clone())
     }
+    fn task_for_lineage(&self, run: &RunId, lineage: &LineageId) -> Option<Task> {
+        let run_task = &self.registry.run(run)?.task;
+        let mut task = self.registry.lineage_task(run, lineage).unwrap_or(run_task).clone();
+        // The original instructions are lineage-owned. Evidence refresh remains run-owned.
+        task.evidence.clone_from(&run_task.evidence);
+        Some(task)
+    }
+
+    fn task_for_agent(&self, agent: &AgentId) -> Option<Task> {
+        let handle = self.registry.agent(agent)?;
+        if let Some(lineage) = handle.lineage_id {
+            self.task_for_lineage(&handle.run_id, &lineage)
+        } else {
+            self.task_of(&handle.run_id)
+        }
+    }
+
 
     /// The immutable base for a new builder lineage.
     ///
@@ -5660,7 +5819,7 @@ pub(crate) fn valid_verify_report_shape(report: &VerifyReport) -> bool {
             !report.commands.is_empty() && !report.blockers.is_empty() && report.failures.is_empty()
         }
         VerifyStatus::Fail => report.blockers.is_empty(),
-        VerifyStatus::Pass | VerifyStatus::NothingToRun => {
+        VerifyStatus::Pass | VerifyStatus::NothingToRun | VerifyStatus::NativePermissionRequired => {
             report.blockers.is_empty() && report.failures.is_empty()
         }
     }
@@ -5941,6 +6100,7 @@ fn error_key(code: ErrorCode) -> &'static str {
         ErrorCode::ProviderUnauthenticated => "provider_unauthenticated",
         ErrorCode::ProviderUsageLimit => "provider_usage_limit",
         ErrorCode::ProviderModelUnavailable => "provider_model_unavailable",
+        ErrorCode::NativePermissionRequired => "native_permission_required",
         ErrorCode::ResumeTargetMissing => "resume_target_missing",
         ErrorCode::SpawnError => "spawn_error",
         ErrorCode::SchemaInvalid => "schema_invalid",
@@ -5964,6 +6124,17 @@ fn epoch_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_access_pause_is_an_environment_branch_for_all_worker_roles() {
+        let error = AttemptError { code: ErrorCode::NativePermissionRequired, message: String::new() };
+        for role in [RoleName::Builder, RoleName::Reviewer, RoleName::Verifier, RoleName::Security] {
+            assert_eq!(branch_of(role, AttemptStatus::Failed, Some(&error)), Branch::Environment);
+            assert_eq!(branch_of(role, AttemptStatus::Timeout, Some(&error)), Branch::Environment);
+            assert_eq!(branch_of(role, AttemptStatus::Cancelled, Some(&error)), Branch::None);
+            assert_eq!(branch_of(role, AttemptStatus::Escalate, Some(&error)), Branch::Escalate);
+        }
+    }
 
     fn err(code: ErrorCode) -> AttemptError {
         AttemptError {

@@ -100,6 +100,9 @@ fn external_cfg(dir: &TempDir) -> Value {
 #[test]
 fn the_embedded_config_loads_and_describes_every_role() {
     let cfg = load_roles(None).expect("embedded roles config");
+    let active_codex = ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.1-sol",
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+    let role_models: Vec<_> = ["fable", "opus", "sonnet", "haiku"].into_iter().chain(active_codex).collect();
 
     assert_eq!(cfg.version, 1);
     assert!(!cfg.gates.allow_agent_approve, "S2: agents cannot approve");
@@ -124,21 +127,7 @@ fn the_embedded_config_loads_and_describes_every_role() {
     assert_eq!(builder.default_model, "sonnet");
     // Rev 26: a role's allowlist spans both providers, so a team can move the builder to codex;
     // `defaultModel` is what it is spawned with when no team says otherwise.
-    assert_eq!(
-        builder.models,
-        vec![
-            "fable",
-            "opus",
-            "sonnet",
-            "haiku",
-            "gpt-6-astra",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.3-codex-spark"
-        ]
-    );
+    assert_eq!(builder.models, role_models);
     assert_eq!(builder.result_schema, SchemaName::BuildResult);
     assert!(
         builder.allowed_delegations.is_empty(),
@@ -174,23 +163,19 @@ fn the_embedded_config_loads_and_describes_every_role() {
         .providers
         .get(&ProviderName::Codex)
         .expect("codex catalog");
-    assert!(codex.models.contains(&"gpt-5.5".to_string()));
+    assert_eq!(codex.models, active_codex);
     // low, medium, high, xhigh, max — `minimal` was dropped 2026-08-26 (rejected upstream with
     // default-on tools) and `max` added 2026-09-11 (Revision 28); `ultra` is never listed.
     assert_eq!(codex.efforts.len(), 5);
-    // Revision 28: a model may narrow the provider's list; the rest take the whole list.
-    assert_eq!(codex.efforts_for("gpt-5.5").len(), 4);
-    assert_eq!(codex.efforts_for("gpt-5.3-codex-spark").len(), 4);
-    assert_eq!(codex.efforts_for("gpt-6-astra"), codex.efforts.as_slice());
-    assert!(!codex.efforts_for("gpt-5.5").iter().any(|e| e.as_str() == "max"));
+    for model in active_codex {
+        assert_eq!(codex.efforts_for(model), codex.efforts.as_slice());
+    }
+    assert_eq!(reviewer.default_model, "gpt-6-astra");
 
     let lead = role_spec(&cfg, RoleName::Lead).expect("lead spec");
     assert!(!lead.writes);
     assert_eq!(lead.provider, ProviderName::Claude);
-    assert_eq!(
-        lead.models,
-        ["fable", "opus", "sonnet", "haiku", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex-spark"]
-    );
+    assert_eq!(lead.models, role_models);
     assert_eq!(lead.default_model, "haiku");
     assert_eq!(lead.max_turns, 100);
     assert_eq!(lead.spawn_budget_usd, 2.0);
@@ -323,7 +308,10 @@ fn role_prompt_returns_the_body_without_its_frontmatter() {
     ] {
         assert!(lead.contains(&format!("`{tool}`")), "lead omits {tool}");
     }
-    assert!(lead.contains("Only a human may approve"));
+    assert!(lead.contains("Human decisions are the default"));
+    assert!(lead.contains("leadEvidence"));
+    assert!(lead.contains("Escalations"));
+    assert!(lead.contains("direct MCP cannot approve"));
     assert!(lead.contains("Never run `git commit`"));
 }
 
@@ -543,11 +531,11 @@ fn a_model_effort_outside_the_providers_list_is_rejected() {
     let dir = roles_copy();
     let mut cfg = external_cfg(&dir);
     // `minimal` is a closed-enum value the codex catalog no longer lists.
-    cfg["providers"]["codex"]["modelEfforts"]["gpt-5.5"] = json!(["low", "minimal"]);
+    cfg["providers"]["codex"]["modelEfforts"]["gpt-6.2-sol"] = json!(["low", "minimal"]);
     let roles = write_external(&dir, &cfg);
     let err = load_roles(Some(&roles)).expect_err("a model cannot take an effort its provider does not");
     assert!(
-        matches!(err, RolesError::ModelEffortNotInProvider { ref model, ref effort, .. } if model == "gpt-5.5" && effort == "minimal"),
+        matches!(err, RolesError::ModelEffortNotInProvider { ref model, ref effort, .. } if model == "gpt-6.2-sol" && effort == "minimal"),
         "{err}"
     );
 }

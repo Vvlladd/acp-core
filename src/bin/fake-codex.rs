@@ -185,7 +185,10 @@ fn main() {
         } else {
             let _ = next_invocation("codex_build");
             write_source();
-            let lines = transcript_lines(&[BUILD_PASS_1], 1, None);
+            let fixture = if scenario == "native_permission" {
+                include_str!("../../fixtures/jsonl/codex/native-permission-1.jsonl")
+            } else { BUILD_PASS_1 };
+            let lines = transcript_lines(&[fixture], 1, None);
             stream(&lines, delay_ms, None);
             write_last_message(parsed.last_message_file.as_deref(), &lines);
         }

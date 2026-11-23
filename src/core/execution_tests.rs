@@ -435,6 +435,12 @@ async fn refused_resume_keeps_the_durable_evidence_identity() {
 
 #[tokio::test]
 async fn idle_resume_persists_evidence_before_the_continuation_prompt() {
+    if !crate::core::tests::is_provider_fixture_child(
+        module_path!(),
+        "idle_resume_persists_evidence_before_the_continuation_prompt",
+    ) {
+        return;
+    }
     let owner = TempDir::new().unwrap();
     let dir = TempDir::new_in(owner.path()).unwrap();
     let (mut core, mut rx) = core(&dir);
@@ -609,7 +615,7 @@ async fn no_builder_caller_cannot_resume_or_repair_another_run_even_after_its_le
         team_value("plan", json!({})),
         team_value(
             "audit",
-            json!({"reviewer":{"provider":"codex","model":"gpt-5.5"}}),
+            json!({"reviewer":{"provider":"codex","model":"gpt-6-astra"}}),
         ),
     ] {
         let captured = execution(&core, &selected);
@@ -713,7 +719,7 @@ fn mode_is_explicit_and_old_membership_is_not_reinterpreted() {
             false,
         ),
         (
-            json!({"version":3,"mode":"audit","name":"audit","roles":{"reviewer":{"provider":"codex","model":"gpt-5.5"}}}),
+            json!({"version":3,"mode":"audit","name":"audit","roles":{"reviewer":{"provider":"codex","model":"gpt-6-astra"}}}),
             true,
         ),
     ] {
@@ -758,7 +764,7 @@ async fn replay_keeps_assignment_and_effort_when_saved_team_is_unreadable() {
     let (mut original, _rx) = core(&dir);
     let selected = team_value(
         "build",
-        json!({"builder":{"provider":"codex","model":"gpt-5.5","effort":"high"}}),
+        json!({"builder":{"provider":"codex","model":"gpt-6-astra","effort":"high"}}),
     );
     let captured = execution(&original, &selected);
     let run = seed_run(&mut original, captured.clone());
@@ -772,7 +778,7 @@ async fn replay_keeps_assignment_and_effort_when_saved_team_is_unreadable() {
     recovered.delegate(request(Some(run))).unwrap();
     let pending = recovered.pending_worktree.values().next().unwrap();
     assert_eq!(pending.provider, ProviderName::Codex);
-    assert_eq!(pending.model, "gpt-5.5");
+    assert_eq!(pending.model, "gpt-6-astra");
     assert_eq!(pending.effort, Some(Effort::High));
 }
 
